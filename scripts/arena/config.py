@@ -21,7 +21,7 @@ DEVICES = {
         'topic': '/sim/dishwasher/joint_command', 
         'joint': 'dishwasher_joint', 
         'min': 0.0,
-        'max': 1.5,
+        'max': math.radians(85),
         'unit': 'degrees',
         'category': 'White Goods'
     },
@@ -37,7 +37,7 @@ DEVICES = {
         'topic': '/sim/oven/joint_command', 
         'joint': 'oven_joint', 
         'min': 0.0,
-        'max': 1.5,
+        'max': math.radians(85),
         'unit': 'degrees',
         'category': 'White Goods'
     },

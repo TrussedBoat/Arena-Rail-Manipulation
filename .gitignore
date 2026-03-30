@@ -1,0 +1,7 @@
+scripts/__pycache__/
+*.pyc
+*.pyo
+
+scripts/arena/__pycache__/
+*.pyc
+*.pyo
