@@ -9,7 +9,7 @@ class UI:
     @staticmethod
     def print_header():
         console.print(Panel.fit(
-            "[bold cyan]🤖 ROBOTIC TASK ORCHESTRATOR v1.0[/bold cyan]\n[dim]Ready for instructions...[/dim]",
+            "[bold cyan]🤖 ROBOTIC TASK ORCHESTRATOR with Qwen 3 VL 9B[/bold cyan]\n[dim]Ready for instructions...[/dim]",
             border_style="cyan"
         ))
 

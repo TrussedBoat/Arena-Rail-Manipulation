@@ -8,9 +8,38 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 from cv_bridge import CvBridge
+from scripts.arena.config import DEVICES, CAMERA_TOPICS
 
 import time
 import base64
+
+
+class BackgroundROSBridge(Node):
+    """A permanent ROS 2 node that caches state in the background."""
+    def __init__(self):
+        super().__init__('langgraph_background_bridge')
+        self.bridge = CvBridge()
+        
+        # Caches
+        self.latest_image = None
+        self.rail_franka1_latest_joints = {} # Dictionary mapping joint names to positions
+        
+        # Permanent Subscribers
+        self.create_subscription(Image, CAMERA_TOPICS["wall_franka_side"], self.image_cb, 10)
+        self.create_subscription(JointState, DEVICES["rail_franka1"]["state_topic"], self.rail_franka1_joint_cb, 10)
+        
+        # Permanent Publisher
+        self.rail_franka1_joint_pub = self.create_publisher(JointState, DEVICES["rail_franka1"]["command_topic"], 10)
+
+    def image_cb(self, msg):
+        self.latest_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+    def rail_franka1_joint_cb(self, msg):
+        # Update the dictionary with the latest positions for all tracked joints
+        for i, name in enumerate(msg.name):
+            if name == DEVICES["rail_franka1"]["joint"]:
+                self.rail_franka1_latest_joints[name] = msg.position[i]
+                break
 
 
 class ImageSubscriber(Node):
@@ -69,44 +98,3 @@ def get_image_ros2(task: str, topic_name: str = '/sim/wall_franka/cam/front/colo
     print("Tool called to get an image!")
 
     return {"text": task, "image": os.path.abspath(image_path)}
-
-@tool
-def publish_joint_command(position: list[float], name: list[str] = None, topic_name: str = '/sim/rail_franka1/joint_command') -> str:
-    """
-    Publishes a joint command to a ROS 2 topic.
-    
-    Args:
-        position: List of target joint positions (e.g., in meters for prismatic joints like rail_j1).
-        name: List of joint names. Defaults to ['rail_j1'].
-        topic_name: The ROS 2 topic to publish to. Defaults to '/sim/rail_franka1/joint_command'.
-    """
-    if name is None:
-        name = ['rail_j1']
-        
-    if not rclpy.ok():
-        rclpy.init()
-    
-    node = rclpy.create_node('joint_command_publisher_tool')
-    pub = node.create_publisher(JointState, topic_name, 10)
-    
-    # Wait for discovery so the message isn't dropped
-    start_wait = time.time()
-    while pub.get_subscription_count() == 0 and (time.time() - start_wait) < 2.0:
-        time.sleep(0.1)
-    
-    time.sleep(0.1) # Brief buffer after discovery
-    
-    msg = JointState()
-    msg.header.stamp = node.get_clock().now().to_msg()
-    msg.name = name
-    msg.position = [float(p) for p in position]
-    
-    pub.publish(msg)
-    
-    # Spin slightly to ensure message is published
-    rclpy.spin_once(node, timeout_sec=1)
-    node.destroy_node()
-
-    print("Tool called to publish a joint command!")
-    
-    return f"Successfully published joint command: positions={position} to joints={name} on topic {topic_name}"

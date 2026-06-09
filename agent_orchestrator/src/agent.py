@@ -4,7 +4,7 @@ from langchain.messages import HumanMessage
 
 # Local imports
 from ui import UI
-from nodes import MessagesState, analyzer_node, get_image_node, tool_node, vlm_node, should_use_tool_or_image
+from nodes import MessagesState, model_call, get_image_node, tool_node, should_continue
 
 import time
 
@@ -16,24 +16,22 @@ def build_agent():
     builder = StateGraph(MessagesState)
 
     # Add nodes
-    builder.add_node("analyzer", analyzer_node)
-    builder.add_node("tool_node", tool_node)
     builder.add_node("get_image", get_image_node)
-    builder.add_node("vlm_node", vlm_node)
+    builder.add_node("model_call", model_call)
+    builder.add_node("tool_node", tool_node)
 
     # Add edges
-    builder.add_edge(START, "analyzer")
+    builder.add_edge(START, "get_image")
+    builder.add_edge("get_image", "model_call")
     builder.add_conditional_edges(
-        "analyzer",
-        should_use_tool_or_image,
+        "model_call",
+        should_continue,
         {
             "tool_node": "tool_node",
-            "get_image": "get_image"
+            END: END
         }
     )
-    builder.add_edge("tool_node", END)
-    builder.add_edge("get_image", "vlm_node")
-    builder.add_edge("vlm_node", END)
+    builder.add_edge("tool_node", "model_call")
 
     return builder.compile(checkpointer=checkpointer)
 
