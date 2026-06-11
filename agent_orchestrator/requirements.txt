@@ -1,7 +1,12 @@
 langgraph
 langchain
-langchain-ollama
 langchain-chroma
+langchain-openai
+langchain-community
+langchain_experimental
+llama-cpp-python
+llama-cpp-agent
 numpy<2.0.0
 opencv-python
 rich
+openai
