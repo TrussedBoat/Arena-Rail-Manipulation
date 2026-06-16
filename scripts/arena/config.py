@@ -3,7 +3,8 @@ import os
 
 # --- SIMULATION CONFIGURATION ---
 DEFAULT_CONFIG = {"width": 1280, "height": 720, "sync_loads": True, "headless": False, "renderer": "RaytracedLighting"}
-SCENE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'isaac_worlds', 'Arena_wall_upd.usd'))
+#SCENE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'isaac_worlds', 'Arena_wall_upd.usd'))
+SCENE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "isaac_worlds", "rail_only.usd"))
 
 # --- DEVICE CONFIGURATION ---
 # Each device entry defines its ROS topic, joint name(s), position limits, unit, and category.

@@ -8,5 +8,4 @@ llama-cpp-python
 llama-cpp-agent
 numpy<2.0.0
 opencv-python
-rich
 openai

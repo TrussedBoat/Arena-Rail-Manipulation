@@ -98,13 +98,13 @@ def move_camera(camera_prim_path, frame_idx, total_frames, start_pos, start_rot)
     camera_xform = XFormPrim(prim_path=camera_prim_path)
     start_x, start_y, start_z = start_pos
     
-    # Perimeter segment lengths
-    len_right = 1.6
+    # Perimeter segment lengths, -0.27 , -0.62
+    len_right = 2.9
     len_down  = 0.35
-    len_left  = 1.6
+    len_left  = 2.9
     len_up    = 0.35
     
-    total_distance = len_right + len_down + len_left + len_up # 3.9m total
+    total_distance = len_right + len_down + len_left + len_up 
     
     # Calculate progress along the total path (0.0 to 1.0)
     progress = frame_idx / max(1, (total_frames - 1))

@@ -1,100 +1,143 @@
-from langchain.tools import tool
-
-import cv2
-import numpy as np
-import os
-
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image, JointState
-from cv_bridge import CvBridge
-from scripts.arena.config import DEVICES, CAMERA_TOPICS
-
 import time
-import base64
+import math
+import rclpy
+from ros_interface import wait_for_joint_target, get_shared_node
+
+import urllib.request
+import urllib.parse
+import json
 
 
-class BackgroundROSBridge(Node):
-    """A permanent ROS 2 node that caches state in the background."""
-    def __init__(self):
-        super().__init__('langgraph_background_bridge')
-        self.bridge = CvBridge()
-        
-        # Caches
-        self.latest_image = None
-        self.rail_franka1_latest_joints = {} # Dictionary mapping joint names to positions
-        
-        # Permanent Subscribers
-        self.create_subscription(Image, CAMERA_TOPICS["wall_franka_side"], self.image_cb, 10)
-        self.create_subscription(JointState, DEVICES["rail_franka1"]["state_topic"], self.rail_franka1_joint_cb, 10)
-        
-        # Permanent Publisher
-        self.rail_franka1_joint_pub = self.create_publisher(JointState, DEVICES["rail_franka1"]["command_topic"], 10)
-
-    def image_cb(self, msg):
-        self.latest_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-
-    def rail_franka1_joint_cb(self, msg):
-        # Update the dictionary with the latest positions for all tracked joints
-        for i, name in enumerate(msg.name):
-            if name == DEVICES["rail_franka1"]["joint"]:
-                self.rail_franka1_latest_joints[name] = msg.position[i]
-                break
-
-
-class ImageSubscriber(Node):
-    def __init__(self, topic_name):
-        super().__init__('get_image_tool')
-        self.subscription = self.create_subscription(
-            Image,
-            topic_name,
-            self.listener_callback,
-            10)
-        self.bridge = CvBridge()
-        self.latest_image = None
-
-    def listener_callback(self, msg):
-        self.latest_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-
-
-def get_image_ros2(task: str, topic_name: str = '/sim/wall_franka/cam/front/color/image_raw') -> dict:
-    """
-    Subscribes to a ROS 2 image topic, saves the image to 'state.png', and returns the path.
-    
-    Args:
-        topic_name (str): The ROS 2 topic to subscribe to. Defaults to '/sim/wall_franka/cam/front/color/image_raw'.
-
-    Returns:
-        dict: Dictionary containing 'text' and 'image' path.
-    """
-    image_path = "state.png"
-    
-    if os.path.exists(image_path):
-        os.remove(image_path)
-
-    if not rclpy.ok():
-        rclpy.init()
-    
-    node = ImageSubscriber(topic_name)
-    
-    # Wait for one image
-    start_time = time.time()
-    timeout = 1.0 # 1 seconds timeout
-    while node.latest_image is None and (time.time() - start_time) < timeout:
+# ── TOOL EXECUTION WRAPPERS ──
+def get_latest_ros_image(timeout_sec=10.0) -> str:
+    node = get_shared_node()
+    start = time.time()
+    print("Waiting for image from ROS 2 topic...")
+    while node.latest_b64_image is None:
         rclpy.spin_once(node, timeout_sec=0.1)
-    
-    image = node.latest_image
-    node.destroy_node()
-    
-    if image is None:
-        return f"Error: Timeout waiting for image on topic {topic_name}"
-    
-    # Save the image to disk
-    success = cv2.imwrite(image_path, image)
-    
-    if not success:
-        return "Error: Failed to save image to disk"
+        if (time.time() - start) > timeout_sec:
+            node.destroy_node()
+            raise TimeoutError("Timed out waiting for ROS 2 image message.")
+    img_data = node.latest_b64_image
+    return img_data
 
-    print("Tool called to get an image!")
+def get_current_joint_states() -> dict:
+    node = get_shared_node()
+    start = time.time()
+    while node.current_rail_position is None or node.current_panda_joint1 is None:
+        rclpy.spin_once(node, timeout_sec=0.1)
+        if (time.time() - start) > 5.0:
+            node.destroy_node()
+            raise TimeoutError("Could not fetch active joint telemetry.")
+    states = {
+        "rail_j1_meters": node.current_rail_position,
+        "panda_joint1_radians": node.current_panda_joint1
+    }
+    return states
 
-    return {"text": task, "image": os.path.abspath(image_path)}
+def move_rail_relative(relative_distance_m: float) -> str:
+    node = get_shared_node()
+    
+    # Wait for initial telemetry
+    start = time.time()
+    while node.current_rail_position is None:
+        time.sleep(0.1)
+        if (time.time() - start) > 5.0:
+            return "Error: Could not read current rail position."
+            
+    current_pos = node.current_rail_position
+    absolute_target = current_pos + relative_distance_m
+    
+    print(f"[MATH]: Moving to {absolute_target:.4f}m...")
+    node.send_absolute_rail_command(absolute_target)
+    
+    # Use your helper to verify
+    success = wait_for_joint_target(node, 'rail_j1', absolute_target, tolerance=0.01)
+    
+    return f"Success: Moved to {absolute_target:.4f}m." if success else "Warning: Timeout during move."
+
+def move_rail_to_object(target_object: str) -> str:
+    """Agentic Tool: Safely homes arm, calculates absolute world target, and moves rail."""
+    try:
+        with open("semantic_distances.json", "r") as f:
+            distances = json.load(f)
+            
+        clean_target = target_object.lower().strip().replace(" ", "_")
+        
+        # 1. Get Semantic Offsets
+        if clean_target in ['laptop', 'home', 'start']:
+            target_offset_x = 0.0
+            target_y = 0.0 
+        elif clean_target in distances:
+            target_offset_x = distances[clean_target]["x"]
+            target_y = distances[clean_target]["y"]
+        else:
+            return f"Error: '{target_object}' not found in map."
+            
+        node = get_shared_node()
+        
+        # Wait for calibration
+        start_wait = time.time()
+        while node.current_rail_position is None or node.initial_rail_position is None:
+            time.sleep(0.1)
+            if time.time() - start_wait > 5.0:
+                return "Error: Hardware not calibrated. Missing initial_rail_position."
+
+        # 2. AUTO-SAFETY: Force arm to 0.0 before moving
+        if node.current_panda_joint1 is not None and abs(node.current_panda_joint1) > 0.02:
+            print("[SAFETY INTERLOCK] Arm is deployed. Auto-homing to 0.0 rad before rail movement...")
+            node.send_panda_joint1_command(0.0)
+            wait_for_joint_target(node, 'panda_joint1', 0.0)
+            
+        # 3. Hardware Origin Math
+        # Absolute Target = Start Location (-1.09m) + Semantic Offset (2.31m)
+        absolute_target = node.initial_rail_position + target_offset_x
+        relative_move = absolute_target - node.current_rail_position
+        
+        # 4. Actuate Rails
+        move_result = move_rail_relative(relative_move)
+        
+        # 5. Determine Y-Axis Orientation
+        recommended_angle = 1.57 if target_y < -1.0 else -1.57
+            
+        return (f"{move_result} The object '{target_object}' is at Y: {target_y}m. "
+                f"You MUST now call 'turn_panda_arm' with target_rad={recommended_angle} to face it.")
+        
+    except Exception as e:
+        return f"Error executing navigation: {e}"
+
+def turn_panda_arm(target_rad: float) -> str:
+    """Agentic Tool: Turns panda_joint1 to face the object."""
+    node = get_shared_node()
+    node.send_panda_joint1_command(target_rad)
+    print(f"[WAITING]: Tracking joint_states until panda_joint1 reaches {target_rad} rad...")
+    
+    success = wait_for_joint_target(node, 'panda_joint1', target_rad)
+    if success:
+        return f"Successfully turned panda_joint1 to face the workspace ({target_rad} rad)."
+    else:
+        return f"Warning: Timed out waiting for panda_joint1 to reach {target_rad} rad."
+
+def home_panda_arm() -> str:
+    node = get_shared_node()
+    # Ensure we have the current state first
+    start = time.time()
+    while node.current_panda_joint1 is None:
+        rclpy.spin_once(node, timeout_sec=0.1)
+        if time.time() - start > 5.0:
+            return "Error: Could not read panda_joint1 telemetry."
+            
+    target_rad = 0.0
+    # Check if already home
+    if abs(node.current_panda_joint1 - target_rad) <= 0.02:
+        return "Panda manipulator arm is already at the home configuration (0.0 rad)."
+        
+    node.send_panda_joint1_command(target_rad)
+    print("[WAITING]: Tracking joint_states until panda_joint1 reaches home (0.0 rad)...")
+    
+    success = wait_for_joint_target(node, 'panda_joint1', target_rad)
+    
+    if success:
+        return "Panda manipulator arm has successfully returned to home default configuration (0.0 rad)."
+    else:
+        return "Warning: Arm homing command dispatched, but timed out verifying final position."
