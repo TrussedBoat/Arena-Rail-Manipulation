@@ -1,11 +1,12 @@
 import time
 import math
 import rclpy
-from ros_interface import wait_for_joint_target, get_shared_node
+from ros_interface import wait_for_joint_target, wait_for_grasp, get_shared_node
 
 import urllib.request
 import urllib.parse
 import json
+import subprocess
 
 
 # ── TOOL EXECUTION WRAPPERS ──
@@ -141,3 +142,56 @@ def home_panda_arm() -> str:
         return "Panda manipulator arm has successfully returned to home default configuration (0.0 rad)."
     else:
         return "Warning: Arm homing command dispatched, but timed out verifying final position."
+
+
+def execute_pick_script() -> str:
+    """Agentic Tool: Executes classical pick script, verifies telemetry, and forces cleanup."""
+    script_path = "/home/homerobotics/classical-pipeline/panda-controller-ws/src/bringup/rail_demo_pick.sh"
+    node = get_shared_node()
+    
+    # 1. Reset the grasp flag
+    node.is_grasped = False
+    
+    print(f"[EXECUTION]: Triggering classical pick sequence: {script_path}")
+    
+    # 2. Use Popen to start the script in the background (Non-blocking)
+    process = subprocess.Popen(
+        ['bash', script_path], 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    
+    try:
+        # 3. Wait for the Robot to call our VLM Service!
+        print("[WAITING]: Waiting for robot to call '/vlm_grasp_completed' service...")
+        
+        # We actively wait up to 60 seconds while the bash script runs in the background
+        if wait_for_grasp(node, timeout=100.0):
+            return "Success: Object physically grasped (Confirmed via Robot Service Call)."
+            
+        # 4. Handle failure cases (Timeout or premature crash)
+        retcode = process.poll() # Check if script died on its own
+        if retcode is not None:
+            _, stderr = process.communicate()
+            if retcode == 0:
+                return "Warning: The pick script finished cleanly, but the robot NEVER called the completion service."
+            else:
+                return f"Error executing pick script (Code {retcode}). Stderr: {stderr[-500:]}"
+                
+        return "Error: Robot failed to complete grasp within 60 seconds (Service call timeout)."
+        
+    except Exception as e:
+        return f"Error triggering script: {e}"
+        
+    finally:
+        # 5. THE CLEANUP CLAUSE: This runs no matter what happened above!
+        if process.poll() is None:  # If the process is still running
+            print("[CLEANUP]: Terminating the background bash script...")
+            process.terminate() # Send SIGTERM (Polite kill)
+            
+            try:
+                process.wait(timeout=2.0) # Give it 2 seconds to shut down cleanly
+            except subprocess.TimeoutExpired:
+                print("[CLEANUP]: Script ignored termination. Forcing SIGKILL...")
+                process.kill() # Send SIGKILL (Brutal kill)

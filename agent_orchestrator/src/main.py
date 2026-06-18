@@ -32,7 +32,7 @@ def main():
                         "   a) Call 'move_rail_to_object'. (This tool automatically ensures arm safety and moves the base).\n"
                         "   b) Call 'turn_panda_arm' using the EXACT angle provided by the previous tool.\n"
                         "   c) Call 'get_latest_image_from_ros' again to confirm the object is now in view.\n"
-                        "4. EXECUTION: Once the object is visually confirmed, output 'Action: pick up the <object>' or 'Action: place it into the <object>'."
+                        "4. EXECUTION: Once the PICK target is visually confirmed, call 'execute_pick_script' to physically grab it. Once the PLACE target is confirmed, output 'Action: place it into the <object>'."
                     )),
                     HumanMessage(content=f"task: {user_task}")
                 ],

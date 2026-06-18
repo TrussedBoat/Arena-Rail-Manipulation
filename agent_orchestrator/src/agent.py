@@ -11,7 +11,8 @@ from tools import (
     get_current_joint_states,
     move_rail_to_object, 
     home_panda_arm,
-    turn_panda_arm
+    turn_panda_arm,
+    execute_pick_script
 )
 
 MODEL_NAME = "Qwen3.6-35B"
@@ -79,6 +80,14 @@ tool_definitions = [
                 "required": ["target_rad"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_pick_script",
+            "description": "Runs the hardware shell script to physically pick up the object. Call this ONLY after navigating to the object, pointing the arm, and visually confirming it.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
     }
 ]
 
@@ -102,6 +111,7 @@ tools_impl = {
     "get_latest_image_from_ros": lambda a: get_latest_ros_image(a.get("timeout_sec", 10)),
     "move_rail_to_object": lambda a: move_rail_to_object(a.get("target_object")),
     "turn_panda_arm": lambda a: turn_panda_arm(a.get("target_rad")),
+    "execute_pick_script": lambda a: execute_pick_script(),
 }
 
 # ── 3. GRAPH NODES ──────────────────────────────────────────────────────────
