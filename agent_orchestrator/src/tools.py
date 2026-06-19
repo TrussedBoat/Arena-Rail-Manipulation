@@ -129,7 +129,7 @@ def move_rail_to_object(target_object: str) -> str:
             return f"{move_result} Successfully returned to {clean_target}. The arm is safely at 0.0 rad."
         else:
             # If navigating to an object, provide the required turn instruction.
-            recommended_angle = 1.57 if target_y < -1.0 else -1.57
+            recommended_angle = 1.57 if target_y < -0.8 else -1.57
             return (f"{move_result} The object '{target_object}' is at Y: {target_y}m. "
                     f"You MUST now call 'turn_panda_arm' with target_rad={recommended_angle} to face it.")
         
@@ -173,7 +173,7 @@ def home_panda_arm() -> str:
         return "Warning: Arm homing command dispatched, but timed out verifying final position."
 
 
-def _execute_hardware_script(action: str, script_name: str, tmux_session: str, flag_attr: str, wait_func) -> str:
+def _execute_hardware_script(action: str, script_name: str, tmux_session: str, flag_attr: str, wait_func, target_object: str) -> str:
     """Core logic runner for any physical hardware bash script."""
     script_path = f"/home/homerobotics/classical-pipeline/panda-controller-ws/src/bringup/{script_name}"
     node = get_shared_node()
@@ -184,7 +184,7 @@ def _execute_hardware_script(action: str, script_name: str, tmux_session: str, f
     print(f"[EXECUTION]: Triggering classical {action} sequence: {script_path}")
     
     process = subprocess.Popen(
-        ['bash', script_path], 
+        ['bash', script_path, target_object], 
         stdout=subprocess.PIPE, 
         stderr=subprocess.PIPE,
         text=True
@@ -234,22 +234,24 @@ def _execute_hardware_script(action: str, script_name: str, tmux_session: str, f
 
 # ── AGENTIC TOOLS ──
 
-def execute_pick_script() -> str:
+def execute_pick_script(target_object: str) -> str:
     """Agentic Tool: Executes classical pick script."""
     return _execute_hardware_script(
         action="pick",
         script_name="rail_demo_pick.sh",
         tmux_session="rail_demo_pick",
         flag_attr="is_grasped",
-        wait_func=wait_for_grasp
+        wait_func=wait_for_grasp,
+        target_object=target_object
     )
 
-def execute_place_script() -> str:
+def execute_place_script(target_object: str) -> str:
     """Agentic Tool: Executes classical place script."""
     return _execute_hardware_script(
         action="place",
         script_name="rail_demo_place.sh",
         tmux_session="rail_demo_place", 
         flag_attr="is_placed",
-        wait_func=wait_for_place
+        wait_func=wait_for_place,
+        target_object=target_object
     )

@@ -94,7 +94,16 @@ tool_definitions = [
         "function": {
             "name": "execute_pick_script",
             "description": "Runs the hardware shell script to physically pick up the object.",
-            "parameters": {"type": "object", "properties": {}, "required": []}
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_object": {
+                        "type": "string",
+                        "description": "The name of the object to pick up (e.g., 'lemon')."
+                    }
+                },
+                "required": ["target_object"]
+            }
         }
     },
     {
@@ -102,7 +111,16 @@ tool_definitions = [
         "function": {
             "name": "execute_place_script",
             "description": "Runs the hardware shell script to physically place the object. Call this ONLY after grasping the object, moving to the destination, pointing the arm, and visually confirming the location.",
-            "parameters": {"type": "object", "properties": {}, "required": []}
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_object": {
+                        "type": "string",
+                        "description": "The name of the destination to place the object into (e.g., 'plate')."
+                    }
+                },
+                "required": ["target_object"]
+            }
         }
     },
     {
@@ -144,8 +162,8 @@ tools_impl = {
     "get_latest_image_from_ros": lambda a: get_latest_ros_image(a.get("timeout_sec", 10)),
     "move_rail_to_object": lambda a: move_rail_to_object(a.get("target_object")),
     "turn_panda_arm": lambda a: turn_panda_arm(a.get("target_rad")),
-    "execute_pick_script": lambda a: execute_pick_script(),
-    "execute_place_script": lambda a: execute_place_script(),
+    "execute_pick_script": lambda a: execute_pick_script(a.get("target_object")),
+    "execute_place_script": lambda a: execute_place_script(a.get("target_object")),
 }
 
 # ── 3. GRAPH NODES ──────────────────────────────────────────────────────────

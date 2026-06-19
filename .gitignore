@@ -4,6 +4,7 @@
 isaac_worlds/cloth_demo.usd
 isaac_worlds/deformable.usd
 
-scripts/mapping/dataset/*
+scripts/mapping/dataset
+scripts/mapping/old_dataset
 
 *.png
