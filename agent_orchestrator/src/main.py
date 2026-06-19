@@ -2,6 +2,7 @@
 import time
 import re
 import rclpy
+import subprocess
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from agent import agent, AgentState
 
@@ -17,6 +18,9 @@ def main():
             if user_task.lower() in ['quit', 'exit', 'q']:
                 print("Shutting down pipeline...")
                 break
+
+            if user_task == "":
+                user_task = "pick up the apple and place it into the purple bowl"
                 
             if not user_task:
                 continue
@@ -54,8 +58,11 @@ def main():
                         "       a) Call 'move_rail_to_object'. (This tool automatically ensures arm safety and moves the base).\n"
                         "       b) Call 'turn_panda_arm' using the EXACT angle provided by the previous tool.\n"
                         "       c) Call 'get_latest_image_from_ros' again to confirm the object is now in view.\n"
-                        "5. EXECUTION: Once the PICK target is visually confirmed, call 'execute_pick_script' to physically grab it. Once the PLACE target is confirmed, call 'execute_place_script' to physically place it.\n"
+                        "5. EXECUTION: Once the PICK target is visually confirmed, call 'execute_pick_script' to physically grab it.\n" 
+                        "   - IF the pick is successful, return back to step 3 (visual check) to check for the place target.\n" 
+                        "   - Once the PLACE target is confirmed, call 'execute_place_script' to physically place it. \n"
                         "6. HOMING: Once the task is complete, call 'move_rail_to_object' with the PRESET value for 'home'.\n"
+                        "7. COMPLETION: Once the robot has returned to home, you MUST call the 'finish_task' tool to successfully terminate the pipeline."
                     )),
                     HumanMessage(content=f"task: {user_task}")
                 ],
@@ -99,14 +106,11 @@ def main():
     except Exception as e:
         print(f"\nPipeline Error: {e}")
     finally:
-        # --- NEW: GRACEFUL SHUTDOWN BLOCK ---
         print("\n[CLEANUP] Initiating graceful shutdown sequence...")
         
-        # Kill the global joint controller
         print(" -> Terminating 'global_joint_controller' tmux session...")
         subprocess.run(['tmux', 'kill-session', '-t', 'global_joint_controller'], capture_output=True)
         
-        # Failsafe: Kill the pick script session just in case the user pressed Ctrl+C mid-pick
         print(" -> Terminating 'rail_demo_pick' tmux session (failsafe)...")
         subprocess.run(['tmux', 'kill-session', '-t', 'rail_demo_pick'], capture_output=True)
         

@@ -5,7 +5,6 @@ from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
 
-# --> IMPORT FIX: Removed the old tools, added move_rail_to_object
 from tools import (
     start_joint_controller,
     get_latest_ros_image,
@@ -19,7 +18,6 @@ from tools import (
 
 MODEL_NAME = "Qwen3.6-35B"
 
-# --> SCHEMA FIX: Only expose the 5 tools the agent actually needs
 tool_definitions = [
     {
         "type": "function",
@@ -96,16 +94,7 @@ tool_definitions = [
         "function": {
             "name": "execute_pick_script",
             "description": "Runs the hardware shell script to physically pick up the object.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target_object": {
-                        "type": "string",
-                        "description": "The name of the object to pick up (e.g., 'orange')."
-                    }
-                },
-                "required": ["target_object"]
-            }
+            "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
     {
@@ -114,6 +103,23 @@ tool_definitions = [
             "name": "execute_place_script",
             "description": "Runs the hardware shell script to physically place the object. Call this ONLY after grasping the object, moving to the destination, pointing the arm, and visually confirming the location.",
             "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish_task",
+            "description": "Call this tool ONLY when the entire task (Pick, Place, and Homing) is 100% complete. This tells the system to shut down the pipeline.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "A brief 1-sentence summary of what was successfully accomplished."
+                    }
+                },
+                "required": ["summary"]
+            }
         }
     }
 ]
@@ -131,7 +137,6 @@ class AgentState(TypedDict):
     messages: list[BaseMessage]
     iterations: int
 
-# --> IMPL FIX: Cleaned up the mappings
 tools_impl = {
     "start_joint_controller": lambda a: start_joint_controller(),
     "check_robot_joint_states": lambda a: json.dumps(get_current_joint_states()),
@@ -182,10 +187,29 @@ def execute_tools(state: AgentState) -> dict:
     return {"messages": state["messages"] + new_tool_messages, "iterations": state.get("iterations", 0)}
 
 def should_continue(state: AgentState) -> str:
-    if state.get("iterations", 0) >= 8: 
+    # 1. Safety Limit Fallback
+    if state.get("iterations", 0) >= 20: 
+        print("\n[WARNING]: Maximum iterations reached. Forcing end.")
         return "end"
-    if hasattr(state["messages"][-1], "tool_calls") and state["messages"][-1].tool_calls:
+        
+    last_message = state["messages"][-1]
+    
+    # 2. Tool Routing & Interception
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        
+        # Check if the LLM wants to end the task
+        for tool in last_message.tool_calls:
+            if tool["name"] == "finish_task":
+                # Extract the summary argument the LLM generated
+                summary = tool["args"].get("summary", "Task complete.")
+                print(f"\n[PIPELINE COMPLETE]: {summary}")
+                print("[SYSTEM]: 'finish_task' tool intercepted. Terminating graph loop gracefully.")
+                return "end" # <-- Short-circuits the graph instantly!
+                
+        # If it's any other tool, route normally
         return "execute_tools"
+        
+    # 3. If no tools are called and we are here, end naturally
     return "end"
 
 # ── 4. BUILD GRAPH SCHEMA ──────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import time
 import math
 import rclpy
-from ros_interface import wait_for_joint_target, wait_for_grasp, get_shared_node
+from ros_interface import wait_for_joint_target, wait_for_grasp, wait_for_place, get_shared_node
 
 import urllib.request
 import urllib.parse
@@ -14,17 +14,14 @@ import subprocess
 def start_joint_controller() -> str:
     """Agentic Tool: Starts the global ROS 2 joint controller in the background."""
     try:
-        # 1. Check if it's already running so we don't crash by starting it twice
         check = subprocess.run(['tmux', 'has-session', '-t', 'global_joint_controller'], capture_output=True)
         if check.returncode == 0:
             return "Global joint controller is already running in the background."
 
         print("[SYSTEM]: Launching global joint controller in tmux...")
         
-        # 2. Create a new detached tmux session
         subprocess.run(['tmux', 'new-session', '-d', '-s', 'global_joint_controller'], check=True)
         
-        # 3. Send the exact startup commands you provided
         cmd = (
             "source /opt/ros/humble/setup.bash && "
             "cd ~/classical-pipeline/panda-controller-ws/ && "
@@ -33,7 +30,6 @@ def start_joint_controller() -> str:
         )
         subprocess.run(['tmux', 'send-keys', '-t', 'global_joint_controller', cmd, 'C-m'], check=True)
         
-        # Give ROS a few seconds to spin up the node
         time.sleep(3.0)
         return "Success: Global joint controller started. The robot is ready to receive movement commands."
         
@@ -128,11 +124,14 @@ def move_rail_to_object(target_object: str) -> str:
         # 4. Actuate Rails
         move_result = move_rail_relative(relative_move)
         
-        # 5. Determine Y-Axis Orientation
-        recommended_angle = 1.57 if target_y < -1.0 else -1.57
-            
-        return (f"{move_result} The object '{target_object}' is at Y: {target_y}m. "
-                f"You MUST now call 'turn_panda_arm' with target_rad={recommended_angle} to face it.")
+        if clean_target in ['laptop', 'home', 'start']:
+            # If homing, just report success. DO NOT tell the LLM to turn the arm.
+            return f"{move_result} Successfully returned to {clean_target}. The arm is safely at 0.0 rad."
+        else:
+            # If navigating to an object, provide the required turn instruction.
+            recommended_angle = 1.57 if target_y < -1.0 else -1.57
+            return (f"{move_result} The object '{target_object}' is at Y: {target_y}m. "
+                    f"You MUST now call 'turn_panda_arm' with target_rad={recommended_angle} to face it.")
         
     except Exception as e:
         return f"Error executing navigation: {e}"
@@ -174,17 +173,16 @@ def home_panda_arm() -> str:
         return "Warning: Arm homing command dispatched, but timed out verifying final position."
 
 
-def execute_pick_script() -> str:
-    """Agentic Tool: Executes classical pick script, verifies telemetry, and forces cleanup."""
-    script_path = "/home/homerobotics/classical-pipeline/panda-controller-ws/src/bringup/rail_demo_pick.sh"
+def _execute_hardware_script(action: str, script_name: str, tmux_session: str, flag_attr: str, wait_func) -> str:
+    """Core logic runner for any physical hardware bash script."""
+    script_path = f"/home/homerobotics/classical-pipeline/panda-controller-ws/src/bringup/{script_name}"
     node = get_shared_node()
     
-    # 1. Reset the pick flag
-    node.is_grasped = False
+    # 1. Reset the specific completion flag dynamically (e.g., node.is_grasped = False)
+    setattr(node, flag_attr, False)
     
-    print(f"[EXECUTION]: Triggering classical pick sequence: {script_path}")
+    print(f"[EXECUTION]: Triggering classical {action} sequence: {script_path}")
     
-    # 2. Use Popen to start the script in the background (Non-blocking)
     process = subprocess.Popen(
         ['bash', script_path], 
         stdout=subprocess.PIPE, 
@@ -192,89 +190,66 @@ def execute_pick_script() -> str:
         text=True
     )
     
-    try:
-        # 3. Wait for the Robot to call our VLM Service!
-        print("[WAITING]: Waiting for robot to call '/vlm_grasp_completed' service...")
-        
-        # We actively wait up to 60 seconds while the bash script runs in the background
-        if wait_for_grasp(node, timeout=60.0):
-            return "Success: Object physically grasped (Confirmed via Robot Service Call)."
-            
-        # 4. Handle failure cases (Timeout or premature crash)
-        retcode = process.poll() # Check if script died on its own
-        if retcode is not None:
-            _, stderr = process.communicate()
-            if retcode == 0:
-                return "Warning: The pick script finished cleanly, but the robot NEVER called the completion service."
-            else:
-                return f"Error executing pick script (Code {retcode}). Stderr: {stderr[-500:]}"
-
-        return "Error: Robot failed to complete pick within 60 seconds (Service call timeout)."
-        
-    except Exception as e:
-        return f"Error triggering script: {e}"
-        
-    finally:
-        # 5. THE CLEANUP CLAUSE: This runs no matter what happened above!
-        if process.poll() is None:  # If the process is still running
-            print("[CLEANUP]: Terminating the background bash script...")
-            process.terminate() # Send SIGTERM (Polite kill)
+    def cleanup_process():
+        """Kills the background bash script and ensures no ghost tmux sessions remain."""
+        if process.poll() is None:
+            print(f"[CLEANUP]: Terminating the background {action} bash script...")
+            process.terminate() 
             
             try:
-                process.wait(timeout=2.0) # Give it 2 seconds to shut down cleanly
+                process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
                 print("[CLEANUP]: Script ignored termination. Forcing SIGKILL...")
-                process.kill() # Send SIGKILL (Brutal kill)
+                process.kill()
+                
+        # Failsafe: Kill the specific tmux session
+        subprocess.run(['tmux', 'kill-session', '-t', tmux_session], capture_output=True)
 
+    try:
+        print(f"[WAITING]: Waiting for robot to call '/vlm_{action}_completed' service...")
+        
+        # 3. Wait using the dynamically passed function (wait_for_grasp or wait_for_place)
+        if wait_func(node, timeout=60.0):
+            cleanup_process()
+            past_tense = "grasped" if action == "pick" else "placed"
+            return f"Success: Object physically {past_tense} (Confirmed via Robot Service Call)."
+            
+        # 4. Handle failure cases
+        retcode = process.poll()
+        if retcode is not None:
+            _, stderr = process.communicate()
+            cleanup_process()
+            if retcode == 0:
+                return f"Warning: The {action} script finished cleanly, but the robot NEVER called the completion service."
+            else:
+                return f"Error executing {action} script (Code {retcode}). Stderr: {stderr[-500:]}"
+
+        cleanup_process()
+        return f"Error: Robot failed to complete {action} within 60 seconds (Service call timeout)."
+        
+    except Exception as e:
+        cleanup_process()
+        return f"Error triggering script: {e}"
+
+
+# ── AGENTIC TOOLS ──
+
+def execute_pick_script() -> str:
+    """Agentic Tool: Executes classical pick script."""
+    return _execute_hardware_script(
+        action="pick",
+        script_name="rail_demo_pick.sh",
+        tmux_session="rail_demo_pick",
+        flag_attr="is_grasped",
+        wait_func=wait_for_grasp
+    )
 
 def execute_place_script() -> str:
-    """Agentic Tool: Executes classical place script, verifies telemetry, and forces cleanup."""
-    script_path = "/home/homerobotics/classical-pipeline/panda-controller-ws/src/bringup/rail_demo_place.sh"
-    node = get_shared_node()
-    
-    # 1. Reset the place flag
-    node.is_placed = False
-    
-    print(f"[EXECUTION]: Triggering classical place sequence: {script_path}")
-    
-    # 2. Use Popen to start the script in the background (Non-blocking)
-    process = subprocess.Popen(
-        ['bash', script_path], 
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.PIPE,
-        text=True
+    """Agentic Tool: Executes classical place script."""
+    return _execute_hardware_script(
+        action="place",
+        script_name="rail_demo_place.sh",
+        tmux_session="rail_demo_place", 
+        flag_attr="is_placed",
+        wait_func=wait_for_place
     )
-    
-    try:
-        # 3. Wait for the Robot to call our VLM Service!
-        print("[WAITING]: Waiting for robot to call '/vlm_place_completed' service...")
-        
-        # We actively wait up to 60 seconds while the bash script runs in the background
-        if wait_for_place(node, timeout=60.0):
-            return "Success: Object physically placed (Confirmed via Robot Service Call)."
-            
-        # 4. Handle failure cases (Timeout or premature crash)
-        retcode = process.poll() # Check if script died on its own
-        if retcode is not None:
-            _, stderr = process.communicate()
-            if retcode == 0:
-                return "Warning: The place script finished cleanly, but the robot NEVER called the completion service."
-            else:
-                return f"Error executing place script (Code {retcode}). Stderr: {stderr[-500:]}"
-
-        return "Error: Robot failed to complete place within 60 seconds (Service call timeout)."
-        
-    except Exception as e:
-        return f"Error triggering script: {e}"
-        
-    finally:
-        # 5. THE CLEANUP CLAUSE: This runs no matter what happened above!
-        if process.poll() is None:  # If the process is still running
-            print("[CLEANUP]: Terminating the background bash script...")
-            process.terminate() # Send SIGTERM (Polite kill)
-            
-            try:
-                process.wait(timeout=2.0) # Give it 2 seconds to shut down cleanly
-            except subprocess.TimeoutExpired:
-                print("[CLEANUP]: Script ignored termination. Forcing SIGKILL...")
-                process.kill() # Send SIGKILL (Brutal kill)
