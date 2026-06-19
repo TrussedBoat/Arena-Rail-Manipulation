@@ -21,23 +21,47 @@ def main():
             if not user_task:
                 continue
                 
+            # input_state = {
+            #     "messages": [
+            #         SystemMessage(content=(
+            #             "You are a strict robotic orchestrator operating via JSON tools.\n"
+            #             "CRITICAL PIPELINE RULES:\n"
+            #             "1. STAGE SPLIT: Complete the PICK phase entirely before starting the PLACE phase.\n"
+            #             "2. VISUAL CHECK: Call 'get_latest_image_from_ros' to check if your target object is in view.\n"
+            #             "3. NAVIGATION & ORIENTATION: If the target is NOT in view:\n"
+            #             "   a) Call 'move_rail_to_object'. (This tool automatically ensures arm safety and moves the base).\n"
+            #             "   b) Call 'turn_panda_arm' using the EXACT angle provided by the previous tool.\n"
+            #             "   c) Call 'get_latest_image_from_ros' again to confirm the object is now in view.\n"
+            #             "4. EXECUTION: Once the PICK target is visually confirmed, call 'execute_pick_script' to physically grab it. Once the PLACE target is confirmed, call 'execute_place_script' to physically place it."
+            #         )),
+            #         HumanMessage(content=f"task: {user_task}")
+            #     ],
+            #     "iterations": 0
+            # }
+
+                        
             input_state = {
                 "messages": [
                     SystemMessage(content=(
                         "You are a strict robotic orchestrator operating via JSON tools.\n"
                         "CRITICAL PIPELINE RULES:\n"
-                        "1. STAGE SPLIT: Complete the PICK phase entirely before starting the PLACE phase.\n"
-                        "2. VISUAL CHECK: Call 'get_latest_image_from_ros' to check if your target object is in view.\n"
-                        "3. NAVIGATION & ORIENTATION: If the target is NOT in view:\n"
-                        "   a) Call 'move_rail_to_object'. (This tool automatically ensures arm safety and moves the base).\n"
-                        "   b) Call 'turn_panda_arm' using the EXACT angle provided by the previous tool.\n"
-                        "   c) Call 'get_latest_image_from_ros' again to confirm the object is now in view.\n"
-                        "4. EXECUTION: Once the PICK target is visually confirmed, call 'execute_pick_script' to physically grab it. Once the PLACE target is confirmed, output 'Action: place it into the <object>'."
+                        "1. INITIALIZATION: Call 'start_joint_controller' first to ensure the robot hardware is active.\n"
+                        "2. STAGE SPLIT: Complete the PICK phase entirely before starting the PLACE phase.\n"
+                        "3. VISUAL CHECK: Call 'get_latest_image_from_ros' to check if your target object is in view.\n"
+                        "4. NAVIGATION & ORIENTATION:\n"
+                        "   - IF the target is already in view: SKIP navigation and proceed directly to step 5.\n"
+                        "   - IF the target is NOT in view:\n"
+                        "       a) Call 'move_rail_to_object'. (This tool automatically ensures arm safety and moves the base).\n"
+                        "       b) Call 'turn_panda_arm' using the EXACT angle provided by the previous tool.\n"
+                        "       c) Call 'get_latest_image_from_ros' again to confirm the object is now in view.\n"
+                        "5. EXECUTION: Once the PICK target is visually confirmed, call 'execute_pick_script' to physically grab it. Once the PLACE target is confirmed, call 'execute_place_script' to physically place it.\n"
+                        "6. HOMING: Once the task is complete, call 'move_rail_to_object' with the PRESET value for 'home'.\n"
                     )),
                     HumanMessage(content=f"task: {user_task}")
                 ],
                 "iterations": 0
             }
+            
             
             print("\n[SYSTEM] Executing task...")
             start_time = time.time()
@@ -75,7 +99,20 @@ def main():
     except Exception as e:
         print(f"\nPipeline Error: {e}")
     finally:
+        # --- NEW: GRACEFUL SHUTDOWN BLOCK ---
+        print("\n[CLEANUP] Initiating graceful shutdown sequence...")
+        
+        # Kill the global joint controller
+        print(" -> Terminating 'global_joint_controller' tmux session...")
+        subprocess.run(['tmux', 'kill-session', '-t', 'global_joint_controller'], capture_output=True)
+        
+        # Failsafe: Kill the pick script session just in case the user pressed Ctrl+C mid-pick
+        print(" -> Terminating 'rail_demo_pick' tmux session (failsafe)...")
+        subprocess.run(['tmux', 'kill-session', '-t', 'rail_demo_pick'], capture_output=True)
+        
+        print(" -> Shutting down ROS 2 nodes...")
         rclpy.shutdown()
+        print("[CLEANUP] Shutdown complete. Goodbye!")
 
 if __name__ == '__main__':
     main()

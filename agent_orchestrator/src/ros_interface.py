@@ -25,18 +25,18 @@ class RobotHardwareInterface(Node):
         super().__init__('agent_hardware_interface')
         self.image_sub = self.create_subscription(Image, '/sim/rail_franka1/cam/wrist/color/image_raw', self.image_callback, 10)
         self.rail_subscriber = self.create_subscription(JointState, '/sim/rail_franka1/joint_states', self.rail_state_callback, 10)
-        self.rail_publisher = self.create_publisher(JointState, '/sim/rail_franka1/joint_command', 10)
+        self.rail_publisher = self.create_publisher(JointState, '/joint_position_command', 10)
 
         self.grasp_srv = self.create_service(Trigger, '/vlm_grasp_completed', self.grasp_callback)
+        self.place_srv = self.create_service(Trigger, '/vlm_place_completed', self.place_callback)
         self.is_grasped = False
+        self.is_placed = False
         
         self.bridge = CvBridge()
         self.latest_b64_image = None
         self.current_rail_position = None
         self.current_panda_joint1 = None
-        
         self.initial_rail_position = None
-        self.is_grasped = False
 
     def grasp_callback(self, request, response):
         self.get_logger().info("[TELEMETRY] Robot announced grasp completion!")
@@ -44,6 +44,14 @@ class RobotHardwareInterface(Node):
         
         response.success = True
         response.message = "VLM received grasp confirmation."
+        return response
+
+    def place_callback(self, request, response):
+        self.get_logger().info("[TELEMETRY] Robot announced place completion!")
+        self.is_placed = True
+        
+        response.success = True
+        response.message = "VLM received place confirmation."
         return response
 
     def image_callback(self, msg):
@@ -109,6 +117,15 @@ def wait_for_grasp(node: RobotHardwareInterface, timeout=60.0) -> bool:
     start = time.time()
     while (time.time() - start) < timeout:
         if node.is_grasped:
+            return True
+        time.sleep(0.1)
+    return False
+
+def wait_for_place(node: RobotHardwareInterface, timeout=60.0) -> bool:
+    """Waits for the background thread to receive the 'placed' message."""
+    start = time.time()
+    while (time.time() - start) < timeout:
+        if node.is_placed:
             return True
         time.sleep(0.1)
     return False

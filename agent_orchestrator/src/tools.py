@@ -10,6 +10,36 @@ import subprocess
 
 
 # ── TOOL EXECUTION WRAPPERS ──
+
+def start_joint_controller() -> str:
+    """Agentic Tool: Starts the global ROS 2 joint controller in the background."""
+    try:
+        # 1. Check if it's already running so we don't crash by starting it twice
+        check = subprocess.run(['tmux', 'has-session', '-t', 'global_joint_controller'], capture_output=True)
+        if check.returncode == 0:
+            return "Global joint controller is already running in the background."
+
+        print("[SYSTEM]: Launching global joint controller in tmux...")
+        
+        # 2. Create a new detached tmux session
+        subprocess.run(['tmux', 'new-session', '-d', '-s', 'global_joint_controller'], check=True)
+        
+        # 3. Send the exact startup commands you provided
+        cmd = (
+            "source /opt/ros/humble/setup.bash && "
+            "cd ~/classical-pipeline/panda-controller-ws/ && "
+            "source install/setup.bash && "
+            "ros2 run panda_python_controllers mono_controller_rail_sim --mode joint_position"
+        )
+        subprocess.run(['tmux', 'send-keys', '-t', 'global_joint_controller', cmd, 'C-m'], check=True)
+        
+        # Give ROS a few seconds to spin up the node
+        time.sleep(3.0)
+        return "Success: Global joint controller started. The robot is ready to receive movement commands."
+        
+    except Exception as e:
+        return f"Error starting controller: {e}"
+        
 def get_latest_ros_image(timeout_sec=10.0) -> str:
     node = get_shared_node()
     start = time.time()
@@ -63,7 +93,7 @@ def move_rail_to_object(target_object: str) -> str:
         with open("semantic_distances.json", "r") as f:
             distances = json.load(f)
             
-        clean_target = target_object.lower().strip().replace(" ", "_")
+        clean_target = target_object.lower().strip()
         
         # 1. Get Semantic Offsets
         if clean_target in ['laptop', 'home', 'start']:
@@ -149,7 +179,7 @@ def execute_pick_script() -> str:
     script_path = "/home/homerobotics/classical-pipeline/panda-controller-ws/src/bringup/rail_demo_pick.sh"
     node = get_shared_node()
     
-    # 1. Reset the grasp flag
+    # 1. Reset the pick flag
     node.is_grasped = False
     
     print(f"[EXECUTION]: Triggering classical pick sequence: {script_path}")
@@ -167,7 +197,7 @@ def execute_pick_script() -> str:
         print("[WAITING]: Waiting for robot to call '/vlm_grasp_completed' service...")
         
         # We actively wait up to 60 seconds while the bash script runs in the background
-        if wait_for_grasp(node, timeout=100.0):
+        if wait_for_grasp(node, timeout=60.0):
             return "Success: Object physically grasped (Confirmed via Robot Service Call)."
             
         # 4. Handle failure cases (Timeout or premature crash)
@@ -178,8 +208,61 @@ def execute_pick_script() -> str:
                 return "Warning: The pick script finished cleanly, but the robot NEVER called the completion service."
             else:
                 return f"Error executing pick script (Code {retcode}). Stderr: {stderr[-500:]}"
-                
-        return "Error: Robot failed to complete grasp within 60 seconds (Service call timeout)."
+
+        return "Error: Robot failed to complete pick within 60 seconds (Service call timeout)."
+        
+    except Exception as e:
+        return f"Error triggering script: {e}"
+        
+    finally:
+        # 5. THE CLEANUP CLAUSE: This runs no matter what happened above!
+        if process.poll() is None:  # If the process is still running
+            print("[CLEANUP]: Terminating the background bash script...")
+            process.terminate() # Send SIGTERM (Polite kill)
+            
+            try:
+                process.wait(timeout=2.0) # Give it 2 seconds to shut down cleanly
+            except subprocess.TimeoutExpired:
+                print("[CLEANUP]: Script ignored termination. Forcing SIGKILL...")
+                process.kill() # Send SIGKILL (Brutal kill)
+
+
+def execute_place_script() -> str:
+    """Agentic Tool: Executes classical place script, verifies telemetry, and forces cleanup."""
+    script_path = "/home/homerobotics/classical-pipeline/panda-controller-ws/src/bringup/rail_demo_place.sh"
+    node = get_shared_node()
+    
+    # 1. Reset the place flag
+    node.is_placed = False
+    
+    print(f"[EXECUTION]: Triggering classical place sequence: {script_path}")
+    
+    # 2. Use Popen to start the script in the background (Non-blocking)
+    process = subprocess.Popen(
+        ['bash', script_path], 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    
+    try:
+        # 3. Wait for the Robot to call our VLM Service!
+        print("[WAITING]: Waiting for robot to call '/vlm_place_completed' service...")
+        
+        # We actively wait up to 60 seconds while the bash script runs in the background
+        if wait_for_place(node, timeout=60.0):
+            return "Success: Object physically placed (Confirmed via Robot Service Call)."
+            
+        # 4. Handle failure cases (Timeout or premature crash)
+        retcode = process.poll() # Check if script died on its own
+        if retcode is not None:
+            _, stderr = process.communicate()
+            if retcode == 0:
+                return "Warning: The place script finished cleanly, but the robot NEVER called the completion service."
+            else:
+                return f"Error executing place script (Code {retcode}). Stderr: {stderr[-500:]}"
+
+        return "Error: Robot failed to complete place within 60 seconds (Service call timeout)."
         
     except Exception as e:
         return f"Error triggering script: {e}"
