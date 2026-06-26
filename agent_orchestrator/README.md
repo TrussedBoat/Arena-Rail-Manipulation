@@ -25,13 +25,7 @@ A multimodal ROS 2 agent that captures environmental state via camera and orches
 
 ## 🛠️ Installation & Setup
 
-### 1. Clone the Repository
-```bash
-git clone https://github.com/romerhomerobotics/Agent.git
-cd Agent
-```
-
-### 2. Install Prerequisites
+### 1. Install Prerequisites
 
 #### Install `uv`
 ```bash
@@ -40,7 +34,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 wget -qO- https://astral.sh/uv/install.sh | sh
 ```
 
-### 3. Setup Python Environment (using `uv`)
+### 2. Setup Python Environment (using `uv`)
 ```bash
 # Initialize uv project (if not already)
 uv init --python 3.10
@@ -53,29 +47,40 @@ source agent_orchestrator/bin/activate
 uv pip install -r requirements.txt 
 ```
 
-## 🎮 Running the Orchestrator
+## 🎮 Running the Orchestrator (Neo-Classic Pipeline)
 
-To run the full system, open three separate terminals:
+To run the full system, open two separate terminals:
 
 ### Terminal 1: Start the Arena Simulation
 ```bash
 cd Workspace/Arena-RealSim
-./scripts/start_arena.sh
+./scripts/start_arena.sh rail
 ```
 
-### Terminal 2: Start the `llama.cpp` Server
-```bash
-cd Workspace/llama.cpp
-./build/bin/llama-server  -m ./models/Qwen3.6-35B-A3B-UD-IQ2_M.gguf  --mmproj models/mmproj-F32-nmtp.gguf  -ngl 99  -c 12288  -np 1  -fa on  --host 127.0.0.1  --port 8080 --reasoning off
-```
-
-### Terminal 3: Run the Orchestrator Agent
+### Terminal 2: Run the Orchestrator Agent
 ```bash
 cd Workspace/Arena-RealSim
-source agent_orchestrator/bin/activate
+source agent_orchestrator/agent_orchestrator/bin/activate
 source /opt/ros/humble/setup.bash
 python3 agent_orchestrator/src/main.py
 ```
+
+## 🎮 Running the Orchestrator (VLA)
+
+To run the full system, open two separate terminals:
+
+### Terminal 1: Start the Arena Simulation
+```bash
+cd Workspace/Arena-RealSim
+./scripts/start_arena.sh rail openvla
+```
+
+### Terminal 2: Run the Orchestrator Agent
+```bash
+cd Workspace/Arena-RealSim
+source agent_orchestrator/agent_orchestrator/bin/activate
+source /opt/ros/humble/setup.bash
+python3 agent_orchestrator/src/main.py --vla 'openvla'
 
 ## 📂 Project Structure
 

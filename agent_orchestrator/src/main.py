@@ -7,8 +7,21 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from agent import agent, AgentState
 
 def main():
+    import argparse
+    import tools
+
+    parser = argparse.ArgumentParser(description="Interactive dynamic agentic-tool pipeline")
+    parser.add_argument('--vla', type=str, default=None, help="Name of the VLA to use (e.g., 'openvla')")
+    cli_args, unknown = parser.parse_known_args()
+
+    if cli_args.vla:
+        tools.VLA_NAME = cli_args.vla
+        print(f"[SYSTEM] Running with VLA model configuration: {tools.VLA_NAME}")
+
     rclpy.init()
     try:
+        tools.start_vlm_server()
+        time.sleep(5)
         print("Starting interactive dynamic agentic-tool pipeline...")
         print("Type 'quit' or 'exit' at any time to stop the script.\n")
         
@@ -20,10 +33,12 @@ def main():
                 break
 
             if user_task == "":
-                user_task = "pick up the apple and place it into the purple bowl"
+                user_task = "pick up the apple and place it in the bowl"
                 
             if not user_task:
                 continue
+
+            tools.USER_TASK = user_task
                 
             # input_state = {
             #     "messages": [
@@ -113,6 +128,15 @@ def main():
         
         print(" -> Terminating 'rail_demo_pick' tmux session (failsafe)...")
         subprocess.run(['tmux', 'kill-session', '-t', 'rail_demo_pick'], capture_output=True)
+        
+        print(" -> Terminating 'rail_demo_place' tmux session (failsafe)...")
+        subprocess.run(['tmux', 'kill-session', '-t', 'rail_demo_place'], capture_output=True)
+        
+        print(" -> Terminating 'openvla_rail_demo' tmux session (failsafe)...")
+        subprocess.run(['tmux', 'kill-session', '-t', 'openvla_rail_demo'], capture_output=True)
+        
+        print(" -> Terminating 'vlm_server' tmux session (failsafe)...")
+        tools.stop_vlm_server()
         
         print(" -> Shutting down ROS 2 nodes...")
         rclpy.shutdown()

@@ -3,8 +3,13 @@ import os
 
 # --- SIMULATION CONFIGURATION ---
 DEFAULT_CONFIG = {"width": 1280, "height": 720, "sync_loads": True, "headless": False, "renderer": "RaytracedLighting"}
-#SCENE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'isaac_worlds', 'Arena_wall_upd.usd'))
-SCENE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "isaac_worlds", "rail_only.usd"))
+MAIN_SCENE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'isaac_worlds', 'Arena_wall_upd.usd'))
+RAIL_SCENE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'isaac_worlds', 'rail_only.usd'))
+
+
+RAIL_F1_WRIST_CAM_PRIM_PATH = "/Island/Rail_System_02/Rail_System/Franka1/panda_hand/franka1_wrist_cam/RSD455/Camera_OmniVision_OV9782_Color"
+RAIL_F1_SIDE_CAM_PRIM_PATH = "/Island/Rail_System_02/Rail_System/franka1_front_cam/RSD455/Camera_OmniVision_OV9782_Color"
+
 
 # --- DEVICE CONFIGURATION ---
 # Each device entry defines its ROS topic, joint name(s), position limits, unit, and category.

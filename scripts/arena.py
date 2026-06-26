@@ -1,11 +1,11 @@
 import argparse
 import os
 from omni.isaac.kit import SimulationApp
-from arena.config import DEFAULT_CONFIG, SCENE_PATH
+from arena.config import DEFAULT_CONFIG, MAIN_SCENE_PATH
 
 # 0. Handle CLI arguments
 parser = argparse.ArgumentParser(description="Arena Simulation Script")
-parser.add_argument("--scene", type=str, default=SCENE_PATH, help="Path to the USD scene file")
+parser.add_argument("--scene", type=str, default=MAIN_SCENE_PATH, help="Path to the USD scene file")
 parser.add_argument("--headless", action="store_true", help="Run simulation in headless mode")
 args, unknown = parser.parse_known_args()
 

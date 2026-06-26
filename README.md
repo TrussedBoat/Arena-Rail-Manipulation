@@ -47,7 +47,7 @@ scripts/
 ### 1. Installation
 Clone the repository into your workspace:
 ```bash
-git clone git@github.com:romerhomerobotics/Arena-RealSim.git
+git clone https://github.com/romerhomerobotics/Arena-RealSim.git
 cd Arena-RealSim
 ```
 
