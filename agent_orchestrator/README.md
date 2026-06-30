@@ -47,7 +47,7 @@ source agent_orchestrator/bin/activate
 uv pip install -r requirements.txt 
 ```
 
-## 🎮 Running the Orchestrator (Neo-Classic Pipeline)
+## 🎮 Running the Orchestrator for Neo-Classic Pipeline
 
 To run the full system, open two separate terminals:
 
@@ -64,23 +64,6 @@ source agent_orchestrator/agent_orchestrator/bin/activate
 source /opt/ros/humble/setup.bash
 python3 agent_orchestrator/src/main.py
 ```
-
-## 🎮 Running the Orchestrator (VLA)
-
-To run the full system, open two separate terminals:
-
-### Terminal 1: Start the Arena Simulation
-```bash
-cd Workspace/Arena-RealSim
-./scripts/start_arena.sh rail openvla
-```
-
-### Terminal 2: Run the Orchestrator Agent
-```bash
-cd Workspace/Arena-RealSim
-source agent_orchestrator/agent_orchestrator/bin/activate
-source /opt/ros/humble/setup.bash
-python3 agent_orchestrator/src/main.py --vla 'openvla'
 
 ## 📂 Project Structure
 

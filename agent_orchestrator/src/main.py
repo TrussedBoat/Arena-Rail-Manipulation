@@ -7,21 +7,14 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from agent import agent, AgentState
 
 def main():
-    import argparse
+    rclpy.init()
     import tools
 
-    parser = argparse.ArgumentParser(description="Interactive dynamic agentic-tool pipeline")
-    parser.add_argument('--vla', type=str, default=None, help="Name of the VLA to use (e.g., 'openvla')")
-    cli_args, unknown = parser.parse_known_args()
-
-    if cli_args.vla:
-        tools.VLA_NAME = cli_args.vla
-        print(f"[SYSTEM] Running with VLA model configuration: {tools.VLA_NAME}")
-
-    rclpy.init()
     try:
         tools.start_vlm_server()
+        print(f"\n[SYSTEM] VLM agent is loading into the GPU, please wait...")
         time.sleep(5)
+        
         print("Starting interactive dynamic agentic-tool pipeline...")
         print("Type 'quit' or 'exit' at any time to stop the script.\n")
         
@@ -33,31 +26,10 @@ def main():
                 break
 
             if user_task == "":
-                user_task = "pick up the apple and place it in the bowl"
+                user_task = "pick up the apple and place it into the purple bowl"
                 
             if not user_task:
                 continue
-
-            tools.USER_TASK = user_task
-                
-            # input_state = {
-            #     "messages": [
-            #         SystemMessage(content=(
-            #             "You are a strict robotic orchestrator operating via JSON tools.\n"
-            #             "CRITICAL PIPELINE RULES:\n"
-            #             "1. STAGE SPLIT: Complete the PICK phase entirely before starting the PLACE phase.\n"
-            #             "2. VISUAL CHECK: Call 'get_latest_image_from_ros' to check if your target object is in view.\n"
-            #             "3. NAVIGATION & ORIENTATION: If the target is NOT in view:\n"
-            #             "   a) Call 'move_rail_to_object'. (This tool automatically ensures arm safety and moves the base).\n"
-            #             "   b) Call 'turn_panda_arm' using the EXACT angle provided by the previous tool.\n"
-            #             "   c) Call 'get_latest_image_from_ros' again to confirm the object is now in view.\n"
-            #             "4. EXECUTION: Once the PICK target is visually confirmed, call 'execute_pick_script' to physically grab it. Once the PLACE target is confirmed, call 'execute_place_script' to physically place it."
-            #         )),
-            #         HumanMessage(content=f"task: {user_task}")
-            #     ],
-            #     "iterations": 0
-            # }
-
                         
             input_state = {
                 "messages": [
@@ -131,10 +103,7 @@ def main():
         
         print(" -> Terminating 'rail_demo_place' tmux session (failsafe)...")
         subprocess.run(['tmux', 'kill-session', '-t', 'rail_demo_place'], capture_output=True)
-        
-        print(" -> Terminating 'openvla_rail_demo' tmux session (failsafe)...")
-        subprocess.run(['tmux', 'kill-session', '-t', 'openvla_rail_demo'], capture_output=True)
-        
+
         print(" -> Terminating 'vlm_server' tmux session (failsafe)...")
         tools.stop_vlm_server()
         

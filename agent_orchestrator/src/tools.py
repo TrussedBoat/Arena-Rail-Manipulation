@@ -238,40 +238,10 @@ def _execute_hardware_script(action: str, script_name: str, tmux_session: str, f
     
     # 1. Reset the specific completion flag dynamically (e.g., node.is_grasped = False)
     setattr(node, flag_attr, False)
-    
-    is_vla = (script_name == "openvla_rail_demo.sh")
-    if is_vla:
-        print("[SYSTEM]: VLA script execution requested. Killing VLM server first to free resources...")
-        stop_vlm_server()
-        
-        # Send stage command to rail.py simulation via ZeroMQ
-        try:
-            import zmq
-            context = zmq.Context()
-            socket = context.socket(zmq.REQ)
-            socket.connect("tcp://127.0.0.1:5555")
-            socket.setsockopt(zmq.RCVTIMEO, 1000)
-            socket.setsockopt(zmq.SNDTIMEO, 1000)
-            print(f"[SYSTEM] Sending ZMQ stage change command: {action}...")
-            socket.send_string(action)
-            socket.recv_string() # Wait for confirmation "ok"
-            socket.close()
-            context.term()
-        except Exception as e:
-            print(f"[SYSTEM] Warning: ZMQ communication to set camera pose failed: {e}")
-            
-        time.sleep(2.0)
-
-    print(f"[EXECUTION]: Triggering {'VLA' if is_vla else 'classical'} {action} sequence: {script_path}")
-    
-    cmd = ['bash', script_path]
-    if VLA_NAME is not None:
-        cmd.append(USER_TASK)
-    else:
-        cmd.append(target_object)
+    print(f"[EXECUTION]: Triggering classical {action} sequence: {script_path}")
         
     process = subprocess.Popen(
-        cmd, 
+        ['bash', script_path, target_object], 
         stdout=subprocess.PIPE, 
         stderr=subprocess.PIPE,
         text=True
@@ -292,97 +262,54 @@ def _execute_hardware_script(action: str, script_name: str, tmux_session: str, f
         # Failsafe: Kill the specific tmux session
         subprocess.run(['tmux', 'kill-session', '-t', tmux_session], capture_output=True)
 
-    result = ""
+
     try:
         print(f"[WAITING]: Waiting for robot to call '/vlm_{action}_completed' service...")
-        
+
         # 3. Wait using the dynamically passed function (wait_for_grasp or wait_for_place)
         if wait_func(node, timeout=60.0):
             cleanup_process()
             past_tense = "grasped" if action == "pick" else "placed"
-            result = f"Success: Object physically {past_tense} (Confirmed via Robot Service Call)."
-        else:
-            # 4. Handle failure cases
-            retcode = process.poll()
-            if retcode is not None:
-                _, stderr = process.communicate()
-                cleanup_process()
-                if retcode == 0:
-                    result = f"Warning: The {action} script finished cleanly, but the robot NEVER called the completion service."
-                else:
-                    result = f"Error executing {action} script (Code {retcode}). Stderr: {stderr[-500:]}"
+            return f"Success: Object physically {past_tense} (Confirmed via Robot Service Call)."
+            
+        # 4. Handle failure cases
+        retcode = process.poll()
+        if retcode is not None:
+            _, stderr = process.communicate()
+            cleanup_process()
+            if retcode == 0:
+                return f"Warning: The {action} script finished cleanly, but the robot NEVER called the completion service."
             else:
-                cleanup_process()
-                result = f"Error: Robot failed to complete {action} within 60 seconds (Service call timeout)."
-        
+                return f"Error executing {action} script (Code {retcode}). Stderr: {stderr[-500:]}"
+
+        cleanup_process()
+        return f"Error: Robot failed to complete {action} within 60 seconds (Service call timeout)."
+
     except Exception as e:
         cleanup_process()
-        result = f"Error triggering script: {e}"
-    finally:
-        if is_vla:
-            print("[SYSTEM]: VLA execution finished. Restarting VLM server...")
-            # Reset the ZMQ stage to "none"
-            try:
-                import zmq
-                context = zmq.Context()
-                socket = context.socket(zmq.REQ)
-                socket.connect("tcp://127.0.0.1:5555")
-                socket.setsockopt(zmq.RCVTIMEO, 1000)
-                socket.setsockopt(zmq.SNDTIMEO, 1000)
-                print("[SYSTEM] Sending ZMQ reset command...")
-                socket.send_string("none")
-                socket.recv_string()
-                socket.close()
-                context.term()
-            except Exception as e:
-                print(f"[SYSTEM] Warning: ZMQ communication to reset camera pose failed: {e}")
-                
-            start_vlm_server()
-            time.sleep(10.0)
-
-    return result
+        return f"Error triggering script: {e}"
 
 
 # ── AGENTIC TOOLS ──
 
 def execute_pick_script(target_object: str) -> str:
     """Agentic Tool: Executes classical pick script."""
-    if VLA_NAME == "openvla":
-        return _execute_hardware_script(
-            action="pick",
-            script_name="openvla_rail_demo.sh",
-            tmux_session="openvla_rail_demo",
-            flag_attr="is_grasped",
-            wait_func=wait_for_grasp,
-            target_object=USER_TASK
-        )
-    else:
-        return _execute_hardware_script(
-            action="pick",
-            script_name="rail_demo_pick.sh",
-            tmux_session="rail_demo_pick",
-            flag_attr="is_grasped",
-            wait_func=wait_for_grasp,
-            target_object=target_object
-        )
+    return _execute_hardware_script(
+        action="pick",
+        script_name="rail_demo_pick.sh",
+        tmux_session="rail_demo_pick",
+        flag_attr="is_grasped",
+        wait_func=wait_for_grasp,
+        target_object=target_object
+    )
 
 def execute_place_script(target_object: str) -> str:
     """Agentic Tool: Executes classical place script."""
-    if VLA_NAME == "openvla":
-        return _execute_hardware_script(
-            action="place",
-            script_name="openvla_rail_demo.sh",
-            tmux_session="openvla_rail_demo",
-            flag_attr="is_placed",
-            wait_func=wait_for_place,
-            target_object=USER_TASK
-        )
-    else:
-        return _execute_hardware_script(
-            action="place",
-            script_name="rail_demo_place.sh",
-            tmux_session="rail_demo_place", 
-            flag_attr="is_placed",
-            wait_func=wait_for_place,
-            target_object=target_object
-        )
+    return _execute_hardware_script(
+        action="place",
+        script_name="rail_demo_place.sh",
+        tmux_session="rail_demo_place", 
+        flag_attr="is_placed",
+        wait_func=wait_for_place,
+        target_object=target_object
+    )
