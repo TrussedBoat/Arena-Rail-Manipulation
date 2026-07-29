@@ -1,0 +1,31 @@
+#!/bin/bash
+set -e
+
+# Project root directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Ensure local bin is in PATH for uv/python binaries
+export PATH="$HOME/.local/bin:$PATH"
+
+# Source ROS 2 Humble
+if [ -f /opt/ros/humble/setup.bash ]; then
+    echo "[+] Sourcing ROS 2 Humble..."
+    source /opt/ros/humble/setup.bash
+else
+    echo "[!] Warning: /opt/ros/humble/setup.bash not found."
+fi
+
+# Activate agent virtual environment
+VENV_PATH="$SCRIPT_DIR/agent_orchestrator/agent_env/bin/activate"
+if [ -f "$VENV_PATH" ]; then
+    echo "[+] Activating agent virtual environment ($VENV_PATH)..."
+    source "$VENV_PATH"
+else
+    echo "[!] Error: Virtual environment not found at $VENV_PATH"
+    echo "    Run setup to create the environment."
+    exit 1
+fi
+
+echo "[+] Starting Robotic Task Orchestrator..."
+exec python3 agent_orchestrator/src/main.py
