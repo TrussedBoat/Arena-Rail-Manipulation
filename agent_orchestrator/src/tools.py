@@ -1254,12 +1254,35 @@ def home_panda_arm() -> str:
         return "Warning: Arm homing command dispatched, but timed out verifying final position."
 
 
-def _execute_hardware_script(action: str, script_path: Path, tmux_session: str, flag_attr: str, wait_func, target_object: str) -> str:
+def _execute_hardware_script(
+    action: str,
+    script_path: Path,
+    tmux_session: str,
+    flag_attr: str,
+    wait_func,
+    target_object: str,
+    *,
+    allow_mock: bool,
+) -> str:
     """Core logic runner for any physical hardware bash script."""
     node = get_shared_node()
-    
+
     # 1. Reset the specific completion flag dynamically (e.g., node.is_grasped = False)
     setattr(node, flag_attr, False)
+
+    if not script_path.is_file():
+        if not allow_mock:
+            return (
+                f"Error: Hardware script '{script_path.name}' was not found and "
+                "mock hardware execution is disabled."
+            )
+        print(
+            f"[MOCK HARDWARE] Hardware script '{script_path.name}' not found. "
+            f"Simulating success for {action}..."
+        )
+        setattr(node, flag_attr, True)
+        return f"Success: Mock hardware {action} completed for testing."
+
     print(f"[EXECUTION]: Triggering classical {action} sequence: {script_path}")
         
     process = subprocess.Popen(
@@ -1323,7 +1346,8 @@ def execute_pick_script(target_object: str) -> str:
         tmux_session="rail_demo_pick",
         flag_attr="is_grasped",
         wait_func=wait_for_grasp,
-        target_object=target_object
+        target_object=target_object,
+        allow_mock=config.allow_mock_hardware_scripts,
     )
 
 def execute_place_script(target_object: str) -> str:
@@ -1335,5 +1359,6 @@ def execute_place_script(target_object: str) -> str:
         tmux_session="rail_demo_place", 
         flag_attr="is_placed",
         wait_func=wait_for_place,
-        target_object=target_object
+        target_object=target_object,
+        allow_mock=config.allow_mock_hardware_scripts,
     )

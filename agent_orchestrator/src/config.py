@@ -122,6 +122,7 @@ class RuntimeConfig:
     yolo: YOLOConfig
     search: SearchConfig
     paths: PathConfig
+    allow_mock_hardware_scripts: bool
 
 
 _runtime_config: RuntimeConfig | None = None
@@ -331,6 +332,9 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
                 controller_root / "src/bringup/rail_demo_place.sh",
             ),
         ),
+        allow_mock_hardware_scripts=_env_bool(
+            source, "YOLO_VLM_ALLOW_MOCK_HARDWARE_SCRIPTS", True
+        ),
     )
 
 
@@ -419,12 +423,28 @@ def validate_runtime_config(
         "static semantic coordinates": config.paths.static_semantic_coordinates,
         "ROS 2 setup script": config.paths.ros_setup_script,
         "controller setup script": config.paths.controller_setup_script,
-        "pick script": config.paths.pick_script,
-        "place script": config.paths.place_script,
     }
     for label, path in required_files.items():
         if not path.is_file():
             errors.append(f"{label} does not exist or is not a file: {path}")
+
+    hardware_scripts = {
+        "pick": config.paths.pick_script,
+        "place": config.paths.place_script,
+    }
+    for action, path in hardware_scripts.items():
+        if path.is_file():
+            continue
+        if config.allow_mock_hardware_scripts:
+            print(
+                f"[CONFIG WARNING] {action.capitalize()} hardware script is missing: "
+                f"{path}. Mock hardware execution is enabled."
+            )
+        else:
+            errors.append(
+                f"{action} script does not exist or is not a file and mock "
+                f"hardware execution is disabled: {path}"
+            )
 
     if config.vlm.executable.is_file() and not os.access(config.vlm.executable, os.X_OK):
         errors.append(f"llama.cpp executable is not executable: {config.vlm.executable}")
