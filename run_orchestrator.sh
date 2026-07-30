@@ -8,13 +8,18 @@ cd "$SCRIPT_DIR"
 # Ensure local bin is in PATH for uv/python binaries
 export PATH="$HOME/.local/bin:$PATH"
 
+# ROS 2 network isolation — must match the domain used by run_sim.sh
+export ROS_DOMAIN_ID=42
+export ROS_LOCALHOST_ONLY=1
+
 # Source ROS 2 Humble
 if [ -f /opt/ros/humble/setup.bash ]; then
-    echo "[+] Sourcing ROS 2 Humble..."
+    echo "[+] Sourcing ROS 2 Humble (Domain ID: $ROS_DOMAIN_ID, localhost only)..."
     source /opt/ros/humble/setup.bash
 else
     echo "[!] Warning: /opt/ros/humble/setup.bash not found."
 fi
+
 
 # Activate agent virtual environment
 VENV_PATH="$SCRIPT_DIR/agent_orchestrator/agent_env/bin/activate"

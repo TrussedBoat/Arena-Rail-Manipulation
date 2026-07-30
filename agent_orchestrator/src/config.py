@@ -7,8 +7,43 @@ from pathlib import Path
 from typing import Collection, Mapping, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_LLAMA_ROOT = Path("/home/homerobotics/Workspace/llama.cpp")
-DEFAULT_CONTROLLER_ROOT = Path("/home/homerobotics/classical-pipeline/panda-controller-ws")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ── EDITABLE CONFIGURATION ──────────────────────────────────────────────
+# Adjust these values to match your local machine. Everything else in this
+# file is logic — you should not need to edit below this block.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# --- Paths ---
+DEFAULT_LLAMA_ROOT      = Path("/home/thinkstation-sim/workspace/llama.cpp")
+DEFAULT_CONTROLLER_ROOT = Path("/home/thinkstation-sim/ros2_ws")
+
+# --- VLM model filenames (relative to DEFAULT_LLAMA_ROOT/models/) ---
+VLM_MODEL_FILENAME  = "Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+VLM_MMPROJ_FILENAME = "mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+VLM_MODEL_ALIAS     = "Qwen3VL-8B-Instruct-Q4_K_M"
+
+# --- YOLO checkpoint (set to None until weights are available) ---
+# Example: PROJECT_ROOT / "agent_orchestrator/models/yolo11s.pt"
+YOLO_CHECKPOINT_PATH: Path | None = None
+
+# --- VLM server settings ---
+VLM_SERVER_HOST            = "127.0.0.1"
+VLM_SERVER_PORT            = 8080
+VLM_CONTEXT_SIZE           = 4096
+VLM_PARALLEL_SLOTS         = 1
+VLM_GPU_LAYERS             = 99
+VLM_FLASH_ATTENTION        = True
+VLM_MAX_COMPLETION_TOKENS  = 256
+VLM_VRAM_BUDGET_GB         = 8.0
+VLM_TOTAL_GPU_VRAM_GB      = 16.0
+
+# --- Search / rail parameters ---
+SEARCH_RAIL_MIN             = -1.10   # metres
+SEARCH_RAIL_MAX             =  1.10   # metres
+SEARCH_RAIL_WAYPOINT_SPACING = 0.20   # metres between scan stops
+
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 class RuntimeConfigurationError(RuntimeError):
@@ -177,26 +212,26 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             model_path=_env_path(
                 source,
                 "YOLO_VLM_MODEL_PATH",
-                llama_root / "models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+                llama_root / "models" / VLM_MODEL_FILENAME,
             ),
             mmproj_path=_env_path(
                 source,
                 "YOLO_VLM_MMPROJ_PATH",
-                llama_root / "models/mmproj-Qwen2.5-VL-7B-Instruct-Q8_0.gguf",
+                llama_root / "models" / VLM_MMPROJ_FILENAME,
             ),
-            host=_env_value(source, "YOLO_VLM_SERVER_HOST", "127.0.0.1"),
-            port=_env_int(source, "YOLO_VLM_SERVER_PORT", 8080),
+            host=_env_value(source, "YOLO_VLM_SERVER_HOST", VLM_SERVER_HOST),
+            port=_env_int(source, "YOLO_VLM_SERVER_PORT", VLM_SERVER_PORT),
             model_alias=_env_value(
                 source,
                 "YOLO_VLM_MODEL_ALIAS",
-                "Qwen2.5-VL-7B-Instruct-Q4_K_M",
+                VLM_MODEL_ALIAS,
             ),
-            context_size=_env_int(source, "YOLO_VLM_CONTEXT_SIZE", 4096),
-            parallel_slots=_env_int(source, "YOLO_VLM_PARALLEL_SLOTS", 1),
-            gpu_layers=_env_int(source, "YOLO_VLM_GPU_LAYERS", 99),
-            flash_attention=_env_bool(source, "YOLO_VLM_FLASH_ATTENTION", True),
+            context_size=_env_int(source, "YOLO_VLM_CONTEXT_SIZE", VLM_CONTEXT_SIZE),
+            parallel_slots=_env_int(source, "YOLO_VLM_PARALLEL_SLOTS", VLM_PARALLEL_SLOTS),
+            gpu_layers=_env_int(source, "YOLO_VLM_GPU_LAYERS", VLM_GPU_LAYERS),
+            flash_attention=_env_bool(source, "YOLO_VLM_FLASH_ATTENTION", VLM_FLASH_ATTENTION),
             max_completion_tokens=_env_int(
-                source, "YOLO_VLM_MAX_COMPLETION_TOKENS", 256
+                source, "YOLO_VLM_MAX_COMPLETION_TOKENS", VLM_MAX_COMPLETION_TOKENS
             ),
             request_timeout_sec=_env_float(
                 source, "YOLO_VLM_REQUEST_TIMEOUT_SEC", 120.0
@@ -207,9 +242,9 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             health_timeout_sec=_env_float(
                 source, "YOLO_VLM_HEALTH_TIMEOUT_SEC", 2.0
             ),
-            vram_budget_gb=_env_float(source, "YOLO_VLM_VRAM_BUDGET_GB", 8.0),
+            vram_budget_gb=_env_float(source, "YOLO_VLM_VRAM_BUDGET_GB", VLM_VRAM_BUDGET_GB),
             total_gpu_vram_gb=_env_float(
-                source, "YOLO_VLM_TOTAL_GPU_VRAM_GB", 16.0
+                source, "YOLO_VLM_TOTAL_GPU_VRAM_GB", VLM_TOTAL_GPU_VRAM_GB
             ),
             extra_server_args=tuple(
                 shlex.split(source.get("YOLO_VLM_SERVER_EXTRA_ARGS", ""))
@@ -219,7 +254,9 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             checkpoint_path=_env_path(
                 source,
                 "YOLO_VLM_YOLO_CHECKPOINT",
-                PROJECT_ROOT / "agent_orchestrator/models/yolo11s.pt",
+                # YOLO_CHECKPOINT_PATH is None until weights are available.
+                # Validation will skip file-existence checks when path is absent.
+                YOLO_CHECKPOINT_PATH or PROJECT_ROOT / "agent_orchestrator/models/placeholder.pt",
             ),
             confidence_threshold=_env_float(
                 source, "YOLO_VLM_YOLO_CONFIDENCE", 0.85
@@ -232,10 +269,10 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             ),
         ),
         search=SearchConfig(
-            rail_min_position=_env_float(source, "YOLO_VLM_RAIL_MIN", -1.10),
-            rail_max_position=_env_float(source, "YOLO_VLM_RAIL_MAX", 1.10),
+            rail_min_position=_env_float(source, "YOLO_VLM_RAIL_MIN", SEARCH_RAIL_MIN),
+            rail_max_position=_env_float(source, "YOLO_VLM_RAIL_MAX", SEARCH_RAIL_MAX),
             rail_waypoint_spacing=_env_float(
-                source, "YOLO_VLM_RAIL_WAYPOINT_SPACING", 0.20
+                source, "YOLO_VLM_RAIL_WAYPOINT_SPACING", SEARCH_RAIL_WAYPOINT_SPACING
             ),
             centering_min_step=_env_float(
                 source, "YOLO_VLM_CENTERING_MIN_STEP", 0.005

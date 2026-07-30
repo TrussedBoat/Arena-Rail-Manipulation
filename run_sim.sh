@@ -5,9 +5,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ROS 2 network isolation — must match the domain used by run_orchestrator.sh
+export ROS_DOMAIN_ID=42
+export ROS_LOCALHOST_ONLY=1
+
 # Source ROS 2 Humble
 if [ -f /opt/ros/humble/setup.bash ]; then
-    echo "[+] Sourcing ROS 2 Humble..."
+    echo "[+] Sourcing ROS 2 Humble (Domain ID: $ROS_DOMAIN_ID, localhost only)..."
     source /opt/ros/humble/setup.bash
 else
     echo "[!] Warning: /opt/ros/humble/setup.bash not found."
