@@ -23,9 +23,9 @@ VLM_MODEL_FILENAME  = "Qwen3VL-8B-Instruct-Q4_K_M.gguf"
 VLM_MMPROJ_FILENAME = "mmproj-Qwen3VL-8B-Instruct-F16.gguf"
 VLM_MODEL_ALIAS     = "Qwen3VL-8B-Instruct-Q4_K_M"
 
-# --- YOLO checkpoint (set to None until weights are available) ---
-# Example: PROJECT_ROOT / "agent_orchestrator/models/yolo11s.pt"
-YOLO_CHECKPOINT_PATH: Path | None = None
+# --- YOLO checkpoint ---
+YOLO_CHECKPOINT_PATH: Path | None = PROJECT_ROOT / "agent_orchestrator/models/yolo11s.pt"
+
 
 # --- VLM server settings ---
 VLM_SERVER_HOST            = "127.0.0.1"
