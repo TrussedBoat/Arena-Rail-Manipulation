@@ -1,240 +1,419 @@
 import json
 from typing import TypedDict
 
-from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import BaseMessage, ToolMessage
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
+from langgraph.graph import END, START, StateGraph
 
+from config import get_runtime_config
 from tools import (
-    start_joint_controller,
-    get_latest_ros_image,
-    get_current_joint_states,
-    move_rail_to_object, 
-    home_panda_arm,
-    turn_panda_arm,
     execute_pick_script,
     execute_place_script,
+    move_rail_to_object,
+    search_and_locate_with_yolo,
+    start_joint_controller,
 )
 
-MODEL_NAME = "Qwen3.6-35B"
+runtime_config = get_runtime_config()
+MODEL_NAME = runtime_config.vlm.model_alias
 
 tool_definitions = [
     {
         "type": "function",
         "function": {
             "name": "start_joint_controller",
-            "description": "Initializes the global ROS 2 joint controller. This MUST be called at the very beginning of the task before attempting to move the rails or arm.",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_robot_joint_states",
-            "description": "Read the live metrics of the hardware. Use this to check if the arm is at 0.0 before moving rails.",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "home_panda_arm",
-            "description": "Command the panda_joint1 actuator to return to its default safe home position (0.0 radians). Use this if the arm is displaced before rail operations.",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_latest_image_from_ros",
-            "description": "Get visual workspace data from the camera stream. Use this if you need to see the scene.",
+            "description": "Initialize the robot joint controller. Always call this first.",
             "parameters": {
                 "type": "object",
-                "properties": {"timeout_sec": {"type": "integer"}},
-                "required": ["timeout_sec"]
-            }
-        }
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
     },
     {
         "type": "function",
         "function": {
-            "name": "move_rail_to_object",
-            "description": "Moves the robot base along the rails to align with a specific object in the room.",
+            "name": "search_and_locate_with_yolo",
+            "description": (
+                "Search for and localize the pickup object using the internal YOLO "
+                "pipeline. Pass one normalized canonical label such as 'apple'."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_object": {
-                        "type": "string", 
-                        "description": "The name of the object to move to (e.g., 'pan', 'plate')."
+                        "type": "string",
+                        "description": "Normalized pickup label, for example 'apple'.",
                     }
                 },
-                "required": ["target_object"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "turn_panda_arm",
-            "description": "Turns the robot arm (panda_joint1) to face a specific direction. Used after moving the rails to face the object.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target_rad": {
-                        "type": "number", 
-                        "description": "The target angle in radians (e.g., 1.57 for Left, -1.57 for Right)."
-                    }
-                },
-                "required": ["target_rad"]
-            }
-        }
+                "required": ["target_object"],
+                "additionalProperties": False,
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "execute_pick_script",
-            "description": "Runs the hardware shell script to physically pick up the object.",
+            "description": "Run the existing pick workflow after successful localization.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_object": {
                         "type": "string",
-                        "description": "The name of the object to pick up (e.g., 'lemon')."
+                        "description": "The normalized pickup label.",
                     }
                 },
-                "required": ["target_object"]
-            }
-        }
+                "required": ["target_object"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_rail_to_object",
+            "description": "Move only to a fixed static destination such as the bowl or home.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_object": {
+                        "type": "string",
+                        "description": "Static destination label, such as 'purple bowl' or 'home'.",
+                    }
+                },
+                "required": ["target_object"],
+                "additionalProperties": False,
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "execute_place_script",
-            "description": "Runs the hardware shell script to physically place the object. Call this ONLY after grasping the object, moving to the destination, pointing the arm, and visually confirming the location.",
+            "description": "Run the existing place workflow after moving to the fixed bowl.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_object": {
                         "type": "string",
-                        "description": "The name of the destination to place the object into (e.g., 'plate')."
+                        "description": "The fixed placement destination label.",
                     }
                 },
-                "required": ["target_object"]
-            }
-        }
+                "required": ["target_object"],
+                "additionalProperties": False,
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "finish_task",
-            "description": "Call this tool ONLY when the entire task (Pick, Place, and Homing) is 100% complete. This tells the system to shut down the pipeline.",
+            "description": "Finish only after pick, place, and return-home all succeed.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "summary": {
                         "type": "string",
-                        "description": "A brief 1-sentence summary of what was successfully accomplished."
+                        "description": "One short completion summary.",
                     }
                 },
-                "required": ["summary"]
-            }
-        }
-    }
+                "required": ["summary"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 llm = ChatOpenAI(
-    base_url="http://127.0.0.1:8080/v1",
+    base_url=runtime_config.vlm.api_base_url,
     api_key="not-needed",
     model=MODEL_NAME,
     temperature=0.2,
-    timeout=120.0,
-    max_tokens=4096
+    timeout=runtime_config.vlm.request_timeout_sec,
+    max_tokens=runtime_config.vlm.max_completion_tokens,
 ).bind_tools(tool_definitions)
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     messages: list[BaseMessage]
     iterations: int
+    pipeline_stage: str
+    pickup_target: str
+    placement_target: str
+    terminated: bool
+    outcome: str
+    failure_reason: str
+
+
+EXPECTED_TOOL_BY_STAGE = {
+    "initialize": "start_joint_controller",
+    "search": "search_and_locate_with_yolo",
+    "pick": "execute_pick_script",
+    "navigate_to_bowl": "move_rail_to_object",
+    "place": "execute_place_script",
+    "return_home": "move_rail_to_object",
+    "finish": "finish_task",
+}
+NEXT_STAGE = {
+    "initialize": "search",
+    "search": "pick",
+    "pick": "navigate_to_bowl",
+    "navigate_to_bowl": "place",
+    "place": "return_home",
+    "return_home": "finish",
+}
+BOWL_TARGETS = {"bowl", "purple bowl"}
+
 
 tools_impl = {
-    "start_joint_controller": lambda a: start_joint_controller(),
-    "check_robot_joint_states": lambda a: json.dumps(get_current_joint_states()),
-    "home_panda_arm": lambda a: home_panda_arm(),
-    "get_latest_image_from_ros": lambda a: get_latest_ros_image(a.get("timeout_sec", 10)),
-    "move_rail_to_object": lambda a: move_rail_to_object(a.get("target_object")),
-    "turn_panda_arm": lambda a: turn_panda_arm(a.get("target_rad")),
-    "execute_pick_script": lambda a: execute_pick_script(a.get("target_object")),
-    "execute_place_script": lambda a: execute_place_script(a.get("target_object")),
+    "start_joint_controller": lambda _: start_joint_controller(),
+    "search_and_locate_with_yolo": lambda args: search_and_locate_with_yolo(
+        args.get("target_object")
+    ),
+    "execute_pick_script": lambda args: execute_pick_script(
+        args.get("target_object")
+    ),
+    "move_rail_to_object": lambda args: move_rail_to_object(
+        args.get("target_object")
+    ),
+    "execute_place_script": lambda args: execute_place_script(
+        args.get("target_object")
+    ),
+    "finish_task": lambda args: {
+        "status": "success",
+        "success": True,
+        "summary": args.get("summary"),
+    },
 }
+
+
+def _normalized_argument(arguments: dict, name: str) -> str:
+    return str(arguments.get(name) or "").strip().lower()
+
+
+def _validate_tool_for_stage(
+    state: AgentState, tool_name: str, arguments: dict
+) -> str | None:
+    stage = state.get("pipeline_stage", "initialize")
+    expected_tool = EXPECTED_TOOL_BY_STAGE.get(stage)
+    if expected_tool is None:
+        return f"Pipeline stage {stage!r} does not accept tool calls."
+    if tool_name != expected_tool:
+        return (
+            f"Out-of-order tool call: stage {stage!r} requires "
+            f"{expected_tool!r}, received {tool_name!r}."
+        )
+
+    target = _normalized_argument(arguments, "target_object")
+    if tool_name == "search_and_locate_with_yolo" and not target:
+        return "Search requires a non-empty canonical pickup target."
+    if tool_name == "execute_pick_script":
+        pickup_target = state.get("pickup_target", "")
+        if not pickup_target or target != pickup_target:
+            return (
+                f"Pick target {target!r} does not match successfully located "
+                f"target {pickup_target!r}."
+            )
+    if stage == "navigate_to_bowl" and target not in BOWL_TARGETS:
+        return (
+            "Static navigation after pick must target 'bowl' or 'purple bowl', "
+            f"received {target!r}."
+        )
+    if tool_name == "execute_place_script":
+        placement_target = state.get("placement_target", "")
+        if target not in BOWL_TARGETS or target != placement_target:
+            return (
+                f"Place target {target!r} does not match navigated bowl target "
+                f"{placement_target!r}."
+            )
+    if stage == "return_home" and target != "home":
+        return f"Return-home navigation requires target 'home', received {target!r}."
+    if tool_name == "finish_task" and not str(arguments.get("summary") or "").strip():
+        return "finish_task requires a non-empty summary."
+    return None
+
+
+def _tool_result_succeeded(tool_name: str, result: object) -> bool:
+    if isinstance(result, dict):
+        if tool_name == "search_and_locate_with_yolo":
+            return result.get("status") == "success" and result.get("success") is True
+        if "success" in result:
+            return result.get("success") is True
+        return result.get("status") == "success"
+
+    text = str(result).strip().lower()
+    if not text or text.startswith(("error", "warning")):
+        return False
+    return text.startswith("success") or "already running" in text
+
+
+def _format_tool_result(result: object) -> str:
+    if isinstance(result, (dict, list)):
+        return json.dumps(result, sort_keys=True)
+    return str(result)
+
+
+def _tool_message(tool_call: dict, content: str, index: int = 0) -> ToolMessage:
+    tool_call_id = str(tool_call.get("id") or f"pipeline_call_{index}")
+    return ToolMessage(content=content, tool_call_id=tool_call_id)
+
+
+def _failed_update(
+    state: AgentState,
+    tool_messages: list[ToolMessage],
+    reason: str,
+) -> dict:
+    print(f"[PIPELINE FAILED]: {reason}")
+    return {
+        "messages": state["messages"] + tool_messages,
+        "iterations": state.get("iterations", 0),
+        "pipeline_stage": "failed",
+        "terminated": True,
+        "outcome": "failure",
+        "failure_reason": reason,
+    }
+
 
 # ── 3. GRAPH NODES ──────────────────────────────────────────────────────────
 def call_llm(state: AgentState) -> dict:
     print("\n[LLM IS EVALUATING TASK...]")
     response = llm.invoke(state["messages"])
-    
-    if hasattr(response, "tool_calls") and response.tool_calls:
+
+    if getattr(response, "tool_calls", None):
         print(f" -> [DEBUG] NATIVE TOOL CALL DETECTED: {response.tool_calls}")
     else:
         print(" -> [DEBUG] NO TOOLS DETECTED IN AI RESPONSE.")
-        
-    return {"messages": state["messages"] + [response], "iterations": state.get("iterations", 0) + 1}
+
+    return {
+        "messages": state["messages"] + [response],
+        "iterations": state.get("iterations", 0) + 1,
+    }
+
 
 def execute_tools(state: AgentState) -> dict:
     last_message = state["messages"][-1]
-    new_tool_messages = []
-    
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        for tc in last_message.tool_calls:
-            try:
-                print(f"\n[TOOL TRIGGERED]: Executing function '{tc['name']}'...")
-                raw_result = tools_impl[tc["name"]](tc["args"])
-                print(f"[TOOL COMPLETED]: '{tc['name']}' execution completed.")
-                
-                if tc["name"] == "get_latest_image_from_ros":
-                    new_tool_messages.append(
-                        HumanMessage(content=[
-                            {"type": "text", "text": "Image captured successfully."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{raw_result}"}}
-                        ])
-                    )
-                else:
-                    new_tool_messages.append(HumanMessage(content=f"Tool Execution Result: {raw_result}"))
-            except Exception as e:
-                print(f"[TOOL ERROR]: '{tc['name']}' execution failure: {e}")
-                new_tool_messages.append(HumanMessage(content=f"error executing tool {tc['name']}: {e}"))
-                
-    return {"messages": state["messages"] + new_tool_messages, "iterations": state.get("iterations", 0)}
+    tool_calls = list(getattr(last_message, "tool_calls", None) or [])
+    if len(tool_calls) != 1:
+        reason = (
+            "Exactly one high-level tool call is required per planner response; "
+            f"received {len(tool_calls)}."
+        )
+        error_result = json.dumps({"status": "failure", "reason": reason})
+        messages = [
+            _tool_message(tool_call, error_result, index)
+            for index, tool_call in enumerate(tool_calls)
+        ]
+        return _failed_update(state, messages, reason)
+
+    tool_call = tool_calls[0]
+    tool_name = str(tool_call.get("name") or "")
+    arguments = tool_call.get("args")
+    if not isinstance(arguments, dict):
+        reason = f"Tool {tool_name!r} arguments must be a JSON object."
+        return _failed_update(
+            state,
+            [_tool_message(tool_call, json.dumps({"status": "failure", "reason": reason}))],
+            reason,
+        )
+
+    validation_error = _validate_tool_for_stage(state, tool_name, arguments)
+    if validation_error is not None:
+        return _failed_update(
+            state,
+            [
+                _tool_message(
+                    tool_call,
+                    json.dumps({"status": "failure", "reason": validation_error}),
+                )
+            ],
+            validation_error,
+        )
+
+    try:
+        print(f"\n[TOOL TRIGGERED]: Executing function {tool_name!r}...")
+        raw_result = tools_impl[tool_name](arguments)
+        print(f"[TOOL COMPLETED]: {tool_name!r} execution completed.")
+    except Exception as exc:
+        reason = f"{tool_name} raised an exception: {exc}"
+        return _failed_update(
+            state,
+            [_tool_message(tool_call, json.dumps({"status": "failure", "reason": reason}))],
+            reason,
+        )
+
+    result_message = _tool_message(tool_call, _format_tool_result(raw_result))
+    if not _tool_result_succeeded(tool_name, raw_result):
+        reason = f"{tool_name} failed: {_format_tool_result(raw_result)}"
+        return _failed_update(state, [result_message], reason)
+
+    located_target = ""
+    if tool_name == "search_and_locate_with_yolo":
+        requested_target = _normalized_argument(arguments, "target_object")
+        located_target = _normalized_argument(raw_result, "target")
+        if not located_target or located_target != requested_target:
+            reason = (
+                "Search returned an invalid target: requested "
+                f"{requested_target!r}, received {located_target!r}."
+            )
+            return _failed_update(state, [result_message], reason)
+
+    stage = state.get("pipeline_stage", "initialize")
+    update = {
+        "messages": state["messages"] + [result_message],
+        "iterations": state.get("iterations", 0),
+        "terminated": False,
+        "outcome": "in_progress",
+        "failure_reason": "",
+    }
+    if tool_name == "search_and_locate_with_yolo":
+        update["pickup_target"] = located_target
+    if stage == "navigate_to_bowl":
+        update["placement_target"] = _normalized_argument(
+            arguments, "target_object"
+        )
+    if tool_name == "finish_task":
+        summary = str(arguments["summary"])
+        print(f"\n[PIPELINE COMPLETE]: {summary}")
+        update.update(
+            {
+                "pipeline_stage": "complete",
+                "terminated": True,
+                "outcome": "success",
+            }
+        )
+    else:
+        update["pipeline_stage"] = NEXT_STAGE[stage]
+    return update
+
 
 def should_continue(state: AgentState) -> str:
-    # 1. Safety Limit Fallback
-    if state.get("iterations", 0) >= 20: 
+    if state.get("terminated", False):
+        return "end"
+    if state.get("iterations", 0) >= 20:
         print("\n[WARNING]: Maximum iterations reached. Forcing end.")
         return "end"
-        
     last_message = state["messages"][-1]
-    
-    # 2. Tool Routing & Interception
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        
-        # Check if the LLM wants to end the task
-        for tool in last_message.tool_calls:
-            if tool["name"] == "finish_task":
-                # Extract the summary argument the LLM generated
-                summary = tool["args"].get("summary", "Task complete.")
-                print(f"\n[PIPELINE COMPLETE]: {summary}")
-                print("[SYSTEM]: 'finish_task' tool intercepted. Terminating graph loop gracefully.")
-                return "end" # <-- Short-circuits the graph instantly!
-                
-        # If it's any other tool, route normally
-        return "execute_tools"
-        
-    # 3. If no tools are called and we are here, end naturally
-    return "end"
+    return "execute_tools" if getattr(last_message, "tool_calls", None) else "end"
+
+
+def route_after_tools(state: AgentState) -> str:
+    return "end" if state.get("terminated", False) else "call_llm"
+
 
 # ── 4. BUILD GRAPH SCHEMA ──────────────────────────────────────────────────
 workflow = StateGraph(AgentState)
 workflow.add_node("call_llm", call_llm)
 workflow.add_node("execute_tools", execute_tools)
 workflow.add_edge(START, "call_llm")
-workflow.add_conditional_edges("call_llm", should_continue, {"execute_tools": "execute_tools", "end": END})
-workflow.add_edge("execute_tools", "call_llm")
+workflow.add_conditional_edges(
+    "call_llm",
+    should_continue,
+    {"execute_tools": "execute_tools", "end": END},
+)
+workflow.add_conditional_edges(
+    "execute_tools",
+    route_after_tools,
+    {"call_llm": "call_llm", "end": END},
+)
 agent = workflow.compile()

@@ -4,16 +4,45 @@ import re
 import rclpy
 import subprocess
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from agent import agent, AgentState
 
-def main():
-    rclpy.init()
-    import tools
+from config import load_runtime_config, set_runtime_config, validate_runtime_config
+
+# max 8 gb kullanan bir vlm modeli bul ve entegre et
+# basit ama net,  bir system prompt tasarla, sadece güncel görüntüyü alıp arama başlatacak şekilde
+# uzun bir system promptu ve fazla tool tanımı vlm in performansını düşürür
+# arama yaparken bir yandan robotu hareket ettirmeli bir yandan da nesneyi takip etmeye çalışmalı
+# nesne tespit edilirse hareket ettirmeyi bırakıo nesnenin yerini referans frame e göre hesaplayıp json a kaydetmeli
+# o referans frame in tanımı kritik ve robust olmalı
+
+
+
+def main() -> int:
+    tools = None
+    runtime_started = False
+    ros_initialized = False
 
     try:
-        tools.start_vlm_server()
-        print(f"\n[SYSTEM] VLM agent is loading into the GPU, please wait...")
-        time.sleep(5)
+        import tools as runtime_tools
+
+        tools = runtime_tools
+        config = load_runtime_config()
+        validate_runtime_config(config)
+        set_runtime_config(config)
+        print(
+            "[SYSTEM] Runtime configuration validated: "
+            f"{config.vlm.model_alias}, context={config.vlm.context_size}, "
+            f"VLM VRAM budget<={config.vlm.vram_budget_gb:g}GB, "
+            f"YOLO={config.yolo.checkpoint_path.name}."
+        )
+
+        rclpy.init()
+        ros_initialized = True
+        runtime_started = True
+        tools.start_vlm_server(config)
+
+        # Importing agent constructs ChatOpenAI, so do it only after configuration
+        # and server readiness have passed their fail-fast gates.
+        from agent import agent
         
         print("Starting interactive dynamic agentic-tool pipeline...")
         print("Type 'quit' or 'exit' at any time to stop the script.\n")
@@ -34,26 +63,23 @@ def main():
             input_state = {
                 "messages": [
                     SystemMessage(content=(
-                        "You are a strict robotic orchestrator operating via JSON tools.\n"
-                        "CRITICAL PIPELINE RULES:\n"
-                        "1. INITIALIZATION: Call 'start_joint_controller' first to ensure the robot hardware is active.\n"
-                        "2. STAGE SPLIT: Complete the PICK phase entirely before starting the PLACE phase.\n"
-                        "3. VISUAL CHECK: Call 'get_latest_image_from_ros' to check if your target object is in view.\n"
-                        "4. NAVIGATION & ORIENTATION:\n"
-                        "   - IF the target is already in view: SKIP navigation and proceed directly to step 5.\n"
-                        "   - IF the target is NOT in view:\n"
-                        "       a) Call 'move_rail_to_object'. (This tool automatically ensures arm safety and moves the base).\n"
-                        "       b) Call 'turn_panda_arm' using the EXACT angle provided by the previous tool.\n"
-                        "       c) Call 'get_latest_image_from_ros' again to confirm the object is now in view.\n"
-                        "5. EXECUTION: Once the PICK target is visually confirmed, call 'execute_pick_script' to physically grab it.\n" 
-                        "   - IF the pick is successful, return back to step 3 (visual check) to check for the place target.\n" 
-                        "   - Once the PLACE target is confirmed, call 'execute_place_script' to physically place it. \n"
-                        "6. HOMING: Once the task is complete, call 'move_rail_to_object' with the PRESET value for 'home'.\n"
-                        "7. COMPLETION: Once the robot has returned to home, you MUST call the 'finish_task' tool to successfully terminate the pipeline."
+                        "You are a strict robot orchestrator. Call exactly one tool per response "
+                        "and use this order:\n"
+                        "1. start_joint_controller\n"
+                        "2. normalize the pickup label, then call search_and_locate_with_yolo once\n"
+                        "3. execute_pick_script only if search succeeded\n"
+                        "4. move_rail_to_object with target_object='purple bowl'\n"
+                        "5. execute_place_script with target_object='purple bowl'\n"
+                        "6. move_rail_to_object with target_object='home'\n"
+                        "7. finish_task\n"
+                        "Stop immediately if any step fails. Never inspect images or command joints directly."
                     )),
                     HumanMessage(content=f"task: {user_task}")
                 ],
-                "iterations": 0
+                "iterations": 0,
+                "pipeline_stage": "initialize",
+                "terminated": False,
+                "outcome": "in_progress",
             }
             
             
@@ -92,24 +118,30 @@ def main():
         print("\nPipeline interrupted by user (Ctrl+C).")
     except Exception as e:
         print(f"\nPipeline Error: {e}")
+        return 1
     finally:
-        print("\n[CLEANUP] Initiating graceful shutdown sequence...")
-        
-        print(" -> Terminating 'global_joint_controller' tmux session...")
-        subprocess.run(['tmux', 'kill-session', '-t', 'global_joint_controller'], capture_output=True)
-        
-        print(" -> Terminating 'rail_demo_pick' tmux session (failsafe)...")
-        subprocess.run(['tmux', 'kill-session', '-t', 'rail_demo_pick'], capture_output=True)
-        
-        print(" -> Terminating 'rail_demo_place' tmux session (failsafe)...")
-        subprocess.run(['tmux', 'kill-session', '-t', 'rail_demo_place'], capture_output=True)
+        if runtime_started:
+            print("\n[CLEANUP] Initiating graceful shutdown sequence...")
 
-        print(" -> Terminating 'vlm_server' tmux session (failsafe)...")
-        tools.stop_vlm_server()
-        
-        print(" -> Shutting down ROS 2 nodes...")
-        rclpy.shutdown()
-        print("[CLEANUP] Shutdown complete. Goodbye!")
+            print(" -> Terminating 'global_joint_controller' tmux session...")
+            subprocess.run(['tmux', 'kill-session', '-t', 'global_joint_controller'], capture_output=True)
+
+            print(" -> Terminating 'rail_demo_pick' tmux session (failsafe)...")
+            subprocess.run(['tmux', 'kill-session', '-t', 'rail_demo_pick'], capture_output=True)
+
+            print(" -> Terminating 'rail_demo_place' tmux session (failsafe)...")
+            subprocess.run(['tmux', 'kill-session', '-t', 'rail_demo_place'], capture_output=True)
+
+            print(" -> Terminating 'vlm_server' tmux session (failsafe)...")
+            if tools is not None:
+                tools.stop_vlm_server()
+
+            print(" -> Shutting down ROS 2 nodes...")
+            if ros_initialized and rclpy.ok():
+                rclpy.shutdown()
+            print("[CLEANUP] Shutdown complete. Goodbye!")
+
+    return 0
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
