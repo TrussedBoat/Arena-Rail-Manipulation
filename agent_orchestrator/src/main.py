@@ -63,25 +63,22 @@ def main() -> int:
             input_state = {
                 "messages": [
                     SystemMessage(content=(
-                        "You are a strict robotic task orchestrator operating via JSON tools.\n"
+                        "You are a robotic task orchestrator operating via JSON tools.\n"
+                        "You have the freedom to plan the necessary steps to complete the task.\n\n"
                         "CRITICAL PIPELINE RULES:\n"
-                        "1. INITIALIZATION: Call 'start_joint_controller' first to activate the robot hardware.\n"
-                        "2. SEARCH & LOCALIZE: Call 'search_and_locate_with_yolo' with target_object (e.g. 'apple') to locate the object.\n"
-                        "3. PICK: Call 'execute_pick_script' with target_object (matching the localized target).\n"
-                        "4. NAVIGATE TO PLACE: Call 'move_rail_to_object' with target_object='purple bowl' (or specified destination).\n"
-                        "5. PLACE: Call 'execute_place_script' with target_object='purple bowl'.\n"
-                        "6. HOMING: Call 'move_rail_to_object' with target_object='home'.\n"
-                        "7. COMPLETION: Call 'finish_task' with a completion summary once all previous steps have succeeded.\n\n"
+                        "1. INITIALIZATION: You MUST call 'start_joint_controller' as your very first step to activate the robot hardware.\n"
+                        "2. HOMING & COMPLETION: When the task is complete, you MUST call 'move_rail_to_object' with target_object='home' to safely return the robot to its base, and immediately followed by 'finish_task' with a completion summary.\n\n"
                         "EXECUTION RULES:\n"
-                        "- Call exactly one tool per step matching the pipeline stage.\n"
+                        "- You can call any other tools in the order you see fit (e.g., search, pick, navigate, place).\n"
+                        "- Call exactly one tool per step.\n"
                         "- Stop immediately if any step fails."
                     )),
                     HumanMessage(content=f"task: {user_task}")
                 ],
                 "iterations": 0,
-                "pipeline_stage": "initialize",
                 "terminated": False,
                 "outcome": "in_progress",
+                "tools_called": [],
             }
             
             

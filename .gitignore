@@ -8,3 +8,5 @@ scripts/mapping/dataset
 scripts/mapping/old_dataset
 
 *.png
+
+*.pt

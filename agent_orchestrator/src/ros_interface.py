@@ -98,7 +98,7 @@ class RobotHardwareInterface(Node):
         self.rail_publisher.publish(msg)
         self.get_logger().info(f"Published JointState for panda_joint1: {target_rad}rad")
 
-def wait_for_joint_target(node: RobotHardwareInterface, joint_name: str, target_value: float, tolerance=0.02, timeout=10.0) -> bool:
+def wait_for_joint_target(node: RobotHardwareInterface, joint_name: str, target_value: float, tolerance=0.02, timeout=20.0) -> bool:
     start = time.time()
     while (time.time() - start) < timeout:
         # The background thread is updating node values automatically!

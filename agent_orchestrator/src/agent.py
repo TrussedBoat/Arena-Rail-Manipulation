@@ -138,31 +138,10 @@ llm = ChatOpenAI(
 class AgentState(TypedDict, total=False):
     messages: list[BaseMessage]
     iterations: int
-    pipeline_stage: str
-    pickup_target: str
-    placement_target: str
     terminated: bool
     outcome: str
     failure_reason: str
-
-
-EXPECTED_TOOL_BY_STAGE = {
-    "initialize": "start_joint_controller",
-    "search": "search_and_locate_with_yolo",
-    "pick": "execute_pick_script",
-    "navigate_to_bowl": "move_rail_to_object",
-    "place": "execute_place_script",
-    "return_home": "move_rail_to_object",
-    "finish": "finish_task",
-}
-NEXT_STAGE = {
-    "initialize": "search",
-    "search": "pick",
-    "pick": "navigate_to_bowl",
-    "navigate_to_bowl": "place",
-    "place": "return_home",
-    "return_home": "finish",
-}
+    tools_called: list[str]
 BOWL_TARGETS = {"bowl", "purple bowl"}
 
 
@@ -195,42 +174,21 @@ def _normalized_argument(arguments: dict, name: str) -> str:
 def _validate_tool_for_stage(
     state: AgentState, tool_name: str, arguments: dict
 ) -> str | None:
-    stage = state.get("pipeline_stage", "initialize")
-    expected_tool = EXPECTED_TOOL_BY_STAGE.get(stage)
-    if expected_tool is None:
-        return f"Pipeline stage {stage!r} does not accept tool calls."
-    if tool_name != expected_tool:
-        return (
-            f"Out-of-order tool call: stage {stage!r} requires "
-            f"{expected_tool!r}, received {tool_name!r}."
-        )
+    tools_called = state.get("tools_called", [])
+    
+    if len(tools_called) == 0 and tool_name != "start_joint_controller":
+        return "The very first tool call must be 'start_joint_controller'."
+        
+    if tool_name == "finish_task":
+        if not tools_called or tools_called[-1] != "move_rail_to_object_home":
+            return "You must return to the 'home' position using 'move_rail_to_object' with target_object 'home' before finishing the task."
+        if not str(arguments.get("summary") or "").strip():
+            return "finish_task requires a non-empty summary."
 
     target = _normalized_argument(arguments, "target_object")
     if tool_name == "search_and_locate_with_yolo" and not target:
         return "Search requires a non-empty canonical pickup target."
-    if tool_name == "execute_pick_script":
-        pickup_target = state.get("pickup_target", "")
-        if not pickup_target or target != pickup_target:
-            return (
-                f"Pick target {target!r} does not match successfully located "
-                f"target {pickup_target!r}."
-            )
-    if stage == "navigate_to_bowl" and target not in BOWL_TARGETS:
-        return (
-            "Static navigation after pick must target 'bowl' or 'purple bowl', "
-            f"received {target!r}."
-        )
-    if tool_name == "execute_place_script":
-        placement_target = state.get("placement_target", "")
-        if target not in BOWL_TARGETS or target != placement_target:
-            return (
-                f"Place target {target!r} does not match navigated bowl target "
-                f"{placement_target!r}."
-            )
-    if stage == "return_home" and target != "home":
-        return f"Return-home navigation requires target 'home', received {target!r}."
-    if tool_name == "finish_task" and not str(arguments.get("summary") or "").strip():
-        return "finish_task requires a non-empty summary."
+
     return None
 
 
@@ -268,7 +226,6 @@ def _failed_update(
     return {
         "messages": state["messages"] + tool_messages,
         "iterations": state.get("iterations", 0),
-        "pipeline_stage": "failed",
         "terminated": True,
         "outcome": "failure",
         "failure_reason": reason,
@@ -358,32 +315,31 @@ def execute_tools(state: AgentState) -> dict:
             )
             return _failed_update(state, [result_message], reason)
 
-    stage = state.get("pipeline_stage", "initialize")
+    called_identifier = tool_name
+    if tool_name == "move_rail_to_object":
+        target = _normalized_argument(arguments, "target_object")
+        if target == "home":
+            called_identifier = "move_rail_to_object_home"
+
+    tools_called = state.get("tools_called", []) + [called_identifier]
+
     update = {
         "messages": state["messages"] + [result_message],
         "iterations": state.get("iterations", 0),
         "terminated": False,
         "outcome": "in_progress",
         "failure_reason": "",
+        "tools_called": tools_called,
     }
-    if tool_name == "search_and_locate_with_yolo":
-        update["pickup_target"] = located_target
-    if stage == "navigate_to_bowl":
-        update["placement_target"] = _normalized_argument(
-            arguments, "target_object"
-        )
     if tool_name == "finish_task":
         summary = str(arguments["summary"])
         print(f"\n[PIPELINE COMPLETE]: {summary}")
         update.update(
             {
-                "pipeline_stage": "complete",
                 "terminated": True,
                 "outcome": "success",
             }
         )
-    else:
-        update["pipeline_stage"] = NEXT_STAGE[stage]
     return update
 
 
