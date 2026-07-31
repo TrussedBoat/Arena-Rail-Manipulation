@@ -36,6 +36,7 @@ class RobotHardwareInterface(Node):
         self.latest_b64_image = None
         self.current_rail_position = None
         self.current_panda_joint1 = None
+        self.current_panda_joint6 = None
         self.initial_rail_position = None
 
     def grasp_callback(self, request, response):
@@ -81,14 +82,32 @@ class RobotHardwareInterface(Node):
                 self.current_panda_joint1 = msg.position[idx]
             except ValueError:
                 pass
+                
+        if 'panda_joint6' in msg.name:
+            try:
+                idx = msg.name.index('panda_joint6')
+                self.current_panda_joint6 = msg.position[idx]
+            except ValueError:
+                pass
 
-    def send_absolute_rail_command(self, absolute_value: float):
+    def send_absolute_rail_command(self, absolute_value: float, speed: float = None):
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = ['rail_j1']
         msg.position = [float(absolute_value)]
+        if speed is not None:
+            msg.velocity = [float(speed)]
         self.rail_publisher.publish(msg)
         self.get_logger().info(f"Published Absolute JointState for rail_j1: {absolute_value}m")
+        
+    def send_rail_and_joint6_command(self, rail_val: float, rail_speed: float, j6_val: float, j6_speed: float):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = ['rail_j1', 'panda_joint6']
+        msg.position = [float(rail_val), float(j6_val)]
+        msg.velocity = [float(rail_speed), float(j6_speed)]
+        self.rail_publisher.publish(msg)
+        self.get_logger().info(f"Published JointState for rail_j1={rail_val}m and panda_joint6={j6_val}rad")
 
     def send_panda_joint1_command(self, target_rad: float):
         msg = JointState()
@@ -98,13 +117,23 @@ class RobotHardwareInterface(Node):
         self.rail_publisher.publish(msg)
         self.get_logger().info(f"Published JointState for panda_joint1: {target_rad}rad")
 
-    def send_panda_search_posture(self, j1: float, j2: float, j4: float):
+    def send_panda_search_posture(self, j1: float, j2: float, j3: float, j4: float, j5: float, j6: float, j7: float):
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = ['panda_joint1', 'panda_joint2', 'panda_joint4']
-        msg.position = [float(j1), float(j2), float(j4)]
+        msg.name = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
+        msg.position = [float(j1), float(j2), float(j3), float(j4), float(j5), float(j6), float(j7)]
         self.rail_publisher.publish(msg)
-        self.get_logger().info(f"Published JointState for posture: j1={j1}, j2={j2}, j4={j4}rad")
+        self.get_logger().info("Published JointState for full arm search posture.")
+
+    def send_panda_joint6_command(self, target_rad: float, speed: float = None):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = ['panda_joint6']
+        msg.position = [float(target_rad)]
+        if speed is not None:
+            msg.velocity = [float(speed)]
+        self.rail_publisher.publish(msg)
+        self.get_logger().info(f"Published JointState for panda_joint6: {target_rad}rad")
 
 def wait_for_joint_target(node: RobotHardwareInterface, joint_name: str, target_value: float, tolerance=0.02, timeout=20.0) -> bool:
     start = time.time()

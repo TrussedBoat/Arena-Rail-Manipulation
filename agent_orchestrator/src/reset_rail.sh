@@ -2,7 +2,14 @@
 # initialize_robot.sh: Sets the robot to the known home state
 # Usage: ros2 topic pub -1 /topic msg "{data}"
 
+export ROS_DOMAIN_ID=42
+export ROS_LOCALHOST_ONLY=1
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
 source /opt/ros/humble/setup.bash 
+# ROS 2 network isolation — must match the domain used by run_orchestrator.sh
+
+
 
 # 1. Move Rails to -1.1
 ros2 topic pub -1 /sim/rail_franka1/joint_command sensor_msgs/msg/JointState "{

@@ -143,6 +143,12 @@ class DeterministicYOLODetector:
 
         image_height, image_width = frame.shape[:2]
         candidates: list[dict[str, object]] = []
+
+        node = get_shared_node()
+        current_rail = getattr(node, "current_rail_position", None)
+        rail_text = f"Robot Rail: {current_rail:.4f}m" if current_rail is not None else "Robot Rail: N/A"
+        cv2.putText(frame, rail_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
         if results:
             result = results[0]
             boxes = getattr(result, "boxes", None)
@@ -170,6 +176,13 @@ class DeterministicYOLODetector:
                     if not math.isfinite(numeric_class_id):
                         continue
                     label = _class_label(names, int(numeric_class_id))
+                    
+                    if label == normalized_target or confidence > 0.3:
+                        color = (0, 255, 0) if label == normalized_target else (0, 0, 255)
+                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                        text = f"{label} {confidence:.2f}"
+                        cv2.putText(frame, text, (int(x1), max(10, int(y1) - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
                     if label != normalized_target:
                         continue
                     if x1 <= 0.0 or y1 <= 0.0 or x2 >= image_width or y2 >= image_height:
@@ -197,6 +210,9 @@ class DeterministicYOLODetector:
                             "guidance_only": not final_eligible,
                         }
                     )
+                    
+        cv2.imshow("YOLO Search", frame)
+        cv2.waitKey(1)
 
         if not candidates:
             return {
@@ -971,12 +987,12 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
                 "Rail telemetry or session origin is not finite.",
                 state="initialize",
             )
-        rail_waypoints = _build_rail_search_waypoints(
-            current_rail_position, config
-        )
+        limits = [config.search.rail_min_position, config.search.rail_max_position]
+        start_limit = limits[0] if abs(current_rail_position - limits[0]) < abs(current_rail_position - limits[1]) else limits[1]
+
         print(
             f"[SEARCH][INITIALIZE] target={target!r}, "
-            f"waypoints={len(rail_waypoints)}, origin={initial_rail_position:.4f}m."
+            f"origin={initial_rail_position:.4f}m."
         )
         angles_to_scan = [angle for angle in config.search.wrist_search_angles if abs(angle) > 0.1]
         if not angles_to_scan:
@@ -985,49 +1001,96 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
         target_centered = False
         final_detection = None
 
-        if len(rail_waypoints) > 0:
-            print(f"[SEARCH][INITIALIZE] Moving to start limit {rail_waypoints[0]:.4f}m...")
-            _command_rail_and_wait(node, rail_waypoints[0], config)
-
-        current_waypoints = rail_waypoints
+        print(f"[SEARCH][INITIALIZE] Moving to start limit {start_limit:.4f}m...")
+        _command_rail_and_wait(node, start_limit, config)
+        
+        current_limit = start_limit
 
         for sweep_idx, wrist_angle in enumerate(angles_to_scan):
             if target_centered:
                 break
                 
-            if sweep_idx > 0:
-                current_waypoints = list(reversed(current_waypoints))
+            target_limit = limits[1] if current_limit == limits[0] else limits[0]
             
-            print(f"[SEARCH][POSTURE] Setting arm to search posture (j1={wrist_angle}, j2=0.3, j4=-1.2)...")
-            if hasattr(node, "send_panda_search_posture"):
-                node.send_panda_search_posture(wrist_angle, 0.3, -1.2)
+            j6_limits = [config.search.j6_min, config.search.j6_max]
+            j6_target = j6_limits[1]
+            
+            if sweep_idx == 0:
+                print(f"[SEARCH][POSTURE] Setting initial arm search posture (j1={wrist_angle}, j2={config.search.search_posture_j2}, j3={config.search.search_posture_j3}, j4={config.search.search_posture_j4}, j5={config.search.search_posture_j5}, j7={config.search.search_posture_j7})...")
+                if hasattr(node, "send_panda_search_posture"):
+                    current_j6 = node.current_panda_joint6 if node.current_panda_joint6 is not None else j6_limits[0]
+                    node.send_panda_search_posture(wrist_angle, config.search.search_posture_j2, config.search.search_posture_j3, config.search.search_posture_j4, config.search.search_posture_j5, current_j6, config.search.search_posture_j7)
+                else:
+                    _command_wrist_and_wait(node, wrist_angle, config)
             else:
-                _command_wrist_and_wait(node, wrist_angle, config)
-            time.sleep(1.5) # Let it settle
+                print(f"[SEARCH][TURN] Turning to j1={wrist_angle}, freezing all other joints.")
+                node.send_panda_joint1_command(wrist_angle)
+            
+            print("[SEARCH][WAIT] Waiting 5.0 seconds for arm posture/turn to settle...")
+            time.sleep(7.0) 
+            
+            # Start oscillating j6 and moving rail simultaneously
+            print(f"[SEARCH][RAIL] Sweep {sweep_idx+1}/{len(angles_to_scan)} - moving continuously to {target_limit:.4f}m...")
+            node.send_rail_and_joint6_command(
+                rail_val=target_limit, 
+                rail_speed=config.search.rail_speed, 
+                j6_val=j6_target, 
+                j6_speed=config.search.j6_speed
+            )
 
-            # We skip the first waypoint of the sweep because we are already there
-            for waypoint_index, rail_waypoint in enumerate(current_waypoints[1:], start=1):
-                print(
-                    f"[SEARCH][RAIL] Sweep {sweep_idx+1}/{len(angles_to_scan)} - waypoint={waypoint_index}/{len(current_waypoints)-1}, "
-                    f"target={rail_waypoint:.4f}m."
-                )
-                _command_rail_and_wait(node, rail_waypoint, config)
-
-                detection = _capture_stationary_detection(
-                    node,
-                    config,
-                    target,
-                    expected_rail=rail_waypoint,
-                    expected_wrist=wrist_angle,
-                )
+            while True:
+                # Handle j6 oscillation
+                if node.current_panda_joint6 is not None:
+                    if abs(node.current_panda_joint6 - j6_target) < 0.15:
+                        j6_target = j6_limits[0] if j6_target == j6_limits[1] else j6_limits[1]
+                        print(f"[SEARCH][J6] Flipped target to {j6_target:.2f}rad")
+                        node.send_panda_joint6_command(j6_target, speed=config.search.j6_speed)
+                        
+                node.latest_b64_image = None
+                try:
+                    _ = get_latest_ros_image(timeout_sec=2.0)
+                except TimeoutError:
+                    pass
+                
+                detection = detect_target_in_latest_frame(target, timeout_sec=1.0)
                 observations += 1
-                if detection["status"] == "not_found":
+                
+                # Only halt the fast sweep if confidence is at least 0.5
+                is_confident = detection.get("confidence") is not None and float(detection["confidence"]) >= 0.5
+                
+                if detection["status"] == "not_found" or not is_confident:
+                    if abs(node.current_rail_position - target_limit) < config.search.rail_joint_tolerance:
+                        print(f"[SEARCH][RAIL] Reached limit {target_limit:.4f}m. Halting motion before next sweep.")
+                        
+                        # Explicitly halt both rail and tilt
+                        if node.current_panda_joint6 is not None:
+                            node.send_rail_and_joint6_command(
+                                rail_val=node.current_rail_position,
+                                rail_speed=0.0,
+                                j6_val=node.current_panda_joint6,
+                                j6_speed=0.0
+                            )
+                        else:
+                            node.send_absolute_rail_command(node.current_rail_position)
+                            
+                        current_limit = target_limit
+                        break
                     continue
 
                 print(
                     "[SEARCH][DETECTED] Candidate found; halting sweep and "
                     "transitioning to centering."
                 )
+                if node.current_panda_joint6 is not None:
+                    node.send_rail_and_joint6_command(
+                        rail_val=node.current_rail_position,
+                        rail_speed=0.0,
+                        j6_val=node.current_panda_joint6,
+                        j6_speed=0.0
+                    )
+                else:
+                    node.send_absolute_rail_command(node.current_rail_position)
+                
                 centering = _center_target_on_rail(
                     node, config, target, detection, wrist_angle
                 )
@@ -1035,14 +1098,19 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
                 if centering["status"] != "success":
                     last_centering_failure = centering
                     print(
-                        f"[SEARCH][CENTER] {centering['reason']} Restoring the "
-                        "search waypoint and resuming the next unscanned state."
+                        f"[SEARCH][CENTER] {centering['reason']} Resuming continuous search sweep."
                     )
-                    _command_rail_and_wait(node, rail_waypoint, config)
                     if hasattr(node, "send_panda_search_posture"):
-                        node.send_panda_search_posture(wrist_angle, 0.3, -1.2)
+                        node.send_panda_search_posture(wrist_angle, config.search.search_posture_j2, config.search.search_posture_j3, config.search.search_posture_j4, config.search.search_posture_j5, node.current_panda_joint6 if node.current_panda_joint6 else j6_limits[0], config.search.search_posture_j7)
                     else:
                         _command_wrist_and_wait(node, wrist_angle, config)
+                    time.sleep(1.5)
+                    node.send_rail_and_joint6_command(
+                        rail_val=target_limit, 
+                        rail_speed=config.search.rail_speed, 
+                        j6_val=j6_target, 
+                        j6_speed=config.search.j6_speed
+                    )
                     continue
 
                 final_detection = centering["detection"]

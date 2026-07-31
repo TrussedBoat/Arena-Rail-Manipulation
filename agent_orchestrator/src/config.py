@@ -39,9 +39,20 @@ VLM_VRAM_BUDGET_GB         = 8.0
 VLM_TOTAL_GPU_VRAM_GB      = 16.0
 
 # --- Search / rail parameters ---
-SEARCH_RAIL_MIN             = -1.30  # metres
+SEARCH_RAIL_MIN             = -1.50  # metres
 SEARCH_RAIL_MAX             =  1.60   # metres
 SEARCH_RAIL_WAYPOINT_SPACING = 0.40  # metres between scan stops
+SEARCH_RAIL_SPEED           = 0.2
+SEARCH_J6_SPEED             = 0.5
+SEARCH_J6_MIN               = 1.0
+SEARCH_J6_MAX               = 1.45
+
+# --- Search Joint Angles ---
+SEARCH_POSTURE_J2           = -0.7854
+SEARCH_POSTURE_J3           = 1e-05
+SEARCH_POSTURE_J4           = -1.54
+SEARCH_POSTURE_J5           = 0.1
+SEARCH_POSTURE_J7           = 0.7854
 
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -97,6 +108,15 @@ class SearchConfig:
     centering_min_step: float
     centering_max_step: float
     centering_gain: float
+    rail_speed: float
+    j6_speed: float
+    j6_min: float
+    j6_max: float
+    search_posture_j2: float
+    search_posture_j3: float
+    search_posture_j4: float
+    search_posture_j5: float
+    search_posture_j7: float
     wrist_search_angles: tuple[float, ...]
     final_centering_angle: float
     motion_settling_sec: float
@@ -282,6 +302,15 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
                 source, "YOLO_VLM_CENTERING_MAX_STEP", 0.10
             ),
             centering_gain=_env_float(source, "YOLO_VLM_CENTERING_GAIN", 0.10),
+            rail_speed=_env_float(source, "YOLO_VLM_RAIL_SPEED", SEARCH_RAIL_SPEED),
+            j6_speed=_env_float(source, "YOLO_VLM_J6_SPEED", SEARCH_J6_SPEED),
+            j6_min=_env_float(source, "YOLO_VLM_J6_MIN", SEARCH_J6_MIN),
+            j6_max=_env_float(source, "YOLO_VLM_J6_MAX", SEARCH_J6_MAX),
+            search_posture_j2=_env_float(source, "YOLO_VLM_SEARCH_POSTURE_J2", SEARCH_POSTURE_J2),
+            search_posture_j3=_env_float(source, "YOLO_VLM_SEARCH_POSTURE_J3", SEARCH_POSTURE_J3),
+            search_posture_j4=_env_float(source, "YOLO_VLM_SEARCH_POSTURE_J4", SEARCH_POSTURE_J4),
+            search_posture_j5=_env_float(source, "YOLO_VLM_SEARCH_POSTURE_J5", SEARCH_POSTURE_J5),
+            search_posture_j7=_env_float(source, "YOLO_VLM_SEARCH_POSTURE_J7", SEARCH_POSTURE_J7),
             wrist_search_angles=_env_float_list(
                 source, "YOLO_VLM_WRIST_SEARCH_ANGLES", (-1.57, 0.0, 1.57)
             ),
