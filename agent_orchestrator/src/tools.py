@@ -35,7 +35,7 @@ MAX_CENTERING_ITERATIONS = 50
 MAX_REACQUISITION_FRAMES = 2
 MAX_CENTERED_CONFIDENCE_RECHECKS = 2
 SEARCH_TELEMETRY_TIMEOUT_SEC = 10.0
-JOINT_MOTION_TIMEOUT_SEC = 10.0
+JOINT_MOTION_TIMEOUT_SEC = 50.0
 JOINT_POLL_INTERVAL_SEC = 0.05
 _yolo_detector = None
 
@@ -532,10 +532,7 @@ def _build_rail_search_waypoints(
         opposite_limit = search.rail_min_position
 
     return [
-        current_position,
-        *_segment_waypoints(
-            current_position, first_limit, search.rail_waypoint_spacing
-        ),
+        first_limit,
         *_segment_waypoints(
             first_limit, opposite_limit, search.rail_waypoint_spacing
         ),
@@ -666,12 +663,8 @@ def _wait_for_stationary_joints(
     stable_since: float | None = None
     previous_rail: float | None = None
     previous_wrist: float | None = None
-    rail_stability_tolerance = min(
-        config.search.rail_joint_tolerance / 4.0, 1e-3
-    )
-    wrist_stability_tolerance = min(
-        config.search.wrist_joint_tolerance / 4.0, 1e-3
-    )
+    rail_stability_tolerance = config.search.rail_joint_tolerance / 4.0
+    wrist_stability_tolerance = config.search.wrist_joint_tolerance / 4.0
 
     while time.monotonic() < deadline:
         rail_value = getattr(node, "current_rail_position", None)
@@ -752,6 +745,7 @@ def _center_target_on_rail(
     config: RuntimeConfig,
     target: str,
     trigger_detection: Mapping[str, object],
+    found_wrist_angle: float,
 ) -> dict[str, object]:
     print("[SEARCH][CENTER] Moving wrist to the calibrated centering angle.")
     _command_wrist_and_wait(
@@ -984,17 +978,41 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
             f"[SEARCH][INITIALIZE] target={target!r}, "
             f"waypoints={len(rail_waypoints)}, origin={initial_rail_position:.4f}m."
         )
+        angles_to_scan = [angle for angle in config.search.wrist_search_angles if abs(angle) > 0.1]
+        if not angles_to_scan:
+            angles_to_scan = [1.57, -1.57]
 
-        for waypoint_index, rail_waypoint in enumerate(rail_waypoints, start=1):
-            print(
-                f"[SEARCH][RAIL] waypoint={waypoint_index}/{len(rail_waypoints)}, "
-                f"target={rail_waypoint:.4f}m."
-            )
-            _command_rail_and_wait(node, rail_waypoint, config)
+        target_centered = False
+        final_detection = None
 
-            for wrist_angle in config.search.wrist_search_angles:
-                print(f"[SEARCH][WRIST] target={wrist_angle:.4f}rad.")
+        if len(rail_waypoints) > 0:
+            print(f"[SEARCH][INITIALIZE] Moving to start limit {rail_waypoints[0]:.4f}m...")
+            _command_rail_and_wait(node, rail_waypoints[0], config)
+
+        current_waypoints = rail_waypoints
+
+        for sweep_idx, wrist_angle in enumerate(angles_to_scan):
+            if target_centered:
+                break
+                
+            if sweep_idx > 0:
+                current_waypoints = list(reversed(current_waypoints))
+            
+            print(f"[SEARCH][POSTURE] Setting arm to search posture (j1={wrist_angle}, j2=0.3, j4=-1.2)...")
+            if hasattr(node, "send_panda_search_posture"):
+                node.send_panda_search_posture(wrist_angle, 0.3, -1.2)
+            else:
                 _command_wrist_and_wait(node, wrist_angle, config)
+            time.sleep(1.5) # Let it settle
+
+            # We skip the first waypoint of the sweep because we are already there
+            for waypoint_index, rail_waypoint in enumerate(current_waypoints[1:], start=1):
+                print(
+                    f"[SEARCH][RAIL] Sweep {sweep_idx+1}/{len(angles_to_scan)} - waypoint={waypoint_index}/{len(current_waypoints)-1}, "
+                    f"target={rail_waypoint:.4f}m."
+                )
+                _command_rail_and_wait(node, rail_waypoint, config)
+
                 detection = _capture_stationary_detection(
                     node,
                     config,
@@ -1011,7 +1029,7 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
                     "transitioning to centering."
                 )
                 centering = _center_target_on_rail(
-                    node, config, target, detection
+                    node, config, target, detection, wrist_angle
                 )
                 observations += int(centering["observations"])
                 if centering["status"] != "success":
@@ -1021,9 +1039,15 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
                         "search waypoint and resuming the next unscanned state."
                     )
                     _command_rail_and_wait(node, rail_waypoint, config)
+                    if hasattr(node, "send_panda_search_posture"):
+                        node.send_panda_search_posture(wrist_angle, 0.3, -1.2)
+                    else:
+                        _command_wrist_and_wait(node, wrist_angle, config)
                     continue
 
                 final_detection = centering["detection"]
+                target_centered = True
+                
                 current_absolute_rail = float(node.current_rail_position)
                 object_x = current_absolute_rail - initial_rail_position
                 try:
@@ -1059,6 +1083,23 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
                         config.paths.dynamic_semantic_coordinates
                     ),
                 }
+
+        if not target_centered:
+            last_detection = (
+                last_centering_failure.get("detection")
+                if last_centering_failure is not None
+                else None
+            )
+            reason = "Full configured rail range was scanned without a valid centered detection."
+            if last_centering_failure is not None:
+                reason += f" Last centering failure: {last_centering_failure['reason']}"
+            return _failure_result(
+                target,
+                reason,
+                state="search_sweep",
+                detection=last_detection,
+                observations=observations,
+            )
 
         last_detection = (
             last_centering_failure.get("detection")
@@ -1149,8 +1190,19 @@ def move_rail_to_object(target_object: str) -> str:
     """Agentic Tool: Safely homes arm, calculates absolute world target, and moves rail."""
     try:
         config = get_runtime_config()
-        with config.paths.static_semantic_coordinates.open("r", encoding="utf-8") as f:
-            distances = json.load(f)
+        distances: dict[str, dict[str, float]] = {}
+        if config.paths.static_semantic_coordinates.is_file():
+            try:
+                with config.paths.static_semantic_coordinates.open("r", encoding="utf-8") as f:
+                    distances.update(json.load(f))
+            except (OSError, json.JSONDecodeError):
+                pass
+        if config.paths.dynamic_semantic_coordinates.is_file():
+            try:
+                with config.paths.dynamic_semantic_coordinates.open("r", encoding="utf-8") as f:
+                    distances.update(json.load(f))
+            except (OSError, json.JSONDecodeError):
+                pass
             
         clean_target = target_object.lower().strip()
         
@@ -1193,6 +1245,9 @@ def move_rail_to_object(target_object: str) -> str:
         # 4. Actuate Rails
         move_result = move_rail_relative(relative_move)
         
+        if move_result.startswith("Error:"):
+            return move_result
+            
         if clean_target in ['laptop', 'home', 'start']:
             return f"{move_result} Successfully returned to {clean_target}. The arm is safely at 0.0 rad."
         return f"{move_result} Arrived at static destination '{clean_target}'."

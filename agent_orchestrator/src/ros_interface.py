@@ -98,6 +98,14 @@ class RobotHardwareInterface(Node):
         self.rail_publisher.publish(msg)
         self.get_logger().info(f"Published JointState for panda_joint1: {target_rad}rad")
 
+    def send_panda_search_posture(self, j1: float, j2: float, j4: float):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = ['panda_joint1', 'panda_joint2', 'panda_joint4']
+        msg.position = [float(j1), float(j2), float(j4)]
+        self.rail_publisher.publish(msg)
+        self.get_logger().info(f"Published JointState for posture: j1={j1}, j2={j2}, j4={j4}rad")
+
 def wait_for_joint_target(node: RobotHardwareInterface, joint_name: str, target_value: float, tolerance=0.02, timeout=20.0) -> bool:
     start = time.time()
     while (time.time() - start) < timeout:

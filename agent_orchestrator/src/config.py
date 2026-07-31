@@ -39,9 +39,9 @@ VLM_VRAM_BUDGET_GB         = 8.0
 VLM_TOTAL_GPU_VRAM_GB      = 16.0
 
 # --- Search / rail parameters ---
-SEARCH_RAIL_MIN             = -1.10   # metres
-SEARCH_RAIL_MAX             =  1.10   # metres
-SEARCH_RAIL_WAYPOINT_SPACING = 0.20   # metres between scan stops
+SEARCH_RAIL_MIN             = -1.30  # metres
+SEARCH_RAIL_MAX             =  1.60   # metres
+SEARCH_RAIL_WAYPOINT_SPACING = 0.40  # metres between scan stops
 
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -286,16 +286,16 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
                 source, "YOLO_VLM_WRIST_SEARCH_ANGLES", (-1.57, 0.0, 1.57)
             ),
             final_centering_angle=_env_float(
-                source, "YOLO_VLM_FINAL_CENTERING_ANGLE", 0.0
+                source, "YOLO_VLM_FINAL_CENTERING_ANGLE", 1.57
             ),
             motion_settling_sec=_env_float(
                 source, "YOLO_VLM_MOTION_SETTLING_SEC", 0.50
             ),
             rail_joint_tolerance=_env_float(
-                source, "YOLO_VLM_RAIL_JOINT_TOLERANCE", 0.01
+                source, "YOLO_VLM_RAIL_JOINT_TOLERANCE", 0.05
             ),
             wrist_joint_tolerance=_env_float(
-                source, "YOLO_VLM_WRIST_JOINT_TOLERANCE", 0.02
+                source, "YOLO_VLM_WRIST_JOINT_TOLERANCE", 0.05
             ),
             horizontal_center_tolerance=_env_float(
                 source, "YOLO_VLM_HORIZONTAL_CENTER_TOLERANCE", 0.05

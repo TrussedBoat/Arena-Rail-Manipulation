@@ -12,6 +12,9 @@ from tools import (
     move_rail_to_object,
     search_and_locate_with_yolo,
     start_joint_controller,
+    turn_panda_arm,
+    home_panda_arm,
+    move_rail_relative,
 )
 
 runtime_config = get_runtime_config()
@@ -36,15 +39,16 @@ tool_definitions = [
         "function": {
             "name": "search_and_locate_with_yolo",
             "description": (
-                "Search for and localize the pickup object using the internal YOLO "
-                "pipeline. Pass one normalized canonical label such as 'apple'."
+                "Search the environment for a specific object and save its location. "
+                "Use this to find objects before interacting with or moving to them. "
+                "Pass one normalized canonical label such as 'apple'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_object": {
                         "type": "string",
-                        "description": "Normalized pickup label, for example 'apple'.",
+                        "description": "Normalized target label, for example 'apple'.",
                     }
                 },
                 "required": ["target_object"],
@@ -56,13 +60,13 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "execute_pick_script",
-            "description": "Run the existing pick workflow after successful localization.",
+            "description": "Execute the physical picking motion to grab the target object. Only use this if the user explicitly asked to pick something up.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_object": {
                         "type": "string",
-                        "description": "The normalized pickup label.",
+                        "description": "The normalized target label.",
                     }
                 },
                 "required": ["target_object"],
@@ -74,16 +78,34 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "move_rail_to_object",
-            "description": "Move only to a fixed static destination such as the bowl or home.",
+            "description": "Move the robot's base rail to the location of a known object (e.g. 'apple', 'purple bowl', or 'home'). Use this to approach an object.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_object": {
                         "type": "string",
-                        "description": "Static destination label, such as 'purple bowl' or 'home'.",
+                        "description": "Destination label, such as 'apple', 'purple bowl' or 'home'.",
                     }
                 },
                 "required": ["target_object"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_rail_relative",
+            "description": "Move the robot's base rail by a specific relative distance in meters.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "relative_distance_m": {
+                        "type": "number",
+                        "description": "The distance in meters to move. Positive moves forward, negative moves backward.",
+                    }
+                },
+                "required": ["relative_distance_m"],
                 "additionalProperties": False,
             },
         },
@@ -92,13 +114,13 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "execute_place_script",
-            "description": "Run the existing place workflow after moving to the fixed bowl.",
+            "description": "Execute the physical placing motion to drop a held object at the current location.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_object": {
                         "type": "string",
-                        "description": "The fixed placement destination label.",
+                        "description": "The placement destination label.",
                     }
                 },
                 "required": ["target_object"],
@@ -109,8 +131,39 @@ tool_definitions = [
     {
         "type": "function",
         "function": {
+            "name": "turn_panda_arm",
+            "description": "Turn the robot's arm to a specific angle in radians (e.g., 3.14 for a 180-degree turn, or 1.57 for 90 degrees).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_rad": {
+                        "type": "number",
+                        "description": "The target angle in radians.",
+                    }
+                },
+                "required": ["target_rad"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "home_panda_arm",
+            "description": "Return the robot's arm to its default forward-facing 0.0 rad position.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish_task",
-            "description": "Finish only after pick, place, and return-home all succeed.",
+            "description": "Complete the workflow once the user's objective is achieved and the robot has safely returned home.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -123,7 +176,7 @@ tool_definitions = [
                 "additionalProperties": False,
             },
         },
-    },
+    }
 ]
 
 llm = ChatOpenAI(
@@ -156,9 +209,16 @@ tools_impl = {
     "move_rail_to_object": lambda args: move_rail_to_object(
         args.get("target_object")
     ),
+    "move_rail_relative": lambda args: move_rail_relative(
+        args.get("relative_distance_m")
+    ),
     "execute_place_script": lambda args: execute_place_script(
         args.get("target_object")
     ),
+    "turn_panda_arm": lambda args: turn_panda_arm(
+        args.get("target_rad")
+    ),
+    "home_panda_arm": lambda _: home_panda_arm(),
     "finish_task": lambda args: {
         "status": "success",
         "success": True,
@@ -238,7 +298,8 @@ def call_llm(state: AgentState) -> dict:
     response = llm.invoke(state["messages"])
 
     if getattr(response, "tool_calls", None):
-        print(f" -> [DEBUG] NATIVE TOOL CALL DETECTED: {response.tool_calls}")
+        pass
+        #print(f" -> [DEBUG] NATIVE TOOL CALL DETECTED: {response.tool_calls}")
     else:
         print(" -> [DEBUG] NO TOOLS DETECTED IN AI RESPONSE.")
 
