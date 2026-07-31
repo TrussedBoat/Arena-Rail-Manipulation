@@ -39,13 +39,13 @@ VLM_VRAM_BUDGET_GB         = 8.0
 VLM_TOTAL_GPU_VRAM_GB      = 16.0
 
 # --- Search / rail parameters ---
-SEARCH_RAIL_MIN             = -1.50  # metres
+SEARCH_RAIL_MIN             = -1.20  # metres
 SEARCH_RAIL_MAX             =  1.60   # metres
 SEARCH_RAIL_WAYPOINT_SPACING = 0.40  # metres between scan stops
-SEARCH_RAIL_SPEED           = 0.2
+SEARCH_RAIL_SPEED           = 0.15
 SEARCH_J6_SPEED             = 0.5
-SEARCH_J6_MIN               = 1.0
-SEARCH_J6_MAX               = 1.45
+SEARCH_J6_MIN               = 0.8
+SEARCH_J6_MAX               = 1.3
 
 # --- Search Joint Angles ---
 SEARCH_POSTURE_J2           = -0.7854
@@ -321,7 +321,7 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
                 source, "YOLO_VLM_MOTION_SETTLING_SEC", 0.50
             ),
             rail_joint_tolerance=_env_float(
-                source, "YOLO_VLM_RAIL_JOINT_TOLERANCE", 0.05
+                source, "YOLO_VLM_RAIL_JOINT_TOLERANCE", 0.02
             ),
             wrist_joint_tolerance=_env_float(
                 source, "YOLO_VLM_WRIST_JOINT_TOLERANCE", 0.05

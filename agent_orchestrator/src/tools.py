@@ -1031,11 +1031,15 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
             
             # Start oscillating j6 and moving rail simultaneously
             print(f"[SEARCH][RAIL] Sweep {sweep_idx+1}/{len(angles_to_scan)} - moving continuously to {target_limit:.4f}m...")
+            
+            rail_dir = 1.0 if target_limit >= node.current_rail_position else -1.0
+            j6_dir = 1.0 if j6_target >= (node.current_panda_joint6 if node.current_panda_joint6 is not None else j6_limits[0]) else -1.0
+            
             node.send_rail_and_joint6_command(
                 rail_val=target_limit, 
-                rail_speed=config.search.rail_speed, 
+                rail_speed=config.search.rail_speed * rail_dir, 
                 j6_val=j6_target, 
-                j6_speed=config.search.j6_speed
+                j6_speed=config.search.j6_speed * j6_dir
             )
 
             while True:
@@ -1044,7 +1048,16 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
                     if abs(node.current_panda_joint6 - j6_target) < 0.15:
                         j6_target = j6_limits[0] if j6_target == j6_limits[1] else j6_limits[1]
                         print(f"[SEARCH][J6] Flipped target to {j6_target:.2f}rad")
-                        node.send_panda_joint6_command(j6_target, speed=config.search.j6_speed)
+                        
+                        rail_dir = 1.0 if target_limit >= node.current_rail_position else -1.0
+                        j6_dir = 1.0 if j6_target >= node.current_panda_joint6 else -1.0
+                        
+                        node.send_rail_and_joint6_command(
+                            rail_val=target_limit,
+                            rail_speed=config.search.rail_speed * rail_dir,
+                            j6_val=j6_target,
+                            j6_speed=config.search.j6_speed * j6_dir
+                        )
                         
                 node.latest_b64_image = None
                 try:
