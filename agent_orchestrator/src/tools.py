@@ -453,28 +453,10 @@ def stop_vlm_server():
 # ── TOOL EXECUTION WRAPPERS ──
 
 def start_joint_controller() -> str:
-    """Agentic Tool: Starts the global ROS 2 joint controller in the background."""
+    """Agentic Tool: Initializes the global ROS 2 joint interface node."""
     try:
-        config = get_runtime_config()
-        check = subprocess.run(['tmux', 'has-session', '-t', 'global_joint_controller'], capture_output=True)
-        if check.returncode == 0:
-            return "Global joint controller is already running in the background."
-
-        print("[SYSTEM]: Launching global joint controller in tmux...")
-        
-        subprocess.run(['tmux', 'new-session', '-d', '-s', 'global_joint_controller'], check=True)
-        
-        cmd = (
-            f"source {shlex.quote(str(config.paths.ros_setup_script))} && "
-            f"cd {shlex.quote(str(config.paths.controller_workspace))} && "
-            f"source {shlex.quote(str(config.paths.controller_setup_script))} && "
-            "ros2 run panda_python_controllers mono_controller_rail_sim --mode joint_position"
-        )
-        subprocess.run(['tmux', 'send-keys', '-t', 'global_joint_controller', cmd, 'C-m'], check=True)
-        
-        time.sleep(3.0)
-        return "Success: Global joint controller started. The robot is ready to receive movement commands."
-        
+        node = get_shared_node()
+        return "Success: Global joint controller / ROS 2 interface is active and ready to receive movement commands."
     except Exception as e:
         return f"Error starting controller: {e}"
 
@@ -953,6 +935,22 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
     last_centering_failure: Mapping[str, object] | None = None
     try:
         config = get_runtime_config()
+        
+        if config.paths.static_semantic_coordinates.is_file():
+            try:
+                with config.paths.static_semantic_coordinates.open("r", encoding="utf-8") as f:
+                    known_distances = json.load(f)
+                if target in known_distances:
+                    print(f"[SEARCH SKIP] Target '{target}' already known in semantic map. Skipping active YOLO search.")
+                    return {
+                        "status": "success",
+                        "success": True,
+                        "target": target,
+                        "reason": "Found in static semantic map",
+                        "state": "complete",
+                    }
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"[WARNING] Could not read static semantic map: {e}. Falling back to active search.")
         detector = _get_yolo_detector(config)
         if not detector.supports_label(target):
             return _failure_result(

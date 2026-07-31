@@ -11,6 +11,7 @@ export PATH="$HOME/.local/bin:$PATH"
 # ROS 2 network isolation — must match the domain used by run_sim.sh
 export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=1
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 # Source ROS 2 Humble
 if [ -f /opt/ros/humble/setup.bash ]; then
@@ -32,5 +33,11 @@ else
     exit 1
 fi
 
+echo "[+] Starting Bridge Node in background..."
+python3 scripts/rail_bridge.py &
+BRIDGE_PID=$!
+
+trap "echo '[+] Stopping Bridge Node...'; kill $BRIDGE_PID" EXIT
+
 echo "[+] Starting Robotic Task Orchestrator..."
-exec python3 agent_orchestrator/src/main.py
+python3 agent_orchestrator/src/main.py

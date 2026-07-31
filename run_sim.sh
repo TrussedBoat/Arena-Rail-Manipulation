@@ -8,6 +8,7 @@ cd "$SCRIPT_DIR"
 # ROS 2 network isolation — must match the domain used by run_orchestrator.sh
 export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=1
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 # Source ROS 2 Humble
 if [ -f /opt/ros/humble/setup.bash ]; then
