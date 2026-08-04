@@ -105,9 +105,6 @@ class SearchConfig:
     rail_min_position: float
     rail_max_position: float
     rail_waypoint_spacing: float
-    centering_min_step: float
-    centering_max_step: float
-    centering_gain: float
     rail_speed: float
     j6_speed: float
     j6_min: float
@@ -118,11 +115,18 @@ class SearchConfig:
     search_posture_j5: float
     search_posture_j7: float
     wrist_search_angles: tuple[float, ...]
-    final_centering_angle: float
     motion_settling_sec: float
     rail_joint_tolerance: float
     wrist_joint_tolerance: float
-    horizontal_center_tolerance: float
+    # TF frame names
+    camera_base_frame: str
+    camera_optical_frame: str
+    # Hardcoded camera intrinsics (no camera_info topic available)
+    camera_fx: float
+    camera_fy: float
+    camera_cx: float
+    camera_cy: float
+    depth_patch_radius: int  # px radius for median depth sampling
 
 
 @dataclass(frozen=True)
@@ -295,13 +299,6 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             rail_waypoint_spacing=_env_float(
                 source, "YOLO_VLM_RAIL_WAYPOINT_SPACING", SEARCH_RAIL_WAYPOINT_SPACING
             ),
-            centering_min_step=_env_float(
-                source, "YOLO_VLM_CENTERING_MIN_STEP", 0.005
-            ),
-            centering_max_step=_env_float(
-                source, "YOLO_VLM_CENTERING_MAX_STEP", 0.10
-            ),
-            centering_gain=_env_float(source, "YOLO_VLM_CENTERING_GAIN", 0.10),
             rail_speed=_env_float(source, "YOLO_VLM_RAIL_SPEED", SEARCH_RAIL_SPEED),
             j6_speed=_env_float(source, "YOLO_VLM_J6_SPEED", SEARCH_J6_SPEED),
             j6_min=_env_float(source, "YOLO_VLM_J6_MIN", SEARCH_J6_MIN),
@@ -314,9 +311,6 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             wrist_search_angles=_env_float_list(
                 source, "YOLO_VLM_WRIST_SEARCH_ANGLES", (-1.57, 0.0, 1.57)
             ),
-            final_centering_angle=_env_float(
-                source, "YOLO_VLM_FINAL_CENTERING_ANGLE", 1.57
-            ),
             motion_settling_sec=_env_float(
                 source, "YOLO_VLM_MOTION_SETTLING_SEC", 0.50
             ),
@@ -326,9 +320,15 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             wrist_joint_tolerance=_env_float(
                 source, "YOLO_VLM_WRIST_JOINT_TOLERANCE", 0.05
             ),
-            horizontal_center_tolerance=_env_float(
-                source, "YOLO_VLM_HORIZONTAL_CENTER_TOLERANCE", 0.05
-            ),
+            # TF frame names published by Isaac Sim
+            camera_base_frame=_env_value(source, "YOLO_VLM_CAMERA_BASE_FRAME", "panda_link0"),
+            camera_optical_frame=_env_value(source, "YOLO_VLM_CAMERA_OPTICAL_FRAME", "wrist_camera"),
+            # Wrist RealSense intrinsics (measured from the running simulation)
+            camera_fx=_env_float(source, "YOLO_VLM_CAMERA_FX", 907.00),
+            camera_fy=_env_float(source, "YOLO_VLM_CAMERA_FY", 905.69),
+            camera_cx=_env_float(source, "YOLO_VLM_CAMERA_CX", 567.74),
+            camera_cy=_env_float(source, "YOLO_VLM_CAMERA_CY", 488.32),
+            depth_patch_radius=int(_env_float(source, "YOLO_VLM_DEPTH_PATCH_RADIUS", 2)),
         ),
         paths=PathConfig(
             static_semantic_coordinates=_env_path(
@@ -622,19 +622,7 @@ def validate_runtime_config(
             "rail waypoint spacing must be positive and no greater than the rail range, got "
             f"{config.search.rail_waypoint_spacing}"
         )
-    if config.search.centering_min_step <= 0:
-        errors.append(
-            f"centering minimum step must be positive, got {config.search.centering_min_step}"
-        )
-    if config.search.centering_max_step < config.search.centering_min_step or (
-        rail_range > 0 and config.search.centering_max_step > rail_range
-    ):
-        errors.append(
-            "centering maximum step must be at least the minimum step and within the rail range"
-        )
-    if config.search.centering_gain <= 0:
-        errors.append(f"centering gain must be positive, got {config.search.centering_gain}")
-    for angle in (*config.search.wrist_search_angles, config.search.final_centering_angle):
+    for angle in config.search.wrist_search_angles:
         if not -math.pi <= angle <= math.pi:
             errors.append(f"wrist angle must be within [-pi, pi] radians, got {angle}")
     if config.search.motion_settling_sec < 0:
@@ -648,11 +636,6 @@ def validate_runtime_config(
     if config.search.wrist_joint_tolerance <= 0:
         errors.append(
             f"wrist joint tolerance must be positive, got {config.search.wrist_joint_tolerance}"
-        )
-    if not 0 < config.search.horizontal_center_tolerance < 1:
-        errors.append(
-            "horizontal centering tolerance must be between 0 and 1, got "
-            f"{config.search.horizontal_center_tolerance}"
         )
 
     if not errors and config.yolo.checkpoint_path.is_file():

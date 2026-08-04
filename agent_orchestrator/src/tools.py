@@ -31,9 +31,7 @@ from ros_interface import (
 
 
 VLM_WARMUP_LATENCY_LIMIT_SEC = 5.0
-MAX_CENTERING_ITERATIONS = 50
 MAX_REACQUISITION_FRAMES = 2
-MAX_CENTERED_CONFIDENCE_RECHECKS = 2
 SEARCH_TELEMETRY_TIMEOUT_SEC = 10.0
 JOINT_MOTION_TIMEOUT_SEC = 50.0
 JOINT_POLL_INTERVAL_SEC = 0.05
@@ -165,6 +163,8 @@ class DeterministicYOLODetector:
                         continue
                     x1, y1, x2, y2 = map(float, coordinates_row)
                     confidence = float(confidence_value)
+                    if confidence <= 0.0:
+                        continue
                     values = (x1, y1, x2, y2, confidence)
                     if not all(math.isfinite(value) for value in values):
                         continue
@@ -177,7 +177,7 @@ class DeterministicYOLODetector:
                         continue
                     label = _class_label(names, int(numeric_class_id))
                     
-                    if label == normalized_target or confidence > 0.3:
+                    if confidence > 0.3:
                         color = (0, 255, 0) if label == normalized_target else (0, 0, 255)
                         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                         text = f"{label} {confidence:.2f}"
@@ -724,168 +724,120 @@ def _wait_for_stationary_joints(
     return False
 
 
-def _recover_lost_target(
+
+
+def _decelerate_to_halt(node: object, steps: int = 5, step_delay: float = 0.06) -> None:
+    """Gracefully ramp rail and j6 velocities to zero over a few steps."""
+    for i in range(steps, 0, -1):
+        frac = i / steps
+        if node.current_panda_joint6 is not None:
+            node.send_rail_and_joint6_command(
+                rail_val=node.current_rail_position,
+                rail_speed=0.0,
+                j6_val=node.current_panda_joint6,
+                j6_speed=0.0,
+            )
+        else:
+            node.send_absolute_rail_command(node.current_rail_position)
+        time.sleep(step_delay)
+
+
+def _extract_object_world_position(
     node: object,
-    config: RuntimeConfig,
-    target: str,
-    *,
-    last_seen_rail: float,
-) -> tuple[dict[str, object] | None, int]:
-    current_rail = float(node.current_rail_position)
-    if abs(current_rail - last_seen_rail) > config.search.rail_joint_tolerance:
-        print(
-            "[SEARCH][RECOVER] Backtracking rail from "
-            f"{current_rail:.4f}m to last observation at {last_seen_rail:.4f}m."
-        )
-        _command_rail_and_wait(node, last_seen_rail, config)
-
-    for attempt in range(1, MAX_REACQUISITION_FRAMES + 1):
-        print(
-            f"[SEARCH][RECOVER] Reacquisition frame {attempt}/"
-            f"{MAX_REACQUISITION_FRAMES}."
-        )
-        detection = _capture_stationary_detection(
-            node,
-            config,
-            target,
-            expected_rail=last_seen_rail,
-            expected_wrist=config.search.final_centering_angle,
-        )
-        if detection["status"] != "not_found":
-            return detection, attempt
-    return None, MAX_REACQUISITION_FRAMES
-
-
-def _center_target_on_rail(
-    node: object,
-    config: RuntimeConfig,
-    target: str,
-    trigger_detection: Mapping[str, object],
-    found_wrist_angle: float,
+    bbox: Sequence,
+    config: "RuntimeConfig",
 ) -> dict[str, object]:
-    print("[SEARCH][CENTER] Moving wrist to the calibrated centering angle.")
-    _command_wrist_and_wait(
-        node, config.search.final_centering_angle, config
+    """
+    Back-project the YOLO bounding-box centre through the wrist depth image
+    into the robot base frame, then add the rail offset to get world coords.
+
+    Returns a dict with keys: x, y, z, depth_raw, pixel_uv.
+    Raises RuntimeConfigurationError on bad depth or TF timeout.
+    """
+    # ── 1. Grab a fresh depth frame ────────────────────────────────────────
+    try:
+        depth_img = node.get_latest_depth_image(timeout_sec=3.0)
+    except TimeoutError as exc:
+        raise RuntimeConfigurationError(f"Depth frame timeout: {exc}") from exc
+
+    h, w = depth_img.shape[:2]
+
+    # ── 2. Compute bounding-box centre pixel ───────────────────────────────
+    # bbox format: [x1, y1, x2, y2] in pixels
+    u = int((bbox[0] + bbox[2]) / 2.0)
+    v = int((bbox[1] + bbox[3]) / 2.0)
+    u = max(0, min(w - 1, u))
+    v = max(0, min(h - 1, v))
+
+    # ── 3. Median depth in a small patch (robust to holes) ─────────────────
+    r = config.search.depth_patch_radius
+    patch = depth_img[
+        max(0, v - r): min(h, v + r + 1),
+        max(0, u - r): min(w, u + r + 1),
+    ]
+    valid = patch[np.isfinite(patch) & (patch > 0.01)]
+    if valid.size == 0:
+        raise RuntimeConfigurationError(
+            f"All depth values in patch around ({u},{v}) are invalid (0 or NaN)."
+        )
+    depth_m = float(np.median(valid))
+    print(f"[POSITION] depth at pixel ({u},{v}): {depth_m:.3f}m")
+
+    # ── 4. Back-project pixel → camera frame (OpenCV convention: Z forward) ─
+    fx = config.search.camera_fx
+    fy = config.search.camera_fy
+    cx = config.search.camera_cx
+    cy = config.search.camera_cy
+    x_cam = (u - cx) * depth_m / fx
+    y_cam = (v - cy) * depth_m / fy
+    z_cam = depth_m
+    p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+    print(f"[POSITION] camera frame: ({x_cam:.3f}, {y_cam:.3f}, {z_cam:.3f})")
+
+    # ── 5. TF lookup: camera → robot base (panda_link0) ────────────────────
+    try:
+        T_base_cam = node.get_transform_matrix(
+            target_frame=config.search.camera_base_frame,
+            source_frame=config.search.camera_optical_frame,
+            timeout_sec=3.0,
+        )
+    except TimeoutError as exc:
+        raise RuntimeConfigurationError(f"TF lookup failed: {exc}") from exc
+
+    # ── 6. Transform to base frame ─────────────────────────────────────────
+    p_base = T_base_cam @ p_cam   # shape (4,)
+
+    # ── 7. Add rail offset to get world frame ──────────────────────────────
+    # panda_link0 travels purely along the world X axis with the rail.
+    rail_x = float(node.current_rail_position) if node.current_rail_position is not None else 0.0
+    world_x = p_base[0] + rail_x
+    world_y = p_base[1]
+    world_z = p_base[2]
+
+    print(
+        f"[POSITION] base frame: ({p_base[0]:.3f}, {p_base[1]:.3f}, {p_base[2]:.3f})  "
+        f"rail={rail_x:.3f}  world=({world_x:.3f}, {world_y:.3f}, {world_z:.3f})"
     )
-    expected_rail = float(node.current_rail_position)
-    last_seen_rail = expected_rail
-    last_detection: Mapping[str, object] = trigger_detection
-    observation = _capture_stationary_detection(
-        node,
-        config,
-        target,
-        expected_rail=expected_rail,
-        expected_wrist=config.search.final_centering_angle,
-    )
-    observations = 1
-    centered_confidence_rechecks = 0
 
-    for iteration in range(1, MAX_CENTERING_ITERATIONS + 1):
-        if observation["status"] == "not_found":
-            recovered, recovery_observations = _recover_lost_target(
-                node,
-                config,
-                target,
-                last_seen_rail=last_seen_rail,
-            )
-            observations += recovery_observations
-            if recovered is None:
-                return {
-                    "status": "failure",
-                    "reason": "Target was lost during centering and could not be reacquired.",
-                    "detection": last_detection,
-                    "iterations": iteration,
-                    "observations": observations,
-                }
-            observation = recovered
-            expected_rail = last_seen_rail
-
-        current_rail = float(node.current_rail_position)
-        last_seen_rail = current_rail
-        last_detection = observation
-        horizontal_error = float(observation["horizontal_error"])
-        print(
-            f"[SEARCH][CENTER] iteration={iteration}, rail={current_rail:.4f}m, "
-            f"error={horizontal_error:.4f}, confidence="
-            f"{float(observation['confidence']):.4f}."
+    if not all(math.isfinite(v) for v in (world_x, world_y, world_z)):
+        raise RuntimeConfigurationError(
+            f"Computed world position contains non-finite values: ({world_x}, {world_y}, {world_z})"
         )
-
-        if abs(horizontal_error) <= config.search.horizontal_center_tolerance:
-            if bool(observation["final_eligible"]):
-                return {
-                    "status": "success",
-                    "reason": None,
-                    "detection": observation,
-                    "iterations": iteration,
-                    "observations": observations,
-                }
-            centered_confidence_rechecks += 1
-            if centered_confidence_rechecks > MAX_CENTERED_CONFIDENCE_RECHECKS:
-                return {
-                    "status": "failure",
-                    "reason": (
-                        "Target was centered but confidence did not become strictly "
-                        f"greater than {config.yolo.confidence_threshold:.2f}."
-                    ),
-                    "detection": observation,
-                    "iterations": iteration,
-                    "observations": observations,
-                }
-            observation = _capture_stationary_detection(
-                node,
-                config,
-                target,
-                expected_rail=current_rail,
-                expected_wrist=config.search.final_centering_angle,
-            )
-            observations += 1
-            continue
-
-        centered_confidence_rechecks = 0
-        raw_correction = config.search.centering_gain * horizontal_error
-        correction_magnitude = min(
-            config.search.centering_max_step,
-            max(config.search.centering_min_step, abs(raw_correction)),
-        )
-        correction = math.copysign(correction_magnitude, horizontal_error)
-        next_rail = min(
-            config.search.rail_max_position,
-            max(config.search.rail_min_position, current_rail + correction),
-        )
-        if abs(next_rail - current_rail) <= 1e-12:
-            return {
-                "status": "failure",
-                "reason": "Centering correction is blocked by a configured rail limit.",
-                "detection": observation,
-                "iterations": iteration,
-                "observations": observations,
-            }
-
-        _command_rail_and_wait(node, next_rail, config)
-        expected_rail = next_rail
-        observation = _capture_stationary_detection(
-            node,
-            config,
-            target,
-            expected_rail=expected_rail,
-            expected_wrist=config.search.final_centering_angle,
-        )
-        observations += 1
 
     return {
-        "status": "failure",
-        "reason": (
-            f"Centering did not converge within {MAX_CENTERING_ITERATIONS} iterations."
-        ),
-        "detection": last_detection,
-        "iterations": MAX_CENTERING_ITERATIONS,
-        "observations": observations,
+        "x": world_x,
+        "y": world_y,
+        "z": world_z,
+        "depth_raw": depth_m,
+        "pixel_uv": [u, v],
     }
 
 
-def _persist_dynamic_coordinate(path: Path, target: str, x: float) -> None:
-    if not math.isfinite(x):
-        raise RuntimeConfigurationError("Refusing to persist a non-finite coordinate")
+def _persist_dynamic_coordinate_3d(path: Path, target: str, x: float, y: float, z: float) -> None:
+    """Write or overwrite a target's {x, y, z} entry in the JSON coordinate file."""
+    for val, name in ((x, "x"), (y, "y"), (z, "z")):
+        if not math.isfinite(val):
+            raise RuntimeConfigurationError(f"Refusing to persist non-finite {name}={val}")
     if not path.parent.is_dir():
         raise RuntimeConfigurationError(
             f"Dynamic-coordinate parent directory does not exist: {path.parent}"
@@ -894,19 +846,20 @@ def _persist_dynamic_coordinate(path: Path, target: str, x: float) -> None:
     coordinates: dict[str, object] = {}
     if path.exists():
         try:
-            with path.open("r", encoding="utf-8") as coordinate_file:
-                existing_coordinates = json.load(coordinate_file)
+            with path.open("r", encoding="utf-8") as f:
+                existing = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeConfigurationError(
                 f"Could not read dynamic-coordinate JSON {path}: {exc}"
             ) from exc
-        if not isinstance(existing_coordinates, dict):
+        if not isinstance(existing, dict):
             raise RuntimeConfigurationError(
                 f"Dynamic-coordinate JSON must contain an object: {path}"
             )
-        coordinates.update(existing_coordinates)
+        coordinates.update(existing)
 
-    coordinates[target] = {"x": float(x)}
+    coordinates[target] = {"x": round(float(x), 4), "y": round(float(y), 4), "z": round(float(z), 4)}
+
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -916,12 +869,12 @@ def _persist_dynamic_coordinate(path: Path, target: str, x: float) -> None:
             prefix=f".{path.name}.",
             suffix=".tmp",
             delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            json.dump(coordinates, temporary_file, indent=4, sort_keys=True)
-            temporary_file.write("\n")
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
+        ) as tmp:
+            temporary_path = Path(tmp.name)
+            json.dump(coordinates, tmp, indent=4, sort_keys=True)
+            tmp.write("\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
         os.replace(temporary_path, path)
     except (OSError, TypeError, ValueError) as exc:
         if temporary_path is not None:
@@ -942,7 +895,6 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
         )
 
     observations = 0
-    last_centering_failure: Mapping[str, object] | None = None
     try:
         config = get_runtime_config()
         
@@ -1091,110 +1043,80 @@ def search_and_locate_with_yolo(target_object: str) -> dict[str, object]:
                     continue
 
                 print(
-                    "[SEARCH][DETECTED] Candidate found; halting sweep and "
-                    "transitioning to centering."
+                    "[SEARCH][DETECTED] Candidate found; gracefully decelerating and "
+                    "extracting object position."
                 )
-                if node.current_panda_joint6 is not None:
+
+                # Graceful deceleration: ramp velocity to zero over ~0.3s
+                _decelerate_to_halt(node)
+
+                # Extract 3-D world position from the depth frame
+                try:
+                    position = _extract_object_world_position(node, detection["bbox"], config)
+                except RuntimeConfigurationError as pos_exc:
+                    print(f"[SEARCH][POSITION] Position extraction failed: {pos_exc}. Resuming sweep.")
+                    # Resume sweep
+                    rail_dir = 1.0 if target_limit >= node.current_rail_position else -1.0
+                    j6_dir = 1.0 if j6_target >= (node.current_panda_joint6 or j6_limits[0]) else -1.0
                     node.send_rail_and_joint6_command(
-                        rail_val=node.current_rail_position,
-                        rail_speed=0.0,
-                        j6_val=node.current_panda_joint6,
-                        j6_speed=0.0
-                    )
-                else:
-                    node.send_absolute_rail_command(node.current_rail_position)
-                
-                centering = _center_target_on_rail(
-                    node, config, target, detection, wrist_angle
-                )
-                observations += int(centering["observations"])
-                if centering["status"] != "success":
-                    last_centering_failure = centering
-                    print(
-                        f"[SEARCH][CENTER] {centering['reason']} Resuming continuous search sweep."
-                    )
-                    if hasattr(node, "send_panda_search_posture"):
-                        node.send_panda_search_posture(wrist_angle, config.search.search_posture_j2, config.search.search_posture_j3, config.search.search_posture_j4, config.search.search_posture_j5, node.current_panda_joint6 if node.current_panda_joint6 else j6_limits[0], config.search.search_posture_j7)
-                    else:
-                        _command_wrist_and_wait(node, wrist_angle, config)
-                    time.sleep(1.5)
-                    node.send_rail_and_joint6_command(
-                        rail_val=target_limit, 
-                        rail_speed=config.search.rail_speed, 
-                        j6_val=j6_target, 
-                        j6_speed=config.search.j6_speed
+                        rail_val=target_limit,
+                        rail_speed=config.search.rail_speed * rail_dir,
+                        j6_val=j6_target,
+                        j6_speed=config.search.j6_speed * j6_dir,
                     )
                     continue
 
-                final_detection = centering["detection"]
-                target_centered = True
-                
-                current_absolute_rail = float(node.current_rail_position)
-                object_x = current_absolute_rail - initial_rail_position
+                # Persist x, y, z to the JSON coordinate file
                 try:
-                    _persist_dynamic_coordinate(
+                    _persist_dynamic_coordinate_3d(
                         config.paths.dynamic_semantic_coordinates,
                         target,
-                        object_x,
+                        position["x"],
+                        position["y"],
+                        position["z"],
                     )
                 except RuntimeConfigurationError as exc:
                     return _failure_result(
                         target,
                         str(exc),
                         state="persist_coordinate",
-                        detection=final_detection,
+                        detection=detection,
                         observations=observations,
                     )
+
+                target_centered = True
                 return {
                     "status": "success",
                     "success": True,
                     "state": "save_and_succeed",
                     "reason": None,
                     "target": target,
-                    "confidence": final_detection["confidence"],
-                    "bbox": final_detection["bbox"],
-                    "center": final_detection["center"],
-                    "horizontal_error": final_detection["horizontal_error"],
-                    "x": object_x,
-                    "absolute_rail_position": current_absolute_rail,
-                    "initial_rail_position": initial_rail_position,
-                    "centering_iterations": centering["iterations"],
+                    "confidence": detection["confidence"],
+                    "bbox": detection["bbox"],
+                    "center": detection.get("center"),
+                    "x": position["x"],
+                    "y": position["y"],
+                    "z": position["z"],
+                    "depth_m": position["depth_raw"],
+                    "pixel_uv": position["pixel_uv"],
+                    "rail_position": float(node.current_rail_position),
                     "observations": observations,
-                    "coordinate_path": str(
-                        config.paths.dynamic_semantic_coordinates
-                    ),
+                    "coordinate_path": str(config.paths.dynamic_semantic_coordinates),
                 }
 
         if not target_centered:
-            last_detection = (
-                last_centering_failure.get("detection")
-                if last_centering_failure is not None
-                else None
-            )
-            reason = "Full configured rail range was scanned without a valid centered detection."
-            if last_centering_failure is not None:
-                reason += f" Last centering failure: {last_centering_failure['reason']}"
             return _failure_result(
                 target,
-                reason,
+                "Full configured rail range was scanned without a valid detection.",
                 state="search_sweep",
-                detection=last_detection,
                 observations=observations,
             )
 
-        last_detection = (
-            last_centering_failure.get("detection")
-            if last_centering_failure is not None
-            else None
-        )
-        reason = "Full configured rail range was scanned without a valid centered detection."
-        if last_centering_failure is not None:
-            reason += f" Last centering failure: {last_centering_failure['reason']}"
+        # Should not reach here; belt-and-suspenders
         return _failure_result(
             target,
-            reason,
+            "Search concluded without finding the target.",
             state="failure",
-            detection=last_detection,
             observations=observations,
         )
     except Exception as exc:

@@ -24,6 +24,6 @@ ros2 topic pub -1 /sim/rail_franka1/joint_command sensor_msgs/msg/JointState "{
 }"
 
 # 3. Open Gripper
-ros2 topic pub -1 /gripper_command std_msgs/msg/Float64 "{data: 100.0}"
+ros2 topic pub -1 /gripper_cmd std_msgs/msg/Float64 "{data: 100.0}"
 
 echo "Robot initialization complete."

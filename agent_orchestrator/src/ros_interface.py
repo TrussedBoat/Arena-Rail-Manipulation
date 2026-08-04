@@ -1,6 +1,7 @@
 import base64
 import time
 import cv2
+import numpy as np
 from cv_bridge import CvBridge
 
 import rclpy
@@ -8,6 +9,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 from std_srvs.srv import Trigger
 from std_msgs.msg import String
+import tf2_ros
+from geometry_msgs.msg import PointStamped
 
 _shared_node = None
 
@@ -24,6 +27,7 @@ class RobotHardwareInterface(Node):
     def __init__(self):
         super().__init__('agent_hardware_interface')
         self.image_sub = self.create_subscription(Image, '/sim/rail_franka1/cam/wrist/color/image_raw', self.image_callback, 10)
+        self.depth_sub = self.create_subscription(Image, '/sim/rail_franka1/cam/wrist/depth/image_raw', self.depth_callback, 10)
         self.rail_subscriber = self.create_subscription(JointState, '/sim/rail_franka1/joint_states', self.rail_state_callback, 10)
         self.rail_publisher = self.create_publisher(JointState, '/joint_position_command', 10)
 
@@ -34,10 +38,15 @@ class RobotHardwareInterface(Node):
         
         self.bridge = CvBridge()
         self.latest_b64_image = None
+        self.latest_depth_image = None  # raw numpy float32 depth frame (metres)
         self.current_rail_position = None
         self.current_panda_joint1 = None
         self.current_panda_joint6 = None
         self.initial_rail_position = None
+
+        # TF listener for camera→base transforms
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
     def grasp_callback(self, request, response):
         self.get_logger().info("[TELEMETRY] Robot announced grasp completion!")
@@ -62,6 +71,50 @@ class RobotHardwareInterface(Node):
             self.latest_b64_image = base64.b64encode(buffer).decode('utf-8')
         except Exception as e:
             self.get_logger().error(f"Image processing exception: {e}")
+
+    def depth_callback(self, msg):
+        """Store latest depth frame as a float32 numpy array (metres)."""
+        try:
+            # 32FC1 encoding → values already in metres
+            self.latest_depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        except Exception as e:
+            self.get_logger().error(f"Depth image processing exception: {e}")
+
+    def get_latest_depth_image(self, timeout_sec: float = 3.0):
+        """Block until a fresh depth frame is available and return it."""
+        self.latest_depth_image = None
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            if self.latest_depth_image is not None:
+                return self.latest_depth_image
+            time.sleep(0.05)
+        raise TimeoutError("Timed out waiting for depth image")
+
+    def get_transform_matrix(self, target_frame: str, source_frame: str, timeout_sec: float = 3.0) -> np.ndarray:
+        """Return a 4x4 homogeneous transform from source_frame to target_frame."""
+        import rclpy.time
+        from scipy.spatial.transform import Rotation
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                tf_stamped = self.tf_buffer.lookup_transform(
+                    target_frame,
+                    source_frame,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.5)
+                )
+                t = tf_stamped.transform.translation
+                q = tf_stamped.transform.rotation
+                rot = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+                mat = np.eye(4)
+                mat[:3, :3] = rot
+                mat[:3, 3] = [t.x, t.y, t.z]
+                return mat
+            except Exception:
+                time.sleep(0.1)
+        raise TimeoutError(
+            f"TF lookup timed out: {source_frame} → {target_frame} after {timeout_sec}s"
+        )
 
     def rail_state_callback(self, msg):
         if 'rail_j1' in msg.name:
