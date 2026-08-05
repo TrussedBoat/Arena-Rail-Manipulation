@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 import rclpy
+import numpy as np
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from geometry_msgs.msg import Pose
 from std_msgs.msg import Float64
 import copy
+
+
+DIRECT_TARGET_POSITION_TOLERANCE = 0.02
+DIRECT_TARGET_STABLE_SAMPLES = 5
 
 class RailUnifiedBridge(Node):
     def __init__(self):
@@ -27,6 +33,10 @@ class RailUnifiedBridge(Node):
         self.sys2_cmd_vel_cache = {f"panda_joint{i}": 0.0 for i in range(1, 8)}
         self.sys2_cmd_vel_cache["panda_finger_joint1"] = 0.0
         self.sys2_cmd_received = set()
+        self.cartesian_control_active = False
+        self.direct_joint_control_active = False
+        self.direct_target_positions = {}
+        self.direct_target_stable_samples = 0
         
         # ==========================================
         # SPLITTER: Isaac Sim (Bundled) -> Controllers (Separated)
@@ -49,10 +59,11 @@ class RailUnifiedBridge(Node):
         self.pub_sys1_cmd = self.create_publisher(JointState, '/sim/rail_franka1/joint_command', 10)
         self.pub_sys2_cmd = self.create_publisher(JointState, '/sim/rail_franka2/joint_command', 10)
         
-        self.create_subscription(JointState, '/sim/rail1/joint_command', self.cb_sys1_relay, 10)
-        self.create_subscription(JointState, '/joint_command', self.cb_sys1_relay, 10)
-        self.create_subscription(JointState, '/joint_position_command', self.cb_sys1_relay, 10)
-        self.create_subscription(Float64, '/gripper_cmd', self.cb_sys1_relay, 10)
+        self.create_subscription(JointState, '/sim/rail1/joint_command', self.cb_sys1_direct_relay, 10)
+        self.create_subscription(JointState, '/joint_command', self.cb_sys1_controller_relay, 10)
+        self.create_subscription(JointState, '/joint_position_command', self.cb_sys1_direct_relay, 10)
+        self.create_subscription(Float64, '/gripper_cmd', self.cb_sys1_direct_relay, 10)
+        self.create_subscription(Pose, '/pose_cmd', self.cb_cartesian_pose, 10)
         self.create_subscription(JointState, '/sim/rail2/joint_command', self.cb_sys2_relay, 10)
         self.create_subscription(JointState, '/sim/franka2_rail/joint_command', self.cb_sys2_relay, 10)
 
@@ -61,7 +72,121 @@ class RailUnifiedBridge(Node):
     # ---------------------------------------------------------
     # MERGE LOGIC
     # ---------------------------------------------------------
-    def cb_sys1_relay(self, msg):
+    def cb_cartesian_pose(self, _msg):
+        if self.direct_joint_control_active:
+            self.get_logger().warning(
+                "Ignoring Cartesian pose: direct Panda joint control has priority."
+            )
+            return
+        if not self.cartesian_control_active:
+            self.cartesian_control_active = True
+            self.get_logger().info(
+                "Cartesian arm ownership enabled; direct Panda/gripper commands are now blocked."
+            )
+
+    @staticmethod
+    def _is_panda_joint(name):
+        return 'panda' in name.lower()
+
+    def cb_sys1_controller_relay(self, msg):
+        if self.direct_joint_control_active:
+            self.get_logger().warning(
+                "Ignoring Cartesian joint command: direct Panda joint control has priority."
+            )
+            return
+        if not self.cartesian_control_active:
+            # Do not replay a stale Cartesian target after direct-joint ownership
+            # has completed. A new /pose_cmd explicitly arms Cartesian forwarding.
+            return
+        self._relay_sys1_command(msg, controller_owned=True)
+
+    def cb_sys1_direct_relay(self, msg):
+        if hasattr(msg, 'name'):
+            panda_names = [name for name in msg.name if self._is_panda_joint(name)]
+            if panda_names:
+                if not self.direct_joint_control_active:
+                    self.get_logger().warning(
+                        "Direct Panda joint control enabled; Cartesian commands are now blocked."
+                    )
+                self.direct_joint_control_active = True
+                self.cartesian_control_active = False
+                self.direct_target_positions = {
+                    name: float(msg.position[index])
+                    for index, name in enumerate(msg.name)
+                    if self._is_panda_joint(name)
+                    and index < len(msg.position)
+                    and np.isfinite(msg.position[index])
+                }
+                self.direct_target_stable_samples = 0
+        self._relay_sys1_command(msg, controller_owned=False)
+
+    def _check_direct_target_convergence(self, msg):
+        """Release direct ownership after a stable, in-tolerance joint target."""
+        if not self.direct_joint_control_active or not self.direct_target_positions:
+            return
+
+        actual_positions = {
+            name: float(msg.position[index])
+            for index, name in enumerate(msg.name)
+            if name in self.direct_target_positions and index < len(msg.position)
+        }
+        if len(actual_positions) != len(self.direct_target_positions):
+            self.direct_target_stable_samples = 0
+            return
+
+        converged = all(
+            abs(actual_positions[name] - target) <= DIRECT_TARGET_POSITION_TOLERANCE
+            for name, target in self.direct_target_positions.items()
+        )
+        if not converged:
+            self.direct_target_stable_samples = 0
+            return
+
+        self.direct_target_stable_samples += 1
+        if self.direct_target_stable_samples < DIRECT_TARGET_STABLE_SAMPLES:
+            return
+
+        self.direct_joint_control_active = False
+        self.direct_target_positions.clear()
+        self.direct_target_stable_samples = 0
+        self.get_logger().info(
+            "Direct Panda target reached; Cartesian command forwarding re-enabled."
+        )
+
+    def _relay_sys1_command(self, msg, controller_owned):
+        if self.cartesian_control_active and not controller_owned:
+            if not hasattr(msg, 'name'):
+                self.get_logger().warning(
+                    "Ignoring direct gripper command: Cartesian controller owns Panda joints."
+                )
+                return
+
+            allowed_indices = [
+                index for index, name in enumerate(msg.name)
+                if not self._is_panda_joint(name)
+            ]
+            blocked = [
+                name for name in msg.name if self._is_panda_joint(name)
+            ]
+            if blocked:
+                self.get_logger().warning(
+                    "Ignoring direct Cartesian-owned joints: " + ", ".join(blocked)
+                )
+            if not allowed_indices:
+                return
+
+            filtered = JointState()
+            filtered.header = msg.header
+            for index in allowed_indices:
+                filtered.name.append(msg.name[index])
+                if index < len(msg.position):
+                    filtered.position.append(msg.position[index])
+                if index < len(msg.velocity):
+                    filtered.velocity.append(msg.velocity[index])
+                if index < len(msg.effort):
+                    filtered.effort.append(msg.effort[index])
+            msg = filtered
+
         # Update the command cache with incoming values (position and velocity)
         if hasattr(msg, 'name'):
             # msg is a JointState message
@@ -86,7 +211,7 @@ class RailUnifiedBridge(Node):
         for name in self.sys1_cmd_cache.keys():
             out_msg.name.append(name)
             out_msg.position.append(self.sys1_cmd_cache[name])
-            out_msg.velocity.append(self.sys1_cmd_vel_cache[name])
+            out_msg.velocity.append(self.sys1_cmd_vel_cache.get(name, 0.0))
             
         self.pub_sys1_cmd.publish(out_msg)
 
@@ -105,7 +230,7 @@ class RailUnifiedBridge(Node):
         for name in self.sys2_cmd_cache.keys():
             out_msg.name.append(name)
             out_msg.position.append(self.sys2_cmd_cache[name])
-            out_msg.velocity.append(self.sys2_cmd_vel_cache[name])
+            out_msg.velocity.append(self.sys2_cmd_vel_cache.get(name, 0.0))
             
         self.pub_sys2_cmd.publish(out_msg)
 
@@ -156,6 +281,7 @@ class RailUnifiedBridge(Node):
 
     def cb_split_state1(self, msg):
         self.process_and_split_state(msg, self.pub_rail1_state, self.pub_franka1_state, 'last_state1')
+        self._check_direct_target_convergence(msg)
 
     def cb_split_state2(self, msg):
         self.process_and_split_state(msg, self.pub_rail2_state, self.pub_franka2_state, 'last_state2')

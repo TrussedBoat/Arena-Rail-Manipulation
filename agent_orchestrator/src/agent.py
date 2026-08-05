@@ -10,11 +10,13 @@ from tools import (
     execute_pick_script,
     execute_place_script,
     move_rail_to_object,
-    search_and_locate_with_yolo,
+    general_mapping,
+    targeted_search,
     start_joint_controller,
     turn_panda_arm,
     home_panda_arm,
     move_rail_relative,
+    move_eef_to_pose,
 )
 
 runtime_config = get_runtime_config()
@@ -37,11 +39,35 @@ tool_definitions = [
     {
         "type": "function",
         "function": {
-            "name": "search_and_locate_with_yolo",
+            "name": "targeted_search",
             "description": (
-                "Search the environment for a specific object and save its location. "
-                "Use this to find objects before interacting with or moving to them. "
+                "Human-like targeted search: pans the wrist camera right then left to find "
+                "a specific object on the tables. Use this as the primary search tool when "
+                "looking for an object. If the object is not found from the current position, "
+                "the robot moves to the table centre and tries once more. "
                 "Pass one normalized canonical label such as 'apple'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_object": {
+                        "type": "string",
+                        "description": "Normalized target label, for example 'apple'.",
+                    }
+                },
+                "required": ["target_object"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "general_mapping",
+            "description": (
+                "Full rail sweep search: moves the robot along the entire rail while scanning "
+                "with YOLO to map object locations. Use this as a fallback if targeted_search "
+                "fails. Pass one normalized canonical label such as 'apple'."
             ),
             "parameters": {
                 "type": "object",
@@ -162,6 +188,31 @@ tool_definitions = [
     {
         "type": "function",
         "function": {
+            "name": "move_eef_to_pose",
+            "description": (
+                "Move the Franka end effector to an absolute Cartesian pose relative to "
+                "panda_link0. XYZ values are metres and roll/pitch/yaw are radians. After "
+                "using this tool, the Cartesian controller exclusively owns Panda arm joints; "
+                "rail movement remains available."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "EEF X position in metres."},
+                    "y": {"type": "number", "description": "EEF Y position in metres."},
+                    "z": {"type": "number", "description": "EEF Z position in metres."},
+                    "roll": {"type": "number", "description": "Roll in radians."},
+                    "pitch": {"type": "number", "description": "Pitch in radians."},
+                    "yaw": {"type": "number", "description": "Yaw in radians."},
+                },
+                "required": ["x", "y", "z", "roll", "pitch", "yaw"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish_task",
             "description": "Complete the workflow once the user's objective is achieved and the robot has safely returned home.",
             "parameters": {
@@ -200,7 +251,10 @@ BOWL_TARGETS = {"bowl", "purple bowl"}
 
 tools_impl = {
     "start_joint_controller": lambda _: start_joint_controller(),
-    "search_and_locate_with_yolo": lambda args: search_and_locate_with_yolo(
+    "general_mapping": lambda args: general_mapping(
+        args.get("target_object")
+    ),
+    "targeted_search": lambda args: targeted_search(
         args.get("target_object")
     ),
     "execute_pick_script": lambda args: execute_pick_script(
@@ -219,6 +273,14 @@ tools_impl = {
         args.get("target_rad")
     ),
     "home_panda_arm": lambda _: home_panda_arm(),
+    "move_eef_to_pose": lambda args: move_eef_to_pose(
+        args.get("x"),
+        args.get("y"),
+        args.get("z"),
+        args.get("roll"),
+        args.get("pitch"),
+        args.get("yaw"),
+    ),
     "finish_task": lambda args: {
         "status": "success",
         "success": True,
@@ -366,7 +428,7 @@ def execute_tools(state: AgentState) -> dict:
         return _failed_update(state, [result_message], reason)
 
     located_target = ""
-    if tool_name == "search_and_locate_with_yolo":
+    if tool_name in ("targeted_search", "general_mapping"):
         requested_target = _normalized_argument(arguments, "target_object")
         located_target = _normalized_argument(raw_result, "target")
         if not located_target or located_target != requested_target:

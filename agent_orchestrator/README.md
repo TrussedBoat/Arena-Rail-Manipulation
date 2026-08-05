@@ -26,6 +26,19 @@ A hybrid ROS 2 manipulation pipeline in which a compact local VLM plans high-lev
 
 ## Architecture
 
+### Cartesian end-effector commands
+
+The orchestrator exposes `move_eef_to_pose` with XYZ in metres and roll, pitch,
+and yaw in radians. It publishes `geometry_msgs/Pose` on `/pose_cmd`, expressed
+relative to `panda_link0`, and waits for `/controller_state` before continuing.
+After the first Cartesian command, the Cartesian controller exclusively owns
+Panda arm and gripper joints; rail-only commands remain available.
+
+`run_orchestrator.sh` starts the controller from the `home_robotics` workspace.
+Set `ARENA_HOME_ROBOTICS_SETUP` if its `install/setup.bash` is not at the default
+location. Cartesian timeouts and TF frame names can be overridden with the
+`YOLO_VLM_CARTESIAN_*` environment variables defined in `src/config.py`.
+
 The VLM sees only six high-level tools:
 
 1. `start_joint_controller`

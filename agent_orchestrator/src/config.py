@@ -24,7 +24,7 @@ VLM_MMPROJ_FILENAME = "mmproj-Qwen3VL-8B-Instruct-F16.gguf"
 VLM_MODEL_ALIAS     = "Qwen3VL-8B-Instruct-Q4_K_M"
 
 # --- YOLO checkpoint ---
-YOLO_CHECKPOINT_PATH: Path | None = PROJECT_ROOT / "agent_orchestrator/models/yolo11s.pt"
+YOLO_CHECKPOINT_PATH: Path | None = PROJECT_ROOT / "agent_orchestrator/models/yolo11m.pt"
 
 
 # --- VLM server settings ---
@@ -130,6 +130,15 @@ class SearchConfig:
 
 
 @dataclass(frozen=True)
+class CartesianConfig:
+    command_timeout_sec: float
+    readiness_timeout_sec: float
+    tf_timeout_sec: float
+    base_frame: str
+    eef_frame: str
+
+
+@dataclass(frozen=True)
 class PathConfig:
     static_semantic_coordinates: Path
     dynamic_semantic_coordinates: Path
@@ -145,6 +154,7 @@ class RuntimeConfig:
     vlm: VLMConfig
     yolo: YOLOConfig
     search: SearchConfig
+    cartesian: CartesianConfig
     paths: PathConfig
     allow_mock_hardware_scripts: bool
 
@@ -329,6 +339,23 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             camera_cx=_env_float(source, "YOLO_VLM_CAMERA_CX", 567.74),
             camera_cy=_env_float(source, "YOLO_VLM_CAMERA_CY", 488.32),
             depth_patch_radius=int(_env_float(source, "YOLO_VLM_DEPTH_PATCH_RADIUS", 2)),
+        ),
+        cartesian=CartesianConfig(
+            command_timeout_sec=_env_float(
+                source, "YOLO_VLM_CARTESIAN_COMMAND_TIMEOUT_SEC", 30.0
+            ),
+            readiness_timeout_sec=_env_float(
+                source, "YOLO_VLM_CARTESIAN_READY_TIMEOUT_SEC", 5.0
+            ),
+            tf_timeout_sec=_env_float(
+                source, "YOLO_VLM_CARTESIAN_TF_TIMEOUT_SEC", 3.0
+            ),
+            base_frame=_env_value(
+                source, "YOLO_VLM_CARTESIAN_BASE_FRAME", "panda_link0"
+            ),
+            eef_frame=_env_value(
+                source, "YOLO_VLM_CARTESIAN_EEF_FRAME", "eef"
+            ),
         ),
         paths=PathConfig(
             static_semantic_coordinates=_env_path(
@@ -637,6 +664,13 @@ def validate_runtime_config(
         errors.append(
             f"wrist joint tolerance must be positive, got {config.search.wrist_joint_tolerance}"
         )
+    for label, value in (
+        ("Cartesian command timeout", config.cartesian.command_timeout_sec),
+        ("Cartesian readiness timeout", config.cartesian.readiness_timeout_sec),
+        ("Cartesian TF timeout", config.cartesian.tf_timeout_sec),
+    ):
+        if value <= 0:
+            errors.append(f"{label} must be positive, got {value}")
 
     if not errors and config.yolo.checkpoint_path.is_file():
         try:

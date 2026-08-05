@@ -1,4 +1,6 @@
 import base64
+import math
+import threading
 import time
 import cv2
 import numpy as np
@@ -8,9 +10,10 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 from std_srvs.srv import Trigger
-from std_msgs.msg import String
+from std_msgs.msg import Bool
 import tf2_ros
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import Pose
+from scipy.spatial.transform import Rotation
 
 _shared_node = None
 
@@ -30,6 +33,13 @@ class RobotHardwareInterface(Node):
         self.depth_sub = self.create_subscription(Image, '/sim/rail_franka1/cam/wrist/depth/image_raw', self.depth_callback, 10)
         self.rail_subscriber = self.create_subscription(JointState, '/sim/rail_franka1/joint_states', self.rail_state_callback, 10)
         self.rail_publisher = self.create_publisher(JointState, '/joint_position_command', 10)
+        self.pose_publisher = self.create_publisher(Pose, '/pose_cmd', 10)
+        self.controller_state_sub = self.create_subscription(
+            Bool, '/controller_state', self.controller_state_callback, 10
+        )
+        self.controller_ready_sub = self.create_subscription(
+            Bool, '/controller_ready', self.controller_ready_callback, 10
+        )
 
         self.grasp_srv = self.create_service(Trigger, '/vlm_grasp_completed', self.grasp_callback)
         self.place_srv = self.create_service(Trigger, '/vlm_place_completed', self.place_callback)
@@ -42,11 +52,83 @@ class RobotHardwareInterface(Node):
         self.current_rail_position = None
         self.current_panda_joint1 = None
         self.current_panda_joint6 = None
+        self.current_joint_positions = {}
         self.initial_rail_position = None
+        self.cartesian_controller_ready = False
+        self.cartesian_control_active = False
+        self._cartesian_completion = threading.Event()
 
         # TF listener for camera→base transforms
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+    def controller_ready_callback(self, msg):
+        self.cartesian_controller_ready = bool(msg.data)
+
+    def controller_state_callback(self, msg):
+        if msg.data:
+            self._cartesian_completion.set()
+
+    def wait_for_cartesian_controller(self, timeout_sec: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if self.cartesian_controller_ready or self.pose_publisher.get_subscription_count() > 0:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def send_eef_pose(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        roll: float,
+        pitch: float,
+        yaw: float,
+        timeout_sec: float = 30.0,
+        readiness_timeout_sec: float = 5.0,
+        tf_timeout_sec: float = 3.0,
+        base_frame: str = 'panda_link0',
+        eef_frame: str = 'eef',
+    ) -> bool:
+        values = (x, y, z, roll, pitch, yaw)
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("EEF pose values must all be finite numbers")
+        if not self.wait_for_cartesian_controller(readiness_timeout_sec):
+            raise RuntimeError("No Cartesian controller subscriber is available on /pose_cmd")
+
+        # The home_robotics controller interprets Pose relative to panda_link0.
+        quaternion = Rotation.from_euler('xyz', [roll, pitch, yaw]).as_quat()
+        norm = float(np.linalg.norm(quaternion))
+        if norm == 0.0 or not math.isfinite(norm):
+            raise ValueError("RPY values produced an invalid orientation quaternion")
+        quaternion /= norm
+
+        # Validate that the controller's feedback transform exists before actuating.
+        self.get_transform_matrix(base_frame, eef_frame, timeout_sec=tf_timeout_sec)
+
+        msg = Pose()
+        msg.position.x, msg.position.y, msg.position.z = map(float, (x, y, z))
+        msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = map(
+            float, quaternion
+        )
+
+        self._cartesian_completion.clear()
+        self.cartesian_control_active = True
+        self.pose_publisher.publish(msg)
+        self.get_logger().info(
+            f"Published EEF pose in {base_frame}: "
+            f"xyz=({x:.4f}, {y:.4f}, {z:.4f}), "
+            f"rpy=({roll:.4f}, {pitch:.4f}, {yaw:.4f})"
+        )
+        return self._cartesian_completion.wait(timeout=max(0.0, timeout_sec))
+
+    def _ensure_direct_arm_control_allowed(self):
+        if self.cartesian_control_active:
+            self.get_logger().warning(
+                "Direct Panda command requested; bridge arbitration will give it priority "
+                "over Cartesian commands."
+            )
 
     def grasp_callback(self, request, response):
         self.get_logger().info("[TELEMETRY] Robot announced grasp completion!")
@@ -117,6 +199,9 @@ class RobotHardwareInterface(Node):
         )
 
     def rail_state_callback(self, msg):
+        for name, position in zip(msg.name, msg.position):
+            self.current_joint_positions[name] = float(position)
+
         if 'rail_j1' in msg.name:
             try:
                 idx = msg.name.index('rail_j1')
@@ -154,6 +239,7 @@ class RobotHardwareInterface(Node):
         self.get_logger().info(f"Published Absolute JointState for rail_j1: {absolute_value}m")
         
     def send_rail_and_joint6_command(self, rail_val: float, rail_speed: float, j6_val: float, j6_speed: float):
+        self._ensure_direct_arm_control_allowed()
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = ['rail_j1', 'panda_joint6']
@@ -163,6 +249,7 @@ class RobotHardwareInterface(Node):
         self.get_logger().info(f"Published JointState for rail_j1={rail_val}m and panda_joint6={j6_val}rad")
 
     def send_panda_joint1_command(self, target_rad: float):
+        self._ensure_direct_arm_control_allowed()
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = ['panda_joint1']
@@ -171,6 +258,7 @@ class RobotHardwareInterface(Node):
         self.get_logger().info(f"Published JointState for panda_joint1: {target_rad}rad")
 
     def send_panda_search_posture(self, j1: float, j2: float, j3: float, j4: float, j5: float, j6: float, j7: float):
+        self._ensure_direct_arm_control_allowed()
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
@@ -179,6 +267,7 @@ class RobotHardwareInterface(Node):
         self.get_logger().info("Published JointState for full arm search posture.")
 
     def send_panda_joint6_command(self, target_rad: float, speed: float = None):
+        self._ensure_direct_arm_control_allowed()
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = ['panda_joint6']
@@ -191,12 +280,19 @@ class RobotHardwareInterface(Node):
 def wait_for_joint_target(node: RobotHardwareInterface, joint_name: str, target_value: float, tolerance=0.02, timeout=20.0) -> bool:
     start = time.time()
     while (time.time() - start) < timeout:
-        # The background thread is updating node values automatically!
-        # Just check the variables and sleep.
-        current_val = node.current_rail_position if joint_name == 'rail_j1' else node.current_panda_joint1
-        
+        # The background ROS thread updates the complete joint telemetry map.
+        # Keep the legacy named fields as a fallback for compatibility.
+        current_val = node.current_joint_positions.get(joint_name)
+        if current_val is None:
+            if joint_name == 'rail_j1':
+                current_val = node.current_rail_position
+            elif joint_name == 'panda_joint1':
+                current_val = node.current_panda_joint1
+            elif joint_name == 'panda_joint6':
+                current_val = node.current_panda_joint6
+
         if current_val is not None and abs(current_val - target_value) <= tolerance:
-            return True 
+            return True
             
         time.sleep(0.05)  # Yield to prevent maxing out the CPU loop
         
