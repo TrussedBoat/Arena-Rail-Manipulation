@@ -121,6 +121,7 @@ class SearchConfig:
     # TF frame names
     camera_base_frame: str
     camera_optical_frame: str
+    global_origin_frame: str
     # Hardcoded camera intrinsics (no camera_info topic available)
     camera_fx: float
     camera_fy: float
@@ -333,6 +334,9 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             # TF frame names published by Isaac Sim
             camera_base_frame=_env_value(source, "YOLO_VLM_CAMERA_BASE_FRAME", "panda_link0"),
             camera_optical_frame=_env_value(source, "YOLO_VLM_CAMERA_OPTICAL_FRAME", "wrist_camera"),
+            global_origin_frame=_env_value(
+                source, "YOLO_VLM_GLOBAL_ORIGIN_FRAME", "global_origin"
+            ),
             # Wrist RealSense intrinsics (measured from the running simulation)
             camera_fx=_env_float(source, "YOLO_VLM_CAMERA_FX", 907.00),
             camera_fy=_env_float(source, "YOLO_VLM_CAMERA_FY", 905.69),
@@ -664,6 +668,15 @@ def validate_runtime_config(
         errors.append(
             f"wrist joint tolerance must be positive, got {config.search.wrist_joint_tolerance}"
         )
+    for frame_name, frame_value in (
+        ("camera base frame", config.search.camera_base_frame),
+        ("camera optical frame", config.search.camera_optical_frame),
+        ("global origin frame", config.search.global_origin_frame),
+    ):
+        if not frame_value.strip():
+            errors.append(f"{frame_name} must not be empty")
+    if config.search.global_origin_frame == config.search.camera_optical_frame:
+        errors.append("global origin frame must differ from the camera optical frame")
     for label, value in (
         ("Cartesian command timeout", config.cartesian.command_timeout_sec),
         ("Cartesian readiness timeout", config.cartesian.readiness_timeout_sec),

@@ -53,13 +53,48 @@ if [ ! -f "$PANDA_CONTROLLER" ]; then
     exit 1
 fi
 
+RRT_MODEL_ROOT="$HOME_ROBOTICS_ROOT/src/motion_planners/data/panda"
+if [ ! -f "$RRT_MODEL_ROOT/panda.urdf" ] || [ ! -f "$RRT_MODEL_ROOT/panda.srdf" ]; then
+    echo "[!] Error: Panda RRT model files not found under: $RRT_MODEL_ROOT"
+    exit 1
+fi
+
 echo "[+] Starting Bridge Node in background..."
 python3 scripts/rail_bridge.py &
 BRIDGE_PID=$!
 
+echo "[+] Starting RRT motion planner in background..."
+rrt_supervisor() {
+    local planner_pid
+    local planner_status
+    trap 'kill "$planner_pid" 2>/dev/null || true; wait "$planner_pid" 2>/dev/null || true; exit 0' TERM INT
+    while true; do
+        PYTHONFAULTHANDLER=1 python3 agent_orchestrator/src/rrt_planner.py --ros-args \
+            -p planning_time_sec:=8.0 \
+            -p goal_position_tolerance_m:=0.005 \
+            -p goal_orientation_tolerance_rad:=0.05 \
+            -p model_root:="$RRT_MODEL_ROOT" \
+            -p pose_cmd_topic:=/pose_cmd \
+            -p joint_states_topic:=/joint_states \
+            -p trajectory_topic:=/joint_trajectory_cmd \
+            -p controller_state_topic:=/controller_state &
+        planner_pid=$!
+        if wait "$planner_pid"; then
+            planner_status=0
+        else
+            planner_status=$?
+        fi
+        echo "[!] RRT planner exited with status $planner_status; restarting in 1 second..."
+        sleep 1
+    done
+}
+rrt_supervisor &
+RRT_PID=$!
+
 echo "[+] Starting Cartesian Panda controller in background..."
 python3 "$PANDA_CONTROLLER" --ros-args \
-    -p cartesian_pose_topic:=/pose_cmd \
+    -p cartesian_pose_topic:=/controller_pose_cmd_disabled \
+    -p joint_trajectory_topic:=/joint_trajectory_cmd \
     -p joint_state_topic:=/joint_states \
     -p joint_command_topic:=/joint_command \
     -p controller_state_topic:=/controller_state \
@@ -67,8 +102,8 @@ python3 "$PANDA_CONTROLLER" --ros-args \
 CARTESIAN_PID=$!
 
 cleanup() {
-    echo "[+] Stopping bridge and Cartesian controller..."
-    kill "$BRIDGE_PID" "$CARTESIAN_PID" 2>/dev/null || true
+    echo "[+] Stopping bridge, RRT planner, and Cartesian controller..."
+    kill "$BRIDGE_PID" "$RRT_PID" "$CARTESIAN_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 

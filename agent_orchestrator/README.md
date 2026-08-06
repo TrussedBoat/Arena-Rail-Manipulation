@@ -21,23 +21,32 @@ A hybrid ROS 2 manipulation pipeline in which a compact local VLM plans high-lev
 - **Deterministic visual search**: Uses the configured local `yolo11s.pt` checkpoint; camera frames are processed locally and are not sent to the VLM during active search.
 - **Stop-and-go motion safety**: YOLO runs only after rail and wrist convergence, a stability interval, and acquisition of a fresh camera frame.
 - **Visual centering and recovery**: Applies bounded rail corrections and backtracks to the last observed position if the target temporarily disappears.
-- **Dynamic coordinates**: Saves the session-relative pickup coordinate to `semantic_distances_dynamic.json` without overwriting unrelated labels.
+- **Dynamic coordinates**: Saves rail-zero global XYZ pickup coordinates to `semantic_distances_dynamic.json` without overwriting unrelated labels.
 - **Fail-closed orchestration**: A LangGraph stage gate permits only one expected high-level tool at a time and terminates immediately after search, pick, navigation, or place failure.
 
 ## Architecture
 
-### Cartesian end-effector commands
+### RRT end-effector commands
 
 The orchestrator exposes `move_eef_to_pose` with XYZ in metres and roll, pitch,
 and yaw in radians. It publishes `geometry_msgs/Pose` on `/pose_cmd`, expressed
-relative to `panda_link0`, and waits for `/controller_state` before continuing.
-After the first Cartesian command, the Cartesian controller exclusively owns
-Panda arm and gripper joints; rail-only commands remain available.
+relative to `panda_link0`. The RRT planner converts the pose into a timed
+seven-joint trajectory, validates self-collision, joint limits, and Jacobian
+singularity margin, and publishes it on `/joint_trajectory_cmd`. The caller
+waits for `/controller_state` and receives failures immediately from
+`/rrt/status`.
+
+The low-level controller does not consume `/pose_cmd` directly. Runtime safety
+monitoring issues a zero-velocity joint hold if actual feedback enters an unsafe
+configuration. Direct joint commands can still take priority through the bridge;
+a later `/pose_cmd` re-arms planned trajectory forwarding.
 
 `run_orchestrator.sh` starts the controller from the `home_robotics` workspace.
 Set `ARENA_HOME_ROBOTICS_SETUP` if its `install/setup.bash` is not at the default
 location. Cartesian timeouts and TF frame names can be overridden with the
-`YOLO_VLM_CARTESIAN_*` environment variables defined in `src/config.py`.
+`YOLO_VLM_CARTESIAN_*` environment variables defined in `src/config.py`. RRT
+parameters such as planning time, edge resolution, and singularity thresholds
+are ROS parameters declared by `src/rrt_planner.py`.
 
 The VLM sees only six high-level tools:
 
@@ -62,17 +71,25 @@ initialize controller
   -> finish task
 ```
 
-Every successful localization writes only the session-relative rail coordinate:
+Every successful localization writes the object position in the rail-zero
+`global_origin` frame. `rail_j1 = 0` is the fixed global origin and the axes
+are rail-aligned (the robot base is rotated 180° about Z relative to them):
 
 ```json
 {
   "apple": {
-    "x": 1.234
+    "x": 1.234,
+    "y": -0.120,
+    "z": 0.045
   }
 }
 ```
 
-The coordinate is calculated as `current_absolute_rail_j1 - initial_rail_position`. Existing entries for other labels are preserved.
+`run_sim.sh` starts the reusable `rail_global` reference-frame node alongside
+the simulator. It consumes `/sim/rail_franka1/joint_states` and publishes
+`global_origin -> panda_link0`. It fails rather than publishing if another TF
+parent for `panda_link0` is detected. Existing entries for other labels are
+preserved.
 
 ## Runtime configuration
 

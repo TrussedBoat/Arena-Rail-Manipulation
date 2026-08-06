@@ -35,6 +35,9 @@ MAX_REACQUISITION_FRAMES = 2
 SEARCH_TELEMETRY_TIMEOUT_SEC = 10.0
 JOINT_MOTION_TIMEOUT_SEC = 50.0
 JOINT_POLL_INTERVAL_SEC = 0.05
+STARTUP_RAIL_POSITION_M = -1.1
+STARTUP_ARM_JOINTS = (0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854)
+STARTUP_GRIPPER_OPEN_COMMAND = 100.0
 _yolo_detector = None
 
 
@@ -469,12 +472,50 @@ def stop_vlm_server():
 # ── TOOL EXECUTION WRAPPERS ──
 
 def start_joint_controller() -> str:
-    """Agentic Tool: Initializes the global ROS 2 joint interface node."""
+    """Initialize ROS, move to the configured startup pose, and open the gripper."""
     try:
+        config = get_runtime_config()
         node = get_shared_node()
-        return "Success: Global joint controller / ROS 2 interface is active and ready to receive movement commands."
+        if not _wait_for_startup_pose_telemetry(node):
+            return "Error starting controller: timed out waiting for rail and arm joint telemetry."
+
+        _command_rail_and_wait(node, STARTUP_RAIL_POSITION_M, config)
+        node.send_panda_search_posture(*STARTUP_ARM_JOINTS)
+        for joint_index, target in enumerate(STARTUP_ARM_JOINTS, start=1):
+            joint_name = f"panda_joint{joint_index}"
+            if not wait_for_joint_target(
+                node,
+                joint_name,
+                target,
+                tolerance=config.search.wrist_joint_tolerance,
+                timeout=JOINT_MOTION_TIMEOUT_SEC,
+            ):
+                return (
+                    "Error starting controller: "
+                    f"{joint_name} did not reach startup target {target:.4f} rad."
+                )
+
+        node.open_gripper(STARTUP_GRIPPER_OPEN_COMMAND)
+        return (
+            "Success: controller is ready at startup pose "
+            f"(rail_j1={STARTUP_RAIL_POSITION_M:.1f}m) with gripper open."
+        )
     except Exception as e:
         return f"Error starting controller: {e}"
+
+
+def _wait_for_startup_pose_telemetry(node: object) -> bool:
+    """Require feedback for the rail and every arm joint before startup motion."""
+    required_joints = {"rail_j1", *(f"panda_joint{i}" for i in range(1, 8))}
+    deadline = time.monotonic() + SEARCH_TELEMETRY_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        positions = getattr(node, "current_joint_positions", {})
+        if required_joints.issubset(positions) and all(
+            math.isfinite(float(positions[joint])) for joint in required_joints
+        ):
+            return True
+        time.sleep(JOINT_POLL_INTERVAL_SEC)
+    return False
 
 
 def _failure_result(
@@ -506,7 +547,6 @@ def _wait_for_search_telemetry(node: object) -> bool:
     while time.monotonic() < deadline:
         if (
             getattr(node, "current_rail_position", None) is not None
-            and getattr(node, "initial_rail_position", None) is not None
             and getattr(node, "current_panda_joint1", None) is not None
         ):
             return True
@@ -749,7 +789,7 @@ def _extract_object_world_position(
 ) -> dict[str, object]:
     """
     Back-project the YOLO bounding-box centre through the wrist depth image
-    into the robot base frame, then add the rail offset to get world coords.
+    into the fixed, rail-aligned global_origin frame.
 
     Returns a dict with keys: x, y, z, depth_raw, pixel_uv.
     Raises RuntimeConfigurationError on bad depth or TF timeout.
@@ -794,34 +834,28 @@ def _extract_object_world_position(
     p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
     print(f"[POSITION] camera frame: ({x_cam:.3f}, {y_cam:.3f}, {z_cam:.3f})")
 
-    # ── 5. TF lookup: camera → robot base (panda_link0) ────────────────────
+    # ── 5. TF lookup: camera → rail-zero global frame ─────────────────────
     try:
-        T_base_cam = node.get_transform_matrix(
-            target_frame=config.search.camera_base_frame,
+        T_global_cam = node.get_transform_matrix(
+            target_frame=config.search.global_origin_frame,
             source_frame=config.search.camera_optical_frame,
             timeout_sec=3.0,
         )
     except TimeoutError as exc:
         raise RuntimeConfigurationError(f"TF lookup failed: {exc}") from exc
 
-    # ── 6. Transform to base frame ─────────────────────────────────────────
-    p_base = T_base_cam @ p_cam   # shape (4,)
-
-    # ── 7. Add rail offset to get world frame ──────────────────────────────
-    # panda_link0 travels purely along the world X axis with the rail.
-    rail_x = float(node.current_rail_position) if node.current_rail_position is not None else 0.0
-    world_x = p_base[0] + rail_x
-    world_y = p_base[1]
-    world_z = p_base[2]
+    # ── 6. Transform into the static rail-zero global frame ────────────────
+    p_global = T_global_cam @ p_cam
+    world_x, world_y, world_z = map(float, p_global[:3])
 
     print(
-        f"[POSITION] base frame: ({p_base[0]:.3f}, {p_base[1]:.3f}, {p_base[2]:.3f})  "
-        f"rail={rail_x:.3f}  world=({world_x:.3f}, {world_y:.3f}, {world_z:.3f})"
+        f"[POSITION] {config.search.global_origin_frame}: "
+        f"({world_x:.3f}, {world_y:.3f}, {world_z:.3f})"
     )
 
     if not all(math.isfinite(v) for v in (world_x, world_y, world_z)):
         raise RuntimeConfigurationError(
-            f"Computed world position contains non-finite values: ({world_x}, {world_y}, {world_z})"
+            f"Computed global position contains non-finite values: ({world_x}, {world_y}, {world_z})"
         )
 
     return {
@@ -925,18 +959,15 @@ def general_mapping(target_object: str) -> dict[str, object]:
         if not _wait_for_search_telemetry(node):
             return _failure_result(
                 target,
-                "Timed out waiting for rail, wrist, and session-origin telemetry.",
+                "Timed out waiting for rail and wrist telemetry.",
                 state="initialize",
             )
 
-        initial_rail_position = float(node.initial_rail_position)
         current_rail_position = float(node.current_rail_position)
-        if not math.isfinite(initial_rail_position) or not math.isfinite(
-            current_rail_position
-        ):
+        if not math.isfinite(current_rail_position):
             return _failure_result(
                 target,
-                "Rail telemetry or session origin is not finite.",
+                "Rail telemetry is not finite.",
                 state="initialize",
             )
         limits = [config.search.rail_min_position, config.search.rail_max_position]
@@ -944,7 +975,8 @@ def general_mapping(target_object: str) -> dict[str, object]:
 
         print(
             f"[SEARCH][INITIALIZE] target={target!r}, "
-            f"origin={initial_rail_position:.4f}m."
+            f"rail={current_rail_position:.4f}m, "
+            f"frame={config.search.global_origin_frame!r}."
         )
         angles_to_scan = [angle for angle in config.search.wrist_search_angles if abs(angle) > 0.1]
         if not angles_to_scan:
@@ -1050,7 +1082,7 @@ def general_mapping(target_object: str) -> dict[str, object]:
                 # Graceful deceleration: ramp velocity to zero over ~0.3s
                 _decelerate_to_halt(node)
 
-                # Extract 3-D world position from the depth frame
+                # Extract 3-D rail-zero global position from the depth frame
                 try:
                     position = _extract_object_world_position(node, detection["bbox"], config)
                 except RuntimeConfigurationError as pos_exc:
@@ -1281,7 +1313,7 @@ def targeted_search(target_object: str) -> dict[str, object]:
             )
 
         # Found: extract approx position and approach
-        print("[TARGETED][POSITION] Computing approximate world position...")
+        print("[TARGETED][POSITION] Computing approximate global position...")
         try:
             approx_pos = _extract_object_world_position(node, detection["bbox"], config)
         except RuntimeConfigurationError as pos_exc:
@@ -1514,7 +1546,7 @@ def move_rail_relative(relative_distance_m: float) -> str:
     return f"Success: Moved to {absolute_target:.4f}m." if success else "Warning: Timeout during move."
 
 def move_rail_to_object(target_object: str) -> str:
-    """Agentic Tool: Safely homes arm, calculates absolute world target, and moves rail."""
+    """Move the rail to a rail-zero global X coordinate."""
     try:
         config = get_runtime_config()
         distances: dict[str, dict[str, float]] = {}
@@ -1543,12 +1575,12 @@ def move_rail_to_object(target_object: str) -> str:
             
         node = get_shared_node()
         
-        # Wait for calibration
+        # rail_j1 itself is the rail-zero global X coordinate.
         start_wait = time.time()
-        while node.current_rail_position is None or node.initial_rail_position is None:
+        while node.current_rail_position is None:
             time.sleep(0.1)
             if time.time() - start_wait > 5.0:
-                return "Error: Hardware not calibrated. Missing initial_rail_position."
+                return "Error: Could not read rail_j1 telemetry."
 
         # 2. AUTO-SAFETY: Force arm to 0.0 before moving
         if (
@@ -1566,9 +1598,9 @@ def move_rail_to_object(target_object: str) -> str:
                 tolerance=config.search.wrist_joint_tolerance,
             )
             
-        # 3. Hardware Origin Math
-        # Absolute Target = Start Location (-1.09m) + Semantic Offset (2.31m)
-        absolute_target = node.initial_rail_position + target_offset_x
+        # 3. rail_j1 = 0 is the fixed global origin, so map X is already an
+        # absolute rail target rather than an offset from this process start.
+        absolute_target = target_offset_x
         relative_move = absolute_target - node.current_rail_position
         
         # 4. Actuate Rails

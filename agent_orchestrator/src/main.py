@@ -71,7 +71,7 @@ def main() -> int:
                         "EXECUTION RULES:\n"
                         "- You can call any other tools in the order you see fit (e.g., search, pick, navigate, place).\n"
                         "- Call exactly one tool per step.\n"
-                        "- Once move_eef_to_pose is used, Cartesian control exclusively owns the Panda arm; do not call direct arm-joint tools afterward. Rail tools remain available.\n"
+                        "- move_eef_to_pose uses RRT with self-collision, joint-limit, and singularity validation; stop if planning or execution fails.\n"
                         "- Stop immediately if any step fails."
                     )),
                     HumanMessage(content=f"task: {user_task}")

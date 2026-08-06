@@ -11,3 +11,7 @@ opencv-python
 openai
 pyzmq
 ultralytics
+mplib==0.2.1
+roboticstoolbox-python
+spatialmath-python
+scipy

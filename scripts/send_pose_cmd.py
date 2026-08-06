@@ -7,13 +7,14 @@ XYZ roll/pitch/yaw in radians, matching tools.move_eef_to_pose().
 """
 
 import argparse
+import json
 import math
 import time
 
 import rclpy
 from geometry_msgs.msg import Pose
 from rclpy.node import Node
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 
 def quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
@@ -35,8 +36,12 @@ class PoseCommand(Node):
         self.publisher = self.create_publisher(Pose, "/pose_cmd", 10)
         self.controller_ready = False
         self.command_complete = False
+        self.command_failure = None
+        self.rrt_ready_at = None
         self.create_subscription(Bool, "/controller_ready", self._ready_callback, 10)
         self.create_subscription(Bool, "/controller_state", self._state_callback, 10)
+        self.create_subscription(String, "/rrt/status", self._rrt_status_callback, 10)
+        self.create_subscription(Bool, "/rrt/ready", self._rrt_ready_callback, 10)
 
     def _ready_callback(self, message: Bool) -> None:
         self.controller_ready = message.data
@@ -44,6 +49,18 @@ class PoseCommand(Node):
     def _state_callback(self, message: Bool) -> None:
         if message.data:
             self.command_complete = True
+
+    def _rrt_status_callback(self, message: String) -> None:
+        try:
+            status = json.loads(message.data)
+        except (TypeError, ValueError):
+            return
+        if status.get("state") == "failure":
+            self.command_failure = str(status.get("message", "RRT planning failed"))
+
+    def _rrt_ready_callback(self, message: Bool) -> None:
+        if message.data:
+            self.rrt_ready_at = time.monotonic()
 
 
 def spin_until(node: PoseCommand, predicate, timeout_sec: float) -> bool:
@@ -77,11 +94,15 @@ def main() -> int:
     try:
         ready = spin_until(
             node,
-            lambda: node.controller_ready or node.publisher.get_subscription_count() > 0,
+            lambda: (
+                node.rrt_ready_at is not None
+                and time.monotonic() - node.rrt_ready_at <= 2.5
+                and node.publisher.get_subscription_count() > 0
+            ),
             args.ready_timeout,
         )
         if not ready:
-            node.get_logger().error("No Cartesian controller subscriber found on /pose_cmd")
+            node.get_logger().error("RRT planner is not healthy or subscribed to /pose_cmd")
             return 2
 
         quaternion = quaternion_from_rpy(args.roll, args.pitch, args.yaw)
@@ -89,6 +110,7 @@ def main() -> int:
         message.position.x, message.position.y, message.position.z = args.x, args.y, args.z
         message.orientation.x, message.orientation.y, message.orientation.z, message.orientation.w = quaternion
         node.command_complete = False
+        node.command_failure = None
         node.publisher.publish(message)
         node.get_logger().info(
             "Published /pose_cmd in panda_link0: "
@@ -97,9 +119,16 @@ def main() -> int:
         )
         if args.no_wait:
             return 0
-        if not spin_until(node, lambda: node.command_complete, args.completion_timeout):
+        if not spin_until(
+            node,
+            lambda: node.command_complete or node.command_failure is not None,
+            args.completion_timeout,
+        ):
             node.get_logger().error("Timed out waiting for /controller_state=true")
             return 3
+        if node.command_failure is not None:
+            node.get_logger().error(node.command_failure)
+            return 4
         node.get_logger().info("Controller reported command completion.")
         return 0
     finally:

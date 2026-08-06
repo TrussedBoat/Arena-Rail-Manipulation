@@ -30,4 +30,18 @@ else
 fi
 
 echo "[+] Starting Arena RealSim Simulation with: $ISAAC_PY"
-exec ./scripts/start_arena.sh rail "$ISAAC_PY"
+./scripts/start_arena.sh rail "$ISAAC_PY" &
+SIM_PID=$!
+
+cleanup() {
+    kill "$FRAME_PID" "$SIM_PID" 2>/dev/null || true
+    wait "$FRAME_PID" "$SIM_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+echo "[+] Starting rail-zero global TF publisher..."
+PYTHONPATH="$SCRIPT_DIR/agent_orchestrator/src${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 agent_orchestrator/src/rail_global.py &
+FRAME_PID=$!
+
+wait "$SIM_PID"

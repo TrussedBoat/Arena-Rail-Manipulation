@@ -27,7 +27,10 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "start_joint_controller",
-            "description": "Initialize the robot joint controller. Always call this first.",
+            "description": (
+                "Initialize the robot, move rail_j1 to -1.1m, set the arm to its "
+                "safe startup pose, and open the gripper. Always call this first."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -190,10 +193,10 @@ tool_definitions = [
         "function": {
             "name": "move_eef_to_pose",
             "description": (
-                "Move the Franka end effector to an absolute Cartesian pose relative to "
-                "panda_link0. XYZ values are metres and roll/pitch/yaw are radians. After "
-                "using this tool, the Cartesian controller exclusively owns Panda arm joints; "
-                "rail movement remains available."
+                "Plan and execute a self-collision-free RRT motion for the Franka end "
+                "effector to an absolute pose relative to panda_link0. XYZ values are "
+                "metres and roll/pitch/yaw are radians. The plan is rejected if it violates "
+                "joint limits or the configured singularity threshold."
             ),
             "parameters": {
                 "type": "object",

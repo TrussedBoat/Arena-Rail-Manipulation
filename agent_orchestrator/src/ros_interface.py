@@ -1,4 +1,5 @@
 import base64
+import json
 import math
 import threading
 import time
@@ -10,7 +11,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 from std_srvs.srv import Trigger
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float64, String
 import tf2_ros
 from geometry_msgs.msg import Pose
 from scipy.spatial.transform import Rotation
@@ -33,12 +34,19 @@ class RobotHardwareInterface(Node):
         self.depth_sub = self.create_subscription(Image, '/sim/rail_franka1/cam/wrist/depth/image_raw', self.depth_callback, 10)
         self.rail_subscriber = self.create_subscription(JointState, '/sim/rail_franka1/joint_states', self.rail_state_callback, 10)
         self.rail_publisher = self.create_publisher(JointState, '/joint_position_command', 10)
+        self.gripper_publisher = self.create_publisher(Float64, '/gripper_cmd', 10)
         self.pose_publisher = self.create_publisher(Pose, '/pose_cmd', 10)
         self.controller_state_sub = self.create_subscription(
             Bool, '/controller_state', self.controller_state_callback, 10
         )
         self.controller_ready_sub = self.create_subscription(
             Bool, '/controller_ready', self.controller_ready_callback, 10
+        )
+        self.rrt_status_sub = self.create_subscription(
+            String, '/rrt/status', self.rrt_status_callback, 10
+        )
+        self.rrt_ready_sub = self.create_subscription(
+            Bool, '/rrt/ready', self.rrt_ready_callback, 10
         )
 
         self.grasp_srv = self.create_service(Trigger, '/vlm_grasp_completed', self.grasp_callback)
@@ -53,10 +61,11 @@ class RobotHardwareInterface(Node):
         self.current_panda_joint1 = None
         self.current_panda_joint6 = None
         self.current_joint_positions = {}
-        self.initial_rail_position = None
         self.cartesian_controller_ready = False
         self.cartesian_control_active = False
         self._cartesian_completion = threading.Event()
+        self._cartesian_failure = None
+        self._rrt_ready_at = None
 
         # TF listener for camera→base transforms
         self.tf_buffer = tf2_ros.Buffer()
@@ -69,10 +78,27 @@ class RobotHardwareInterface(Node):
         if msg.data:
             self._cartesian_completion.set()
 
+    def rrt_status_callback(self, msg):
+        try:
+            status = json.loads(msg.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if status.get('state') == 'failure':
+            self._cartesian_failure = str(status.get('message', 'RRT planning failed'))
+            self._cartesian_completion.set()
+
+    def rrt_ready_callback(self, msg):
+        if msg.data:
+            self._rrt_ready_at = time.monotonic()
+
     def wait_for_cartesian_controller(self, timeout_sec: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline:
-            if self.cartesian_controller_ready or self.pose_publisher.get_subscription_count() > 0:
+            if (
+                self._rrt_ready_at is not None
+                and time.monotonic() - self._rrt_ready_at <= 2.5
+                and self.pose_publisher.get_subscription_count() > 0
+            ):
                 return True
             time.sleep(0.05)
         return False
@@ -95,7 +121,7 @@ class RobotHardwareInterface(Node):
         if not all(math.isfinite(float(value)) for value in values):
             raise ValueError("EEF pose values must all be finite numbers")
         if not self.wait_for_cartesian_controller(readiness_timeout_sec):
-            raise RuntimeError("No Cartesian controller subscriber is available on /pose_cmd")
+            raise RuntimeError("RRT planner is not healthy or subscribed to /pose_cmd")
 
         # The home_robotics controller interprets Pose relative to panda_link0.
         quaternion = Rotation.from_euler('xyz', [roll, pitch, yaw]).as_quat()
@@ -114,6 +140,7 @@ class RobotHardwareInterface(Node):
         )
 
         self._cartesian_completion.clear()
+        self._cartesian_failure = None
         self.cartesian_control_active = True
         self.pose_publisher.publish(msg)
         self.get_logger().info(
@@ -121,7 +148,10 @@ class RobotHardwareInterface(Node):
             f"xyz=({x:.4f}, {y:.4f}, {z:.4f}), "
             f"rpy=({roll:.4f}, {pitch:.4f}, {yaw:.4f})"
         )
-        return self._cartesian_completion.wait(timeout=max(0.0, timeout_sec))
+        completed = self._cartesian_completion.wait(timeout=max(0.0, timeout_sec))
+        if self._cartesian_failure is not None:
+            raise RuntimeError(self._cartesian_failure)
+        return completed
 
     def _ensure_direct_arm_control_allowed(self):
         if self.cartesian_control_active:
@@ -207,10 +237,6 @@ class RobotHardwareInterface(Node):
                 idx = msg.name.index('rail_j1')
                 self.current_rail_position = msg.position[idx]
                 
-                # Lock in the origin on first boot
-                if self.initial_rail_position is None:
-                    self.initial_rail_position = self.current_rail_position
-                    self.get_logger().info(f"[CALIBRATION] Set Laptop Origin to {self.initial_rail_position}m")
             except ValueError:
                 pass
                 
@@ -265,6 +291,12 @@ class RobotHardwareInterface(Node):
         msg.position = [float(j1), float(j2), float(j3), float(j4), float(j5), float(j6), float(j7)]
         self.rail_publisher.publish(msg)
         self.get_logger().info("Published JointState for full arm search posture.")
+
+    def open_gripper(self, opening_command: float = 100.0):
+        msg = Float64()
+        msg.data = float(opening_command)
+        self.gripper_publisher.publish(msg)
+        self.get_logger().info(f"Published gripper open command: {msg.data:.1f}")
 
     def send_panda_joint6_command(self, target_rad: float, speed: float = None):
         self._ensure_direct_arm_control_allowed()

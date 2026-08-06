@@ -1,0 +1,6 @@
+#for looiking left
+python3 scripts/send_pose_cmd.py 0.00 0.30 0.7 3.14 -1.56 1.56
+
+python3 scripts/view_wrist_camera.py --scale 0.6 # open (agent_env) for this
+
+ros2 topic echo /rrt/status for monitoring the RRT status
