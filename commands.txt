@@ -1,3 +1,6 @@
+agent_env enviroment activation:
+source ~/workspace//Arena-RealSim/agent_orchestrator/agent_env/bin/activate
+
 #for looiking left
 python3 scripts/send_pose_cmd.py 0.00 0.30 0.7 3.14 -1.56 1.56
 

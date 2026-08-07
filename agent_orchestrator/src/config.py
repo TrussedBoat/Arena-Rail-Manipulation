@@ -35,14 +35,26 @@ VLM_PARALLEL_SLOTS         = 1
 VLM_GPU_LAYERS             = 99
 VLM_FLASH_ATTENTION        = True
 VLM_MAX_COMPLETION_TOKENS  = 256
+VLM_REQUEST_TIMEOUT_SEC    = 120.0
+VLM_STARTUP_TIMEOUT_SEC    = 45.0
+VLM_HEALTH_TIMEOUT_SEC     = 2.0
 VLM_VRAM_BUDGET_GB         = 8.0
 VLM_TOTAL_GPU_VRAM_GB      = 16.0
+VLM_SERVER_EXTRA_ARGS      = ""
+
+# --- YOLO settings ---
+YOLO_CONFIDENCE_THRESHOLD  = 0.85
+YOLO_IMAGE_SIZE            = 640
+YOLO_DEVICE                = "cuda:0"
+YOLO_MAX_DETECTIONS        = 100
+YOLO_REQUIRED_CLASSES      = ("apple",)
 
 # --- Search / rail parameters ---
 SEARCH_RAIL_MIN             = -1.20  # metres
 SEARCH_RAIL_MAX             =  1.60   # metres
 SEARCH_RAIL_WAYPOINT_SPACING = 0.40  # metres between scan stops
-SEARCH_RAIL_SPEED           = 0.15
+# Override at runtime with YOLO_VLM_RAIL_SPEED (metres/second).
+SEARCH_RAIL_SPEED           = 0.25
 SEARCH_J6_SPEED             = 0.5
 SEARCH_J6_MIN               = 0.8
 SEARCH_J6_MAX               = 1.3
@@ -53,6 +65,47 @@ SEARCH_POSTURE_J3           = 1e-05
 SEARCH_POSTURE_J4           = -1.54
 SEARCH_POSTURE_J5           = 0.1
 SEARCH_POSTURE_J7           = 0.7854
+SEARCH_WRIST_ANGLES         = (-1.57, 0.0, 1.57)
+SEARCH_MOTION_SETTLING_SEC  = 0.50
+SEARCH_RAIL_TOLERANCE       = 0.02
+SEARCH_WRIST_TOLERANCE      = 0.05
+
+# --- Camera and reference frames ---
+CAMERA_BASE_FRAME           = "panda_link0"
+CAMERA_OPTICAL_FRAME        = "wrist_camera"
+GLOBAL_ORIGIN_FRAME         = "global_origin"
+CAMERA_FX                   = 907.00
+CAMERA_FY                   = 905.69
+CAMERA_CX                   = 567.74
+CAMERA_CY                   = 488.32
+DEPTH_PATCH_RADIUS          = 2
+
+# --- RRT targeted-search scan ---
+TARGETED_SCAN_VIEWPOINTS        = 7
+TARGETED_CAPTURE_FPS            = 0.3 #lower it if the wrist camera is not able to capture fast enough
+TARGETED_CANDIDATE_CONFIDENCE   = 0.30
+TARGETED_DESK_WIDTH             = 1.0
+TARGETED_ARC_RADIUS             = 0.50
+TARGETED_SCAN_HEIGHT            = 0.70
+TARGETED_SCAN_ROLL              = 3.14
+TARGETED_SCAN_PITCH             = -1.0
+TARGETED_CLOSE_STANDOFF         = 0.30
+TARGETED_CANCEL_TIMEOUT_SEC     = 3.0
+
+# --- Cartesian EEF settings ---
+CARTESIAN_COMMAND_TIMEOUT_SEC   = 30.0
+CARTESIAN_READY_TIMEOUT_SEC     = 5.0
+CARTESIAN_TF_TIMEOUT_SEC        = 3.0
+CARTESIAN_BASE_FRAME            = "panda_link0"
+CARTESIAN_EEF_FRAME             = "eef"
+
+# --- Runtime paths and behavior ---
+ROS_SETUP_SCRIPT               = Path("/opt/ros/humble/setup.bash")
+STATIC_COORDINATES_PATH        = PROJECT_ROOT / "semantic_distances.json"
+DYNAMIC_COORDINATES_PATH       = PROJECT_ROOT / "semantic_distances_dynamic.json"
+PICK_SCRIPT_RELATIVE_PATH      = Path("src/bringup/rail_demo_pick.sh")
+PLACE_SCRIPT_RELATIVE_PATH     = Path("src/bringup/rail_demo_place.sh")
+ALLOW_MOCK_HARDWARE_SCRIPTS    = True
 
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -128,6 +181,16 @@ class SearchConfig:
     camera_cx: float
     camera_cy: float
     depth_patch_radius: int  # px radius for median depth sampling
+    targeted_scan_viewpoints: int
+    targeted_capture_fps: float
+    targeted_candidate_confidence: float
+    targeted_desk_width: float
+    targeted_arc_radius: float
+    targeted_scan_height: float
+    targeted_scan_roll: float
+    targeted_scan_pitch: float
+    targeted_close_standoff: float
+    targeted_cancel_timeout_sec: float
 
 
 @dataclass(frozen=True)
@@ -270,20 +333,20 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
                 source, "YOLO_VLM_MAX_COMPLETION_TOKENS", VLM_MAX_COMPLETION_TOKENS
             ),
             request_timeout_sec=_env_float(
-                source, "YOLO_VLM_REQUEST_TIMEOUT_SEC", 120.0
+                source, "YOLO_VLM_REQUEST_TIMEOUT_SEC", VLM_REQUEST_TIMEOUT_SEC
             ),
             startup_timeout_sec=_env_float(
-                source, "YOLO_VLM_STARTUP_TIMEOUT_SEC", 45.0
+                source, "YOLO_VLM_STARTUP_TIMEOUT_SEC", VLM_STARTUP_TIMEOUT_SEC
             ),
             health_timeout_sec=_env_float(
-                source, "YOLO_VLM_HEALTH_TIMEOUT_SEC", 2.0
+                source, "YOLO_VLM_HEALTH_TIMEOUT_SEC", VLM_HEALTH_TIMEOUT_SEC
             ),
             vram_budget_gb=_env_float(source, "YOLO_VLM_VRAM_BUDGET_GB", VLM_VRAM_BUDGET_GB),
             total_gpu_vram_gb=_env_float(
                 source, "YOLO_VLM_TOTAL_GPU_VRAM_GB", VLM_TOTAL_GPU_VRAM_GB
             ),
             extra_server_args=tuple(
-                shlex.split(source.get("YOLO_VLM_SERVER_EXTRA_ARGS", ""))
+                shlex.split(source.get("YOLO_VLM_SERVER_EXTRA_ARGS", VLM_SERVER_EXTRA_ARGS))
             ),
         ),
         yolo=YOLOConfig(
@@ -295,13 +358,15 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
                 YOLO_CHECKPOINT_PATH or PROJECT_ROOT / "agent_orchestrator/models/placeholder.pt",
             ),
             confidence_threshold=_env_float(
-                source, "YOLO_VLM_YOLO_CONFIDENCE", 0.85
+                source, "YOLO_VLM_YOLO_CONFIDENCE", YOLO_CONFIDENCE_THRESHOLD
             ),
-            image_size=_env_int(source, "YOLO_VLM_YOLO_IMAGE_SIZE", 640),
-            device=_env_value(source, "YOLO_VLM_YOLO_DEVICE", "cuda:0"),
-            max_detections=_env_int(source, "YOLO_VLM_YOLO_MAX_DETECTIONS", 100),
+            image_size=_env_int(source, "YOLO_VLM_YOLO_IMAGE_SIZE", YOLO_IMAGE_SIZE),
+            device=_env_value(source, "YOLO_VLM_YOLO_DEVICE", YOLO_DEVICE),
+            max_detections=_env_int(
+                source, "YOLO_VLM_YOLO_MAX_DETECTIONS", YOLO_MAX_DETECTIONS
+            ),
             required_classes=_env_string_list(
-                source, "YOLO_VLM_YOLO_REQUIRED_CLASSES", ("apple",)
+                source, "YOLO_VLM_YOLO_REQUIRED_CLASSES", YOLO_REQUIRED_CLASSES
             ),
         ),
         search=SearchConfig(
@@ -320,60 +385,90 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             search_posture_j5=_env_float(source, "YOLO_VLM_SEARCH_POSTURE_J5", SEARCH_POSTURE_J5),
             search_posture_j7=_env_float(source, "YOLO_VLM_SEARCH_POSTURE_J7", SEARCH_POSTURE_J7),
             wrist_search_angles=_env_float_list(
-                source, "YOLO_VLM_WRIST_SEARCH_ANGLES", (-1.57, 0.0, 1.57)
+                source, "YOLO_VLM_WRIST_SEARCH_ANGLES", SEARCH_WRIST_ANGLES
             ),
             motion_settling_sec=_env_float(
-                source, "YOLO_VLM_MOTION_SETTLING_SEC", 0.50
+                source, "YOLO_VLM_MOTION_SETTLING_SEC", SEARCH_MOTION_SETTLING_SEC
             ),
             rail_joint_tolerance=_env_float(
-                source, "YOLO_VLM_RAIL_JOINT_TOLERANCE", 0.02
+                source, "YOLO_VLM_RAIL_JOINT_TOLERANCE", SEARCH_RAIL_TOLERANCE
             ),
             wrist_joint_tolerance=_env_float(
-                source, "YOLO_VLM_WRIST_JOINT_TOLERANCE", 0.05
+                source, "YOLO_VLM_WRIST_JOINT_TOLERANCE", SEARCH_WRIST_TOLERANCE
             ),
             # TF frame names published by Isaac Sim
-            camera_base_frame=_env_value(source, "YOLO_VLM_CAMERA_BASE_FRAME", "panda_link0"),
-            camera_optical_frame=_env_value(source, "YOLO_VLM_CAMERA_OPTICAL_FRAME", "wrist_camera"),
+            camera_base_frame=_env_value(source, "YOLO_VLM_CAMERA_BASE_FRAME", CAMERA_BASE_FRAME),
+            camera_optical_frame=_env_value(source, "YOLO_VLM_CAMERA_OPTICAL_FRAME", CAMERA_OPTICAL_FRAME),
             global_origin_frame=_env_value(
-                source, "YOLO_VLM_GLOBAL_ORIGIN_FRAME", "global_origin"
+                source, "YOLO_VLM_GLOBAL_ORIGIN_FRAME", GLOBAL_ORIGIN_FRAME
             ),
             # Wrist RealSense intrinsics (measured from the running simulation)
-            camera_fx=_env_float(source, "YOLO_VLM_CAMERA_FX", 907.00),
-            camera_fy=_env_float(source, "YOLO_VLM_CAMERA_FY", 905.69),
-            camera_cx=_env_float(source, "YOLO_VLM_CAMERA_CX", 567.74),
-            camera_cy=_env_float(source, "YOLO_VLM_CAMERA_CY", 488.32),
-            depth_patch_radius=int(_env_float(source, "YOLO_VLM_DEPTH_PATCH_RADIUS", 2)),
+            camera_fx=_env_float(source, "YOLO_VLM_CAMERA_FX", CAMERA_FX),
+            camera_fy=_env_float(source, "YOLO_VLM_CAMERA_FY", CAMERA_FY),
+            camera_cx=_env_float(source, "YOLO_VLM_CAMERA_CX", CAMERA_CX),
+            camera_cy=_env_float(source, "YOLO_VLM_CAMERA_CY", CAMERA_CY),
+            depth_patch_radius=int(_env_float(source, "YOLO_VLM_DEPTH_PATCH_RADIUS", DEPTH_PATCH_RADIUS)),
+            targeted_scan_viewpoints=_env_int(
+                source, "YOLO_VLM_TARGETED_SCAN_VIEWPOINTS", TARGETED_SCAN_VIEWPOINTS
+            ),
+            targeted_capture_fps=_env_float(
+                source, "YOLO_VLM_TARGETED_CAPTURE_FPS", TARGETED_CAPTURE_FPS
+            ),
+            targeted_candidate_confidence=_env_float(
+                source, "YOLO_VLM_TARGETED_CANDIDATE_CONFIDENCE", TARGETED_CANDIDATE_CONFIDENCE
+            ),
+            targeted_desk_width=_env_float(
+                source, "YOLO_VLM_TARGETED_DESK_WIDTH", TARGETED_DESK_WIDTH
+            ),
+            targeted_arc_radius=_env_float(
+                source, "YOLO_VLM_TARGETED_ARC_RADIUS", TARGETED_ARC_RADIUS
+            ),
+            targeted_scan_height=_env_float(
+                source, "YOLO_VLM_TARGETED_SCAN_HEIGHT", TARGETED_SCAN_HEIGHT
+            ),
+            targeted_scan_roll=_env_float(
+                source, "YOLO_VLM_TARGETED_SCAN_ROLL", TARGETED_SCAN_ROLL
+            ),
+            targeted_scan_pitch=_env_float(
+                source, "YOLO_VLM_TARGETED_SCAN_PITCH", TARGETED_SCAN_PITCH
+            ),
+            targeted_close_standoff=_env_float(
+                source, "YOLO_VLM_TARGETED_CLOSE_STANDOFF", TARGETED_CLOSE_STANDOFF
+            ),
+            targeted_cancel_timeout_sec=_env_float(
+                source, "YOLO_VLM_TARGETED_CANCEL_TIMEOUT_SEC", TARGETED_CANCEL_TIMEOUT_SEC
+            ),
         ),
         cartesian=CartesianConfig(
             command_timeout_sec=_env_float(
-                source, "YOLO_VLM_CARTESIAN_COMMAND_TIMEOUT_SEC", 30.0
+                source, "YOLO_VLM_CARTESIAN_COMMAND_TIMEOUT_SEC", CARTESIAN_COMMAND_TIMEOUT_SEC
             ),
             readiness_timeout_sec=_env_float(
-                source, "YOLO_VLM_CARTESIAN_READY_TIMEOUT_SEC", 5.0
+                source, "YOLO_VLM_CARTESIAN_READY_TIMEOUT_SEC", CARTESIAN_READY_TIMEOUT_SEC
             ),
             tf_timeout_sec=_env_float(
-                source, "YOLO_VLM_CARTESIAN_TF_TIMEOUT_SEC", 3.0
+                source, "YOLO_VLM_CARTESIAN_TF_TIMEOUT_SEC", CARTESIAN_TF_TIMEOUT_SEC
             ),
             base_frame=_env_value(
-                source, "YOLO_VLM_CARTESIAN_BASE_FRAME", "panda_link0"
+                source, "YOLO_VLM_CARTESIAN_BASE_FRAME", CARTESIAN_BASE_FRAME
             ),
             eef_frame=_env_value(
-                source, "YOLO_VLM_CARTESIAN_EEF_FRAME", "eef"
+                source, "YOLO_VLM_CARTESIAN_EEF_FRAME", CARTESIAN_EEF_FRAME
             ),
         ),
         paths=PathConfig(
             static_semantic_coordinates=_env_path(
                 source,
                 "YOLO_VLM_STATIC_COORDINATES_PATH",
-                PROJECT_ROOT / "semantic_distances.json",
+                STATIC_COORDINATES_PATH,
             ),
             dynamic_semantic_coordinates=_env_path(
                 source,
                 "YOLO_VLM_DYNAMIC_COORDINATES_PATH",
-                PROJECT_ROOT / "semantic_distances_dynamic.json",
+                DYNAMIC_COORDINATES_PATH,
             ),
             ros_setup_script=_env_path(
-                source, "YOLO_VLM_ROS_SETUP_SCRIPT", Path("/opt/ros/humble/setup.bash")
+                source, "YOLO_VLM_ROS_SETUP_SCRIPT", ROS_SETUP_SCRIPT
             ),
             controller_workspace=controller_root,
             controller_setup_script=_env_path(
@@ -384,16 +479,16 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             pick_script=_env_path(
                 source,
                 "YOLO_VLM_PICK_SCRIPT",
-                controller_root / "src/bringup/rail_demo_pick.sh",
+                controller_root / PICK_SCRIPT_RELATIVE_PATH,
             ),
             place_script=_env_path(
                 source,
                 "YOLO_VLM_PLACE_SCRIPT",
-                controller_root / "src/bringup/rail_demo_place.sh",
+                controller_root / PLACE_SCRIPT_RELATIVE_PATH,
             ),
         ),
         allow_mock_hardware_scripts=_env_bool(
-            source, "YOLO_VLM_ALLOW_MOCK_HARDWARE_SCRIPTS", True
+            source, "YOLO_VLM_ALLOW_MOCK_HARDWARE_SCRIPTS", ALLOW_MOCK_HARDWARE_SCRIPTS
         ),
     )
 
@@ -653,6 +748,10 @@ def validate_runtime_config(
             "rail waypoint spacing must be positive and no greater than the rail range, got "
             f"{config.search.rail_waypoint_spacing}"
         )
+    if not math.isfinite(config.search.rail_speed) or config.search.rail_speed <= 0:
+        errors.append(
+            f"rail speed must be finite and positive, got {config.search.rail_speed}"
+        )
     for angle in config.search.wrist_search_angles:
         if not -math.pi <= angle <= math.pi:
             errors.append(f"wrist angle must be within [-pi, pi] radians, got {angle}")
@@ -668,6 +767,30 @@ def validate_runtime_config(
         errors.append(
             f"wrist joint tolerance must be positive, got {config.search.wrist_joint_tolerance}"
         )
+    if config.search.targeted_scan_viewpoints < 2:
+        errors.append("targeted scan viewpoints must be at least 2")
+    for label, value in (
+        ("targeted capture FPS", config.search.targeted_capture_fps),
+        ("targeted desk width", config.search.targeted_desk_width),
+        ("targeted arc radius", config.search.targeted_arc_radius),
+        ("targeted scan height", config.search.targeted_scan_height),
+        ("targeted close stand-off", config.search.targeted_close_standoff),
+        ("targeted cancel timeout", config.search.targeted_cancel_timeout_sec),
+    ):
+        if not math.isfinite(value) or value <= 0:
+            errors.append(f"{label} must be finite and positive, got {value}")
+    if not 0 < config.search.targeted_candidate_confidence < config.yolo.confidence_threshold:
+        errors.append(
+            "targeted candidate confidence must be between 0 and the final YOLO "
+            f"threshold ({config.yolo.confidence_threshold}), got "
+            f"{config.search.targeted_candidate_confidence}"
+        )
+    for label, angle in (
+        ("targeted scan roll", config.search.targeted_scan_roll),
+        ("targeted scan pitch", config.search.targeted_scan_pitch),
+    ):
+        if not math.isfinite(angle) or not -math.pi <= angle <= math.pi:
+            errors.append(f"{label} must be within [-pi, pi], got {angle}")
     for frame_name, frame_value in (
         ("camera base frame", config.search.camera_base_frame),
         ("camera optical frame", config.search.camera_optical_frame),

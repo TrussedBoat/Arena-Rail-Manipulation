@@ -44,10 +44,10 @@ tool_definitions = [
         "function": {
             "name": "targeted_search",
             "description": (
-                "Human-like targeted search: pans the wrist camera right then left to find "
-                "a specific object on the tables. Use this as the primary search tool when "
-                "looking for an object. If the object is not found from the current position, "
-                "the robot moves to the table centre and tries once more. "
+                "RRT wrist-camera search over both desk rows. It runs YOLO during inward "
+                "arc motions, safely stops on a candidate, depth-localizes it, and saves "
+                "coordinates only after a high-confidence closer look. If both sides fail "
+                "from the current rail position, it retries at rail centre. "
                 "Pass one normalized canonical label such as 'apple'."
             ),
             "parameters": {
@@ -311,7 +311,7 @@ def _validate_tool_for_stage(
             return "finish_task requires a non-empty summary."
 
     target = _normalized_argument(arguments, "target_object")
-    if tool_name == "search_and_locate_with_yolo" and not target:
+    if tool_name in ("targeted_search", "general_mapping") and not target:
         return "Search requires a non-empty canonical pickup target."
 
     return None
@@ -319,7 +319,7 @@ def _validate_tool_for_stage(
 
 def _tool_result_succeeded(tool_name: str, result: object) -> bool:
     if isinstance(result, dict):
-        if tool_name == "search_and_locate_with_yolo":
+        if tool_name in ("targeted_search", "general_mapping"):
             return result.get("status") == "success" and result.get("success") is True
         if "success" in result:
             return result.get("success") is True

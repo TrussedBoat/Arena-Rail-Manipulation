@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """RRT motion-planning gateway for Panda end-effector pose commands.
 
-The node owns /pose_cmd, plans a self-collision-free joint trajectory with
+The node owns /rrt/pose_command, plans a self-collision-free joint trajectory with
 MPlib, rejects joint-limit and singular configurations, and publishes the
-validated trajectory to /joint_trajectory_cmd.  During execution it monitors
+validated trajectory to /rrt/joint_trajectory.  During execution it monitors
 actual joint feedback and issues a direct hold command if a safety condition
 is violated.
 """
@@ -29,7 +29,7 @@ from rclpy.node import Node
 import roboticstoolbox as rtb
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Empty, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
@@ -88,13 +88,18 @@ class RRTPlannerNode(Node):
                 "homerobotics_ws/src/motion_planners/data/panda",
             )
         )
-        self.declare_parameter("pose_cmd_topic", "/pose_cmd")
+        self.declare_parameter("pose_cmd_topic", "/rrt/pose_command")
         self.declare_parameter("joint_states_topic", "/joint_states")
-        self.declare_parameter("trajectory_topic", "/joint_trajectory_cmd")
-        self.declare_parameter("controller_state_topic", "/controller_state")
+        self.declare_parameter("trajectory_topic", "/rrt/joint_trajectory")
+        self.declare_parameter("controller_state_topic", "/panda/controller_state")
         self.declare_parameter("status_topic", "/rrt/status")
         self.declare_parameter("ready_topic", "/rrt/ready")
-        self.declare_parameter("hold_topic", "/joint_position_command")
+        # Keep RRT safety holds separate from the orchestrator's direct-joint
+        # command channel.  The bridge still relays this topic to Isaac Sim,
+        # but its distinct name prevents a safety hold from looking like a
+        # normal VLM joint command to diagnostics and ROS tooling.
+        self.declare_parameter("hold_topic", "/rrt/hold_command")
+        self.declare_parameter("cancel_topic", "/rrt/cancel")
         self.declare_parameter("model_root", str(default_model_root))
         self.declare_parameter("move_group", "eef")
         self.declare_parameter("planning_time_sec", 5.0)
@@ -107,6 +112,7 @@ class RRTPlannerNode(Node):
         self.declare_parameter("singularity_stop", 0.05)
         self.declare_parameter("goal_position_tolerance_m", 0.005)
         self.declare_parameter("goal_orientation_tolerance_rad", 0.01)
+        self.declare_parameter("eef_min_z_m", 0.15)
 
         self.planning_time_sec = float(self.get_parameter("planning_time_sec").value)
         self.planning_attempts = int(self.get_parameter("planning_attempts").value)
@@ -124,6 +130,7 @@ class RRTPlannerNode(Node):
         self.goal_orientation_tolerance_rad = float(
             self.get_parameter("goal_orientation_tolerance_rad").value
         )
+        self.eef_min_z_m = float(self.get_parameter("eef_min_z_m").value)
         self._validate_parameters()
 
         model_root = Path(str(self.get_parameter("model_root").value)).expanduser()
@@ -180,14 +187,20 @@ class RRTPlannerNode(Node):
             self._controller_state_callback,
             10,
         )
+        self.create_subscription(
+            Empty,
+            str(self.get_parameter("cancel_topic").value),
+            self._cancel_callback,
+            10,
+        )
         self.ready_timer = self.create_timer(
             1.0, lambda: self.ready_pub.publish(Bool(data=True))
         )
         self.ready_pub.publish(Bool(data=True))
 
         self.get_logger().info(
-            "RRT planner ready: /pose_cmd -> self-collision/singularity validation "
-            "-> /joint_trajectory_cmd"
+            "RRT planner ready: /rrt/pose_command -> self-collision/singularity validation "
+            "-> /rrt/joint_trajectory"
         )
 
     def _validate_parameters(self) -> None:
@@ -206,6 +219,8 @@ class RRTPlannerNode(Node):
             raise ValueError("planning_attempts must be at least one")
         if not 0 < self.singularity_stop < self.singularity_warn:
             raise ValueError("Require 0 < singularity_stop < singularity_warn")
+        if not math.isfinite(self.eef_min_z_m) or self.eef_min_z_m < 0.0:
+            raise ValueError("eef_min_z_m must be a finite non-negative height")
 
     @staticmethod
     def _copy_model(source: Path, destination: Path) -> None:
@@ -262,6 +277,22 @@ class RRTPlannerNode(Node):
             self.active_trajectory = None
             self._publish_status("success", "RRT trajectory completed")
 
+    def _cancel_callback(self, _message: Empty) -> None:
+        if not self.executing:
+            self._publish_status("cancelled", "No active RRT trajectory to cancel")
+            return
+        q = self._current_arm_q(raise_if_missing=False)
+        if q is None:
+            self._publish_status(
+                "failure", "Cannot cancel RRT trajectory without current joint telemetry"
+            )
+            return
+        self._publish_hold(q)
+        self.executing = False
+        self.active_trajectory = None
+        self.safety_stop_sent = False
+        self._publish_status("cancelled", "RRT trajectory cancelled with joint hold")
+
     def _current_arm_q(self, *, raise_if_missing: bool = True) -> np.ndarray | None:
         missing = [name for name in PANDA_JOINT_NAMES if name not in self.current_positions]
         if missing:
@@ -281,6 +312,13 @@ class RRTPlannerNode(Node):
             if self.executing:
                 self._publish_status("failure", "Planner is busy executing another trajectory")
                 return
+            if not _finite_pose(pose):
+                raise PlanningError("Target pose contains a non-finite value")
+            if pose.position.z < self.eef_min_z_m:
+                raise PlanningError(
+                    f"Target EEF z={pose.position.z:.4f}m is below the table safety "
+                    f"floor of {self.eef_min_z_m:.4f}m"
+                )
             self._publish_status("planning", "Planning collision-free RRT trajectory")
             if self._target_already_reached(pose):
                 self._publish_status("success", "EEF target is already reached")
@@ -313,12 +351,7 @@ class RRTPlannerNode(Node):
         q = self._current_arm_q(raise_if_missing=False)
         if q is None:
             return False
-        # Robotics Toolbox ends at its 0.1034 m tool frame while the planning
-        # URDF defines EEF at 0.125 m, leaving a 0.0216 m local-Z offset.
-        current = np.asarray(self.robot.fkine(q).A, dtype=float)
-        current[:3, 3] += (
-            current[:3, 2] * PANDA_RTB_TO_URDF_EEF_OFFSET_M
-        )
+        current = self._eef_transform(q)
 
         target_position = np.array(
             [pose.position.x, pose.position.y, pose.position.z], dtype=float
@@ -344,6 +377,11 @@ class RRTPlannerNode(Node):
     def _plan(self, pose: Pose) -> JointTrajectory:
         if not _finite_pose(pose):
             raise PlanningError("Target pose contains a non-finite value")
+        if pose.position.z < self.eef_min_z_m:
+            raise PlanningError(
+                f"Target EEF z={pose.position.z:.4f}m is below the table safety "
+                f"floor of {self.eef_min_z_m:.4f}m"
+            )
         quaternion = _normalised_wxyz(pose)
         start_q = self._current_full_q()
         start_error = self._configuration_error(start_q[:7])
@@ -412,6 +450,13 @@ class RRTPlannerNode(Node):
         collisions = self.planner.check_for_self_collision(q)
         if collisions:
             return f"self-collision detected ({collisions[0]})"
+        eef_z = float(self._eef_transform(q)[2, 3])
+        if eef_z < self.eef_min_z_m:
+            scope = "runtime" if runtime else "planned"
+            return (
+                f"{scope} EEF z={eef_z:.4f}m is below the table safety floor "
+                f"of {self.eef_min_z_m:.4f}m"
+            )
         sigma = self._sigma_min(q)
         if sigma <= self.singularity_stop:
             scope = "runtime" if runtime else "planned"
@@ -420,6 +465,14 @@ class RRTPlannerNode(Node):
                 f"<= {self.singularity_stop:.5f}"
             )
         return None
+
+    def _eef_transform(self, q: np.ndarray) -> np.ndarray:
+        """Return the planner EEF transform in panda_link0 coordinates."""
+        transform = np.asarray(self.robot.fkine(q).A, dtype=float)
+        # Robotics Toolbox ends at its 0.1034m tool frame while the planning
+        # URDF defines EEF at 0.125m, leaving a 0.0216m local-Z offset.
+        transform[:3, 3] += transform[:3, 2] * PANDA_RTB_TO_URDF_EEF_OFFSET_M
+        return transform
 
     def _sigma_min(self, q: np.ndarray) -> float:
         jacobian = np.asarray(self.robot.jacob0(q), dtype=float)
@@ -467,16 +520,19 @@ class RRTPlannerNode(Node):
         return trajectory
 
     def _stop_with_hold(self, q: np.ndarray, reason: str) -> None:
+        self._publish_hold(q)
+        self.safety_stop_sent = True
+        self.executing = False
+        self.active_trajectory = None
+        self._publish_status("failure", f"Runtime safety stop: {reason}")
+
+    def _publish_hold(self, q: np.ndarray) -> None:
         hold = JointState()
         hold.header.stamp = self.get_clock().now().to_msg()
         hold.name = PANDA_JOINT_NAMES
         hold.position = np.asarray(q, dtype=float).tolist()
         hold.velocity = [0.0] * 7
         self.hold_pub.publish(hold)
-        self.safety_stop_sent = True
-        self.executing = False
-        self.active_trajectory = None
-        self._publish_status("failure", f"Runtime safety stop: {reason}")
 
     def destroy_node(self):
         try:

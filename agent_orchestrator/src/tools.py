@@ -28,12 +28,14 @@ from ros_interface import (
     wait_for_joint_target,
     wait_for_place,
 )
+from targeted_scan_geometry import close_view_pose, generate_desk_arc, rail_centre
 
 
 VLM_WARMUP_LATENCY_LIMIT_SEC = 5.0
 MAX_REACQUISITION_FRAMES = 2
 SEARCH_TELEMETRY_TIMEOUT_SEC = 10.0
 JOINT_MOTION_TIMEOUT_SEC = 50.0
+HOME_MOTION_TIMEOUT_SEC = 120.0
 JOINT_POLL_INTERVAL_SEC = 0.05
 STARTUP_RAIL_POSITION_M = -1.1
 STARTUP_ARM_JOINTS = (0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854)
@@ -479,21 +481,10 @@ def start_joint_controller() -> str:
         if not _wait_for_startup_pose_telemetry(node):
             return "Error starting controller: timed out waiting for rail and arm joint telemetry."
 
-        _command_rail_and_wait(node, STARTUP_RAIL_POSITION_M, config)
-        node.send_panda_search_posture(*STARTUP_ARM_JOINTS)
-        for joint_index, target in enumerate(STARTUP_ARM_JOINTS, start=1):
-            joint_name = f"panda_joint{joint_index}"
-            if not wait_for_joint_target(
-                node,
-                joint_name,
-                target,
-                tolerance=config.search.wrist_joint_tolerance,
-                timeout=JOINT_MOTION_TIMEOUT_SEC,
-            ):
-                return (
-                    "Error starting controller: "
-                    f"{joint_name} did not reach startup target {target:.4f} rad."
-                )
+        _command_rail_and_wait(
+            node, STARTUP_RAIL_POSITION_M, config, timeout_sec=HOME_MOTION_TIMEOUT_SEC
+        )
+        _command_default_standing_posture_and_wait(node, config)
 
         node.open_gripper(STARTUP_GRIPPER_OPEN_COMMAND)
         return (
@@ -595,19 +586,34 @@ def _build_rail_search_waypoints(
     ]
 
 
-def _command_rail_and_wait(node: object, target: float, config: RuntimeConfig) -> None:
+def _command_rail_and_wait(
+    node: object,
+    target: float,
+    config: RuntimeConfig,
+    *,
+    timeout_sec: float = JOINT_MOTION_TIMEOUT_SEC,
+) -> None:
     if not config.search.rail_min_position <= target <= config.search.rail_max_position:
         raise RuntimeConfigurationError(
             f"Refusing rail target {target:.4f}m outside configured bounds"
         )
     starting_position = getattr(node, "current_rail_position", None)
-    node.send_absolute_rail_command(float(target))
+    current_position = (
+        float(starting_position) if starting_position is not None else target
+    )
+    direction = (
+        1.0 if target > current_position else -1.0 if target < current_position else 0.0
+    )
+    node.send_absolute_rail_command(
+        float(target), speed=config.search.rail_speed * direction
+    )
     if not _wait_for_commanded_joint(
         node,
         "rail_j1",
         target,
         config.search.rail_joint_tolerance,
         starting_position=starting_position,
+        timeout_sec=timeout_sec,
     ):
         raise RuntimeConfigurationError(
             f"rail_j1 did not converge to {target:.4f}m before timeout"
@@ -629,6 +635,39 @@ def _command_wrist_and_wait(node: object, target: float, config: RuntimeConfig) 
         )
 
 
+def _command_default_standing_posture_and_wait(
+    node: object, config: RuntimeConfig
+) -> None:
+    """Move the arm to the configured default standing posture and confirm it."""
+    send_posture = getattr(node, "send_panda_search_posture", None)
+    if not callable(send_posture):
+        raise RuntimeConfigurationError(
+            "Robot interface does not support full-arm default-posture commands"
+        )
+
+    send_posture(*STARTUP_ARM_JOINTS)
+    for joint_index, target in enumerate(STARTUP_ARM_JOINTS, start=1):
+        joint_name = f"panda_joint{joint_index}"
+        if not wait_for_joint_target(
+            node,
+            joint_name,
+            target,
+            tolerance=config.search.wrist_joint_tolerance,
+            timeout=HOME_MOTION_TIMEOUT_SEC,
+        ):
+            raise RuntimeConfigurationError(
+                f"{joint_name} did not reach default standing target {target:.4f}rad"
+            )
+
+
+def _return_targeted_search_to_home(node: object, config: RuntimeConfig) -> None:
+    """Put the arm in its default posture before returning the rail home."""
+    _command_default_standing_posture_and_wait(node, config)
+    _command_rail_and_wait(
+        node, STARTUP_RAIL_POSITION_M, config, timeout_sec=HOME_MOTION_TIMEOUT_SEC
+    )
+
+
 def _wait_for_commanded_joint(
     node: object,
     joint_name: str,
@@ -636,6 +675,7 @@ def _wait_for_commanded_joint(
     tolerance: float,
     *,
     starting_position: object,
+    timeout_sec: float = JOINT_MOTION_TIMEOUT_SEC,
 ) -> bool:
     """Wait for target convergence and observable progress on small commands."""
     attribute_name = (
@@ -650,7 +690,7 @@ def _wait_for_commanded_joint(
         abs(target - start_value) if start_value is not None else 0.0
     )
     required_progress = commanded_distance / 2.0
-    deadline = time.monotonic() + JOINT_MOTION_TIMEOUT_SEC
+    deadline = time.monotonic() + timeout_sec
 
     while time.monotonic() < deadline:
         value = getattr(node, attribute_name, None)
@@ -662,7 +702,12 @@ def _wait_for_commanded_joint(
                 or commanded_distance <= 1e-12
                 or abs(current - start_value) >= required_progress
             )
-            if at_target and made_progress:
+            # A command may be issued while the joint is already within the
+            # requested tolerance (for example startup rail_j1=-1.1011m for
+            # a -1.1000m target).  In that case the simulator may correctly
+            # hold still, so requiring observable movement would turn a
+            # successful command into a timeout.
+            if at_target and (commanded_distance <= tolerance or made_progress):
                 return True
         time.sleep(JOINT_POLL_INTERVAL_SEC)
     return False
@@ -1226,7 +1271,7 @@ def _targeted_j1_pan_scan(
     return None
 
 
-def targeted_search(target_object: str) -> dict[str, object]:
+def _legacy_targeted_search(target_object: str) -> dict[str, object]:
     """
     Targeted search tool: human-like right/left J1 pan sweep to locate an object.
 
@@ -1428,6 +1473,292 @@ def targeted_search(target_object: str) -> dict[str, object]:
         )
 
 
+def _scan_pose_with_yolo(
+    node: object,
+    target: str,
+    pose: object,
+    config: RuntimeConfig,
+) -> tuple[dict[str, object] | None, int]:
+    """Run one RRT arc segment while sampling YOLO at configured FPS."""
+    period = 1.0 / config.search.targeted_capture_fps
+    node.begin_eef_pose(
+        pose.x,
+        pose.y,
+        pose.z,
+        pose.roll,
+        pose.pitch,
+        pose.yaw,
+        readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+        tf_timeout_sec=config.cartesian.tf_timeout_sec,
+        base_frame=config.cartesian.base_frame,
+        eef_frame=config.cartesian.eef_frame,
+    )
+    observations = 0
+    next_capture = time.monotonic()
+    first_observation = True
+    while first_observation or not node.eef_motion_done():
+        first_observation = False
+        now = time.monotonic()
+        if now < next_capture:
+            time.sleep(min(next_capture - now, 0.01))
+            continue
+
+        started = time.monotonic()
+        node.latest_b64_image = None
+        try:
+            detection = detect_target_in_latest_frame(target, timeout_sec=period)
+        except Exception as exc:
+            cancelled = node.cancel_eef_motion(
+                config.search.targeted_cancel_timeout_sec
+            )
+            suffix = "" if cancelled else "; RRT cancellation also timed out"
+            raise RuntimeConfigurationError(
+                f"Targeted frame delivery/inference failed: {exc}{suffix}"
+            ) from exc
+        observations += 1
+        elapsed = time.monotonic() - started
+        if elapsed > period:
+            cancelled = node.cancel_eef_motion(
+                config.search.targeted_cancel_timeout_sec
+            )
+            if not cancelled:
+                raise RuntimeConfigurationError(
+                    "YOLO deadline was missed and RRT cancellation timed out"
+                )
+            raise RuntimeConfigurationError(
+                f"YOLO delivery deadline missed: {elapsed:.3f}s > {period:.3f}s "
+                f"({config.search.targeted_capture_fps:g} FPS)"
+            )
+
+        confidence = detection.get("confidence")
+        if (
+            detection.get("status") != "not_found"
+            and confidence is not None
+            and float(confidence) >= config.search.targeted_candidate_confidence
+        ):
+            if not node.cancel_eef_motion(config.search.targeted_cancel_timeout_sec):
+                raise RuntimeConfigurationError("Timed out cancelling RRT after detection")
+            time.sleep(config.search.motion_settling_sec)
+            return detection, observations
+
+        next_capture += period
+        if time.monotonic() > next_capture:
+            cancelled = node.cancel_eef_motion(
+                config.search.targeted_cancel_timeout_sec
+            )
+            if not cancelled:
+                raise RuntimeConfigurationError(
+                    "Targeted schedule slipped and RRT cancellation timed out"
+                )
+            raise RuntimeConfigurationError(
+                f"Targeted capture schedule missed "
+                f"{config.search.targeted_capture_fps:g} FPS"
+            )
+
+    if not node.wait_for_eef_motion(0.0):
+        raise RuntimeConfigurationError("RRT scan pose did not complete successfully")
+    return None, observations
+
+
+def _scan_both_desk_sides(
+    node: object,
+    target: str,
+    config: RuntimeConfig,
+) -> tuple[dict[str, object] | None, int | None, int]:
+    observations = 0
+    current_rail = float(node.current_rail_position)
+    for side, label in ((1, "left"), (-1, "right")):
+        poses = generate_desk_arc(
+            current_rail=current_rail,
+            rail_min=config.search.rail_min_position,
+            rail_max=config.search.rail_max_position,
+            side=side,
+            desk_width=config.search.targeted_desk_width,
+            radius=config.search.targeted_arc_radius,
+            height=config.search.targeted_scan_height,
+            roll=config.search.targeted_scan_roll,
+            pitch=config.search.targeted_scan_pitch,
+            viewpoints=config.search.targeted_scan_viewpoints,
+        )
+        print(
+            f"[TARGETED][{label.upper()}] Scanning {len(poses)} RRT viewpoints "
+            f"at {config.search.targeted_capture_fps:g} FPS."
+        )
+        for index, pose in enumerate(poses, start=1):
+            print(
+                f"[TARGETED][{label.upper()}] viewpoint {index}/{len(poses)}: "
+                f"xyz=({pose.x:.3f},{pose.y:.3f},{pose.z:.3f}), "
+                f"yaw={pose.yaw:.3f}."
+            )
+            detection, count = _scan_pose_with_yolo(node, target, pose, config)
+            observations += count
+            if detection is not None:
+                return detection, side, observations
+    return None, None, observations
+
+
+def targeted_search(target_object: str) -> dict[str, object]:
+    """Search both desk rows with RRT wrist arcs and confirm candidates up close."""
+    target = _normalize_label(target_object or "")
+    if not target:
+        return _failure_result(
+            target, "A non-empty target label is required.", state="initialize"
+        )
+
+    observations = 0
+    try:
+        config = get_runtime_config()
+        detector = _get_yolo_detector(config)
+        if not detector.supports_label(target):
+            return _failure_result(
+                target,
+                f"Configured YOLO checkpoint does not provide target class {target!r}.",
+                state="initialize",
+            )
+        node = get_shared_node()
+        if not _wait_for_search_telemetry(node):
+            return _failure_result(
+                target,
+                "Timed out waiting for rail and arm telemetry.",
+                state="initialize",
+            )
+
+        centre = rail_centre(
+            config.search.rail_min_position, config.search.rail_max_position
+        )
+        stations = [float(node.current_rail_position)]
+        if not math.isclose(
+            stations[0], centre, abs_tol=config.search.rail_joint_tolerance
+        ):
+            stations.append(centre)
+
+        candidate = None
+        candidate_side = None
+        for station_index, station in enumerate(stations):
+            if station_index > 0:
+                print("[TARGETED][POSTURE] Returning arm to default standing posture.")
+                _command_default_standing_posture_and_wait(node, config)
+                print(f"[TARGETED][CENTRE] Moving rail to {station:.3f}m for retry.")
+                _command_rail_and_wait(node, station, config)
+            candidate, candidate_side, count = _scan_both_desk_sides(
+                node, target, config
+            )
+            observations += count
+            if candidate is not None:
+                break
+
+        if candidate is None or candidate_side is None:
+            print("[TARGETED][HOME] No candidate found; returning to home posture.")
+            try:
+                _return_targeted_search_to_home(node, config)
+            except RuntimeConfigurationError as recovery_exc:
+                return _failure_result(
+                    target,
+                    "Couldn't find target after scanning both desk sides and rail centre; "
+                    f"home recovery failed: {recovery_exc}",
+                    state="home_recovery",
+                    observations=observations,
+                )
+            return _failure_result(
+                target,
+                "Couldn't find target after scanning both desk sides and rail centre.",
+                state="couldnt_find",
+                observations=observations,
+            )
+
+        print("[TARGETED][CANDIDATE] RRT held; extracting global 3-D position.")
+        approximate = _extract_object_world_position(node, candidate["bbox"], config)
+        approach_x = max(
+            config.search.rail_min_position,
+            min(config.search.rail_max_position, float(approximate["x"])),
+        )
+        _command_rail_and_wait(node, approach_x, config)
+
+        close_pose = close_view_pose(
+            side=candidate_side,
+            standoff=config.search.targeted_close_standoff,
+            height=config.search.targeted_scan_height,
+            roll=config.search.targeted_scan_roll,
+            pitch=config.search.targeted_scan_pitch,
+        )
+        if not node.send_eef_pose(
+            close_pose.x,
+            close_pose.y,
+            close_pose.z,
+            close_pose.roll,
+            close_pose.pitch,
+            close_pose.yaw,
+            timeout_sec=config.cartesian.command_timeout_sec,
+            readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+            tf_timeout_sec=config.cartesian.tf_timeout_sec,
+            base_frame=config.cartesian.base_frame,
+            eef_frame=config.cartesian.eef_frame,
+        ):
+            return _failure_result(
+                target,
+                "Closer-look RRT pose did not complete.",
+                state="close_approach",
+                detection=candidate,
+                observations=observations,
+            )
+
+        time.sleep(config.search.motion_settling_sec)
+        node.latest_b64_image = None
+        final_detection = detect_target_in_latest_frame(
+            target, timeout_sec=1.0 / config.search.targeted_capture_fps
+        )
+        observations += 1
+        final_confidence = final_detection.get("confidence")
+        if (
+            final_detection.get("status") == "not_found"
+            or final_confidence is None
+            or float(final_confidence) <= config.yolo.confidence_threshold
+        ):
+            return _failure_result(
+                target,
+                "Candidate failed the closer-look confidence confirmation.",
+                state="close_confirmation",
+                detection=final_detection,
+                observations=observations,
+            )
+
+        final_position = _extract_object_world_position(
+            node, final_detection["bbox"], config
+        )
+        _persist_dynamic_coordinate_3d(
+            config.paths.dynamic_semantic_coordinates,
+            target,
+            final_position["x"],
+            final_position["y"],
+            final_position["z"],
+        )
+        return {
+            "status": "success",
+            "success": True,
+            "state": "save_and_succeed",
+            "reason": None,
+            "target": target,
+            "confidence": final_detection["confidence"],
+            "bbox": final_detection["bbox"],
+            "center": final_detection.get("center"),
+            "x": final_position["x"],
+            "y": final_position["y"],
+            "z": final_position["z"],
+            "depth_m": final_position["depth_raw"],
+            "pixel_uv": final_position["pixel_uv"],
+            "rail_position": float(node.current_rail_position),
+            "observations": observations,
+            "coordinate_path": str(config.paths.dynamic_semantic_coordinates),
+        }
+    except Exception as exc:
+        return _failure_result(
+            target,
+            f"Targeted search aborted safely: {exc}",
+            state="failure",
+            observations=observations,
+        )
+
+
 def get_latest_ros_image(timeout_sec=10.0) -> str:
     node = get_shared_node()
     start = time.time()
@@ -1489,7 +1820,7 @@ def move_eef_to_pose(
                 "status": "failure",
                 "success": False,
                 "reason": (
-                    "Timed out waiting for /controller_state after "
+                    "Timed out waiting for /panda/controller_state after "
                     f"{config.cartesian.command_timeout_sec:g} seconds."
                 ),
                 "command": command,

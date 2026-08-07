@@ -2,9 +2,10 @@
 import rclpy
 import numpy as np
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import Pose
-from std_msgs.msg import Float64
+from std_msgs.msg import Bool, Float64
 import copy
 
 
@@ -19,7 +20,7 @@ class RailUnifiedBridge(Node):
         self.last_state1 = JointState()
         self.last_state2 = JointState()
         
-        # Cache for latest commanded joint positions and velocities from /joint_command
+        # Cache for latest planned Cartesian joint positions and velocities.
         self.sys1_cmd_cache = {f"panda_joint{i}": 0.0 for i in range(1, 8)}
         self.sys1_cmd_cache["panda_finger_joint1"] = 0.0
         
@@ -58,16 +59,29 @@ class RailUnifiedBridge(Node):
         # ==========================================
         self.pub_sys1_cmd = self.create_publisher(JointState, '/sim/rail_franka1/joint_command', 10)
         self.pub_sys2_cmd = self.create_publisher(JointState, '/sim/rail_franka2/joint_command', 10)
+        direct_control_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.direct_control_state_pub = self.create_publisher(
+            Bool, '/panda/direct_joint_control_active', direct_control_qos
+        )
         
         self.create_subscription(JointState, '/sim/rail1/joint_command', self.cb_sys1_direct_relay, 10)
-        self.create_subscription(JointState, '/joint_command', self.cb_sys1_controller_relay, 10)
-        self.create_subscription(JointState, '/joint_position_command', self.cb_sys1_direct_relay, 10)
-        self.create_subscription(Float64, '/gripper_cmd', self.cb_sys1_direct_relay, 10)
-        self.create_subscription(Pose, '/pose_cmd', self.cb_cartesian_pose, 10)
+        self.create_subscription(JointState, '/cartesian/joint_command', self.cb_sys1_controller_relay, 10)
+        self.create_subscription(JointState, '/direct_joint_command', self.cb_sys1_direct_relay, 10)
+        # RRT publishes this only for cancellation/safety holds.  It must
+        # reach the simulator as a direct command, but stays separate from
+        # the VLM/orchestrator direct-joint channel.
+        self.create_subscription(JointState, '/rrt/hold_command', self.cb_sys1_direct_relay, 10)
+        self.create_subscription(Float64, '/gripper/command', self.cb_sys1_direct_relay, 10)
+        self.create_subscription(Pose, '/rrt/pose_command', self.cb_cartesian_pose, 10)
         self.create_subscription(JointState, '/sim/rail2/joint_command', self.cb_sys2_relay, 10)
         self.create_subscription(JointState, '/sim/franka2_rail/joint_command', self.cb_sys2_relay, 10)
 
         self.get_logger().info("Unified Splitter/Relay Bridge Active with Position and Velocity Caching.")
+        self._publish_direct_control_state()
 
     # ---------------------------------------------------------
     # MERGE LOGIC
@@ -88,6 +102,11 @@ class RailUnifiedBridge(Node):
     def _is_panda_joint(name):
         return 'panda' in name.lower()
 
+    def _publish_direct_control_state(self):
+        message = Bool()
+        message.data = self.direct_joint_control_active
+        self.direct_control_state_pub.publish(message)
+
     def cb_sys1_controller_relay(self, msg):
         if self.direct_joint_control_active:
             self.get_logger().warning(
@@ -96,7 +115,7 @@ class RailUnifiedBridge(Node):
             return
         if not self.cartesian_control_active:
             # Do not replay a stale Cartesian target after direct-joint ownership
-            # has completed. A new /pose_cmd explicitly arms Cartesian forwarding.
+            # has completed. A new /rrt/pose_command explicitly arms Cartesian forwarding.
             return
         self._relay_sys1_command(msg, controller_owned=True)
 
@@ -109,6 +128,7 @@ class RailUnifiedBridge(Node):
                         "Direct Panda joint control enabled; Cartesian commands are now blocked."
                     )
                 self.direct_joint_control_active = True
+                self._publish_direct_control_state()
                 self.cartesian_control_active = False
                 self.direct_target_positions = {
                     name: float(msg.position[index])
@@ -147,6 +167,7 @@ class RailUnifiedBridge(Node):
             return
 
         self.direct_joint_control_active = False
+        self._publish_direct_control_state()
         self.direct_target_positions.clear()
         self.direct_target_stable_samples = 0
         self.get_logger().info(
@@ -197,7 +218,7 @@ class RailUnifiedBridge(Node):
                 if i < len(msg.velocity):
                     self.sys1_cmd_vel_cache[name] = msg.velocity[i]
         else:
-            # msg is a Float64 message from /gripper_cmd (position only usually)
+            # msg is a Float64 message from /gripper/command (position only usually)
             self.sys1_cmd_cache["panda_finger_joint1"] = msg.data
             self.sys1_cmd_received.add("panda_finger_joint1")
 

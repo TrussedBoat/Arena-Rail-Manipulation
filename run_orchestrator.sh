@@ -73,11 +73,13 @@ rrt_supervisor() {
             -p planning_time_sec:=8.0 \
             -p goal_position_tolerance_m:=0.005 \
             -p goal_orientation_tolerance_rad:=0.05 \
+            -p eef_min_z_m:=0.15 \
             -p model_root:="$RRT_MODEL_ROOT" \
-            -p pose_cmd_topic:=/pose_cmd \
+            -p pose_cmd_topic:=/rrt/pose_command \
             -p joint_states_topic:=/joint_states \
-            -p trajectory_topic:=/joint_trajectory_cmd \
-            -p controller_state_topic:=/controller_state &
+            -p trajectory_topic:=/rrt/joint_trajectory \
+            -p controller_state_topic:=/panda/controller_state \
+            -p hold_topic:=/rrt/hold_command &
         planner_pid=$!
         if wait "$planner_pid"; then
             planner_status=0
@@ -93,12 +95,13 @@ RRT_PID=$!
 
 echo "[+] Starting Cartesian Panda controller in background..."
 python3 "$PANDA_CONTROLLER" --ros-args \
-    -p cartesian_pose_topic:=/controller_pose_cmd_disabled \
-    -p joint_trajectory_topic:=/joint_trajectory_cmd \
+    -p cartesian_pose_topic:=/panda/disabled_cartesian_pose_command \
+    -p joint_trajectory_topic:=/rrt/joint_trajectory \
     -p joint_state_topic:=/joint_states \
-    -p joint_command_topic:=/joint_command \
-    -p controller_state_topic:=/controller_state \
-    -p controller_ready_topic:=/controller_ready &
+    -p joint_command_topic:=/cartesian/joint_command \
+    -p gripper_cmd_topic:=/gripper/command \
+    -p controller_state_topic:=/panda/controller_state \
+    -p controller_ready_topic:=/panda/controller_ready &
 CARTESIAN_PID=$!
 
 cleanup() {

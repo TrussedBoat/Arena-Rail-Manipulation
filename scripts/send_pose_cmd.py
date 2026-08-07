@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send one Cartesian EEF target to the Arena controller without the VLM.
 
-The controller subscribes to geometry_msgs/Pose on /pose_cmd and interprets it
+The RRT planner subscribes to geometry_msgs/Pose on /rrt/pose_command and interprets it
 in the panda_link0 frame.  This utility accepts XYZ in metres and fixed-axis
 XYZ roll/pitch/yaw in radians, matching tools.move_eef_to_pose().
 """
@@ -33,13 +33,13 @@ def quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, f
 class PoseCommand(Node):
     def __init__(self) -> None:
         super().__init__("pose_cmd_debugger")
-        self.publisher = self.create_publisher(Pose, "/pose_cmd", 10)
+        self.publisher = self.create_publisher(Pose, "/rrt/pose_command", 10)
         self.controller_ready = False
         self.command_complete = False
         self.command_failure = None
         self.rrt_ready_at = None
-        self.create_subscription(Bool, "/controller_ready", self._ready_callback, 10)
-        self.create_subscription(Bool, "/controller_state", self._state_callback, 10)
+        self.create_subscription(Bool, "/panda/controller_ready", self._ready_callback, 10)
+        self.create_subscription(Bool, "/panda/controller_state", self._state_callback, 10)
         self.create_subscription(String, "/rrt/status", self._rrt_status_callback, 10)
         self.create_subscription(Bool, "/rrt/ready", self._rrt_ready_callback, 10)
 
@@ -102,7 +102,7 @@ def main() -> int:
             args.ready_timeout,
         )
         if not ready:
-            node.get_logger().error("RRT planner is not healthy or subscribed to /pose_cmd")
+            node.get_logger().error("RRT planner is not healthy or subscribed to /rrt/pose_command")
             return 2
 
         quaternion = quaternion_from_rpy(args.roll, args.pitch, args.yaw)
@@ -113,7 +113,7 @@ def main() -> int:
         node.command_failure = None
         node.publisher.publish(message)
         node.get_logger().info(
-            "Published /pose_cmd in panda_link0: "
+            "Published /rrt/pose_command in panda_link0: "
             f"xyz=({args.x:.4f}, {args.y:.4f}, {args.z:.4f}), "
             f"rpy=({args.roll:.4f}, {args.pitch:.4f}, {args.yaw:.4f})"
         )
@@ -124,7 +124,7 @@ def main() -> int:
             lambda: node.command_complete or node.command_failure is not None,
             args.completion_timeout,
         ):
-            node.get_logger().error("Timed out waiting for /controller_state=true")
+            node.get_logger().error("Timed out waiting for /panda/controller_state=true")
             return 3
         if node.command_failure is not None:
             node.get_logger().error(node.command_failure)

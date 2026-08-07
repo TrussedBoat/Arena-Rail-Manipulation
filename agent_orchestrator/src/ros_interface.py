@@ -9,9 +9,10 @@ from cv_bridge import CvBridge
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, JointState
 from std_srvs.srv import Trigger
-from std_msgs.msg import Bool, Float64, String
+from std_msgs.msg import Bool, Empty, Float64, String
 import tf2_ros
 from geometry_msgs.msg import Pose
 from scipy.spatial.transform import Rotation
@@ -33,14 +34,26 @@ class RobotHardwareInterface(Node):
         self.image_sub = self.create_subscription(Image, '/sim/rail_franka1/cam/wrist/color/image_raw', self.image_callback, 10)
         self.depth_sub = self.create_subscription(Image, '/sim/rail_franka1/cam/wrist/depth/image_raw', self.depth_callback, 10)
         self.rail_subscriber = self.create_subscription(JointState, '/sim/rail_franka1/joint_states', self.rail_state_callback, 10)
-        self.rail_publisher = self.create_publisher(JointState, '/joint_position_command', 10)
-        self.gripper_publisher = self.create_publisher(Float64, '/gripper_cmd', 10)
-        self.pose_publisher = self.create_publisher(Pose, '/pose_cmd', 10)
+        self.rail_publisher = self.create_publisher(JointState, '/direct_joint_command', 10)
+        self.gripper_publisher = self.create_publisher(Float64, '/gripper/command', 10)
+        self.pose_publisher = self.create_publisher(Pose, '/rrt/pose_command', 10)
+        self.rrt_cancel_publisher = self.create_publisher(Empty, '/rrt/cancel', 10)
         self.controller_state_sub = self.create_subscription(
-            Bool, '/controller_state', self.controller_state_callback, 10
+            Bool, '/panda/controller_state', self.controller_state_callback, 10
         )
         self.controller_ready_sub = self.create_subscription(
-            Bool, '/controller_ready', self.controller_ready_callback, 10
+            Bool, '/panda/controller_ready', self.controller_ready_callback, 10
+        )
+        direct_control_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.direct_joint_control_sub = self.create_subscription(
+            Bool,
+            '/panda/direct_joint_control_active',
+            self.direct_joint_control_callback,
+            direct_control_qos,
         )
         self.rrt_status_sub = self.create_subscription(
             String, '/rrt/status', self.rrt_status_callback, 10
@@ -63,8 +76,12 @@ class RobotHardwareInterface(Node):
         self.current_joint_positions = {}
         self.cartesian_controller_ready = False
         self.cartesian_control_active = False
+        self.direct_joint_control_active = False
         self._cartesian_completion = threading.Event()
         self._cartesian_failure = None
+        self._rrt_status_event = threading.Event()
+        self._rrt_status_state = None
+        self._rrt_status_message = None
         self._rrt_ready_at = None
 
         # TF listener for camera→base transforms
@@ -75,16 +92,26 @@ class RobotHardwareInterface(Node):
         self.cartesian_controller_ready = bool(msg.data)
 
     def controller_state_callback(self, msg):
-        if msg.data:
-            self._cartesian_completion.set()
+        self.cartesian_control_active = self.cartesian_control_active or bool(msg.data)
+
+    def direct_joint_control_callback(self, msg):
+        self.direct_joint_control_active = bool(msg.data)
 
     def rrt_status_callback(self, msg):
         try:
             status = json.loads(msg.data)
         except (TypeError, ValueError, json.JSONDecodeError):
             return
-        if status.get('state') == 'failure':
+        state = str(status.get('state', ''))
+        self._rrt_status_state = state
+        self._rrt_status_message = str(status.get('message', ''))
+        self._rrt_status_event.set()
+        if state == 'failure':
             self._cartesian_failure = str(status.get('message', 'RRT planning failed'))
+            self._cartesian_completion.set()
+        elif state == 'success':
+            self._cartesian_completion.set()
+        elif state == 'cancelled':
             self._cartesian_completion.set()
 
     def rrt_ready_callback(self, msg):
@@ -98,6 +125,7 @@ class RobotHardwareInterface(Node):
                 self._rrt_ready_at is not None
                 and time.monotonic() - self._rrt_ready_at <= 2.5
                 and self.pose_publisher.get_subscription_count() > 0
+                and not self.direct_joint_control_active
             ):
                 return True
             time.sleep(0.05)
@@ -117,11 +145,42 @@ class RobotHardwareInterface(Node):
         base_frame: str = 'panda_link0',
         eef_frame: str = 'eef',
     ) -> bool:
+        self.begin_eef_pose(
+            x,
+            y,
+            z,
+            roll,
+            pitch,
+            yaw,
+            readiness_timeout_sec=readiness_timeout_sec,
+            tf_timeout_sec=tf_timeout_sec,
+            base_frame=base_frame,
+            eef_frame=eef_frame,
+        )
+        completed = self._cartesian_completion.wait(timeout=max(0.0, timeout_sec))
+        if self._cartesian_failure is not None:
+            raise RuntimeError(self._cartesian_failure)
+        return completed and self._rrt_status_state == 'success'
+
+    def begin_eef_pose(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        roll: float,
+        pitch: float,
+        yaw: float,
+        readiness_timeout_sec: float = 5.0,
+        tf_timeout_sec: float = 3.0,
+        base_frame: str = 'panda_link0',
+        eef_frame: str = 'eef',
+    ) -> None:
+        """Publish an RRT EEF target and return immediately."""
         values = (x, y, z, roll, pitch, yaw)
         if not all(math.isfinite(float(value)) for value in values):
             raise ValueError("EEF pose values must all be finite numbers")
         if not self.wait_for_cartesian_controller(readiness_timeout_sec):
-            raise RuntimeError("RRT planner is not healthy or subscribed to /pose_cmd")
+            raise RuntimeError("RRT planner is not healthy or subscribed to /rrt/pose_command")
 
         # The home_robotics controller interprets Pose relative to panda_link0.
         quaternion = Rotation.from_euler('xyz', [roll, pitch, yaw]).as_quat()
@@ -141,6 +200,9 @@ class RobotHardwareInterface(Node):
 
         self._cartesian_completion.clear()
         self._cartesian_failure = None
+        self._rrt_status_event.clear()
+        self._rrt_status_state = None
+        self._rrt_status_message = None
         self.cartesian_control_active = True
         self.pose_publisher.publish(msg)
         self.get_logger().info(
@@ -148,10 +210,31 @@ class RobotHardwareInterface(Node):
             f"xyz=({x:.4f}, {y:.4f}, {z:.4f}), "
             f"rpy=({roll:.4f}, {pitch:.4f}, {yaw:.4f})"
         )
+
+    def eef_motion_done(self) -> bool:
+        return self._cartesian_completion.is_set()
+
+    def wait_for_eef_motion(self, timeout_sec: float) -> bool:
         completed = self._cartesian_completion.wait(timeout=max(0.0, timeout_sec))
         if self._cartesian_failure is not None:
             raise RuntimeError(self._cartesian_failure)
-        return completed
+        return completed and self._rrt_status_state == 'success'
+
+    def cancel_eef_motion(self, timeout_sec: float = 3.0) -> bool:
+        self._rrt_status_event.clear()
+        self._rrt_status_state = None
+        self._rrt_status_message = None
+        self.rrt_cancel_publisher.publish(Empty())
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if self._rrt_status_event.wait(timeout=max(0.0, remaining)):
+                if self._rrt_status_state == 'cancelled':
+                    return True
+                if self._rrt_status_state == 'failure':
+                    raise RuntimeError(self._rrt_status_message or 'RRT cancellation failed')
+                self._rrt_status_event.clear()
+        return False
 
     def _ensure_direct_arm_control_allowed(self):
         if self.cartesian_control_active:
