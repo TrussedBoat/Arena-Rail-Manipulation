@@ -15,6 +15,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import rclpy
+from scipy.spatial.transform import Rotation
 
 from config import (
     YOLOConfig,
@@ -28,7 +29,13 @@ from ros_interface import (
     wait_for_joint_target,
     wait_for_place,
 )
-from targeted_scan_geometry import close_view_pose, generate_desk_arc, rail_centre
+from targeted_scan_geometry import (
+    close_view_tilt_poses,
+    generate_desk_arc,
+    generate_desk_targets,
+    look_at_eef_rotation,
+    rail_centre,
+)
 
 
 VLM_WARMUP_LATENCY_LIMIT_SEC = 5.0
@@ -1560,6 +1567,49 @@ def _scan_pose_with_yolo(
     return None, observations
 
 
+def _camera_look_at_scan_pose(
+    node: object,
+    pose: object,
+    target: object,
+    config: RuntimeConfig,
+) -> object:
+    """Keep the arc XYZ while orienting the wrist camera at one desk point."""
+    try:
+        base_to_eef = node.get_transform_matrix(
+            target_frame=config.cartesian.base_frame,
+            source_frame=config.cartesian.eef_frame,
+            timeout_sec=config.cartesian.tf_timeout_sec,
+        )
+        base_to_camera = node.get_transform_matrix(
+            target_frame=config.cartesian.base_frame,
+            source_frame=config.search.camera_optical_frame,
+            timeout_sec=config.cartesian.tf_timeout_sec,
+        )
+        eef_to_camera = np.linalg.inv(base_to_eef) @ base_to_camera
+        eef_rotation = look_at_eef_rotation(
+            eef_position=(pose.x, pose.y, pose.z),
+            target_position=(target.x, target.y, target.z),
+            eef_to_camera=eef_to_camera,
+        )
+        roll, pitch, yaw = Rotation.from_matrix(eef_rotation).as_euler("xyz")
+    except (TimeoutError, ValueError, np.linalg.LinAlgError) as exc:
+        raise RuntimeConfigurationError(
+            f"Could not compute camera look-at scan orientation: {exc}"
+        ) from exc
+
+    if not all(math.isfinite(float(value)) for value in (roll, pitch, yaw)):
+        raise RuntimeConfigurationError("Camera look-at produced non-finite EEF RPY")
+    roll = float(roll)
+    return type(pose)(
+        x=pose.x,
+        y=pose.y,
+        z=pose.z,
+        roll=roll,
+        pitch=float(pitch),
+        yaw=float(yaw),
+    )
+
+
 def _scan_both_desk_sides(
     node: object,
     target: str,
@@ -1568,7 +1618,7 @@ def _scan_both_desk_sides(
     observations = 0
     current_rail = float(node.current_rail_position)
     for side, label in ((1, "left"), (-1, "right")):
-        poses = generate_desk_arc(
+        arc_poses = generate_desk_arc(
             current_rail=current_rail,
             rail_min=config.search.rail_min_position,
             rail_max=config.search.rail_max_position,
@@ -1580,15 +1630,30 @@ def _scan_both_desk_sides(
             pitch=config.search.targeted_scan_pitch,
             viewpoints=config.search.targeted_scan_viewpoints,
         )
+        targets = generate_desk_targets(
+            current_rail=current_rail,
+            rail_min=config.search.rail_min_position,
+            rail_max=config.search.rail_max_position,
+            side=side,
+            table_scan_y=config.search.targeted_table_scan_y,
+            surface_z=config.search.targeted_desk_surface_z,
+            viewpoints=config.search.targeted_scan_viewpoints,
+        )
         print(
-            f"[TARGETED][{label.upper()}] Scanning {len(poses)} RRT viewpoints "
+            f"[TARGETED][{label.upper()}] Scanning {len(arc_poses)} RRT viewpoints "
             f"at {config.search.targeted_capture_fps:g} FPS."
         )
-        for index, pose in enumerate(poses, start=1):
+        for index, (arc_pose, target_point) in enumerate(
+            zip(arc_poses, targets, strict=True), start=1
+        ):
+            pose = _camera_look_at_scan_pose(node, arc_pose, target_point, config)
             print(
-                f"[TARGETED][{label.upper()}] viewpoint {index}/{len(poses)}: "
+                f"[TARGETED][{label.upper()}] viewpoint {index}/{len(arc_poses)}: "
                 f"xyz=({pose.x:.3f},{pose.y:.3f},{pose.z:.3f}), "
-                f"yaw={pose.yaw:.3f}."
+                f"rpy=({pose.roll:.3f},{pose.pitch:.3f},{pose.yaw:.3f}), "
+                f"desk_target=({target_point.global_x:.3f} global X; "
+                f"{target_point.x:.3f},{target_point.y:.3f},{target_point.z:.3f} "
+                f"in {config.cartesian.base_frame})."
             )
             detection, count = _scan_pose_with_yolo(node, target, pose, config)
             observations += count
@@ -1674,56 +1739,75 @@ def targeted_search(target_object: str) -> dict[str, object]:
         )
         _command_rail_and_wait(node, approach_x, config)
 
-        close_pose = close_view_pose(
+        close_poses = close_view_tilt_poses(
             side=candidate_side,
             standoff=config.search.targeted_close_standoff,
             height=config.search.targeted_scan_height,
             roll=config.search.targeted_scan_roll,
             pitch=config.search.targeted_scan_pitch,
         )
-        if not node.send_eef_pose(
-            close_pose.x,
-            close_pose.y,
-            close_pose.z,
-            close_pose.roll,
-            close_pose.pitch,
-            close_pose.yaw,
-            timeout_sec=config.cartesian.command_timeout_sec,
-            readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
-            tf_timeout_sec=config.cartesian.tf_timeout_sec,
-            base_frame=config.cartesian.base_frame,
-            eef_frame=config.cartesian.eef_frame,
-        ):
-            return _failure_result(
-                target,
-                "Closer-look RRT pose did not complete.",
-                state="close_approach",
-                detection=candidate,
-                observations=observations,
+        confirmations: list[tuple[float, dict[str, object], dict[str, object]]] = []
+        best_detection = candidate
+        best_confidence = float(candidate.get("confidence") or 0.0)
+        for tilt_label, close_pose in zip(("up", "down"), close_poses, strict=True):
+            print(
+                f"[TARGETED][CONFIRM][{tilt_label.upper()}] "
+                f"z={close_pose.z:.3f}, pitch={close_pose.pitch:.3f}."
             )
+            if not node.send_eef_pose(
+                close_pose.x,
+                close_pose.y,
+                close_pose.z,
+                close_pose.roll,
+                close_pose.pitch,
+                close_pose.yaw,
+                timeout_sec=config.cartesian.command_timeout_sec,
+                readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+                tf_timeout_sec=config.cartesian.tf_timeout_sec,
+                base_frame=config.cartesian.base_frame,
+                eef_frame=config.cartesian.eef_frame,
+            ):
+                return _failure_result(
+                    target,
+                    f"Closer-look {tilt_label} RRT pose did not complete.",
+                    state="close_approach",
+                    detection=best_detection,
+                    observations=observations,
+                )
 
-        time.sleep(config.search.motion_settling_sec)
-        node.latest_b64_image = None
-        final_detection = detect_target_in_latest_frame(
-            target, timeout_sec=1.0 / config.search.targeted_capture_fps
-        )
-        observations += 1
-        final_confidence = final_detection.get("confidence")
-        if (
-            final_detection.get("status") == "not_found"
-            or final_confidence is None
-            or float(final_confidence) <= config.yolo.confidence_threshold
-        ):
+            time.sleep(config.search.motion_settling_sec)
+            node.latest_b64_image = None
+            detection = detect_target_in_latest_frame(
+                target, timeout_sec=1.0 / config.search.targeted_capture_fps
+            )
+            observations += 1
+            confidence = detection.get("confidence")
+            numeric_confidence = float(confidence) if confidence is not None else 0.0
+            if numeric_confidence > best_confidence:
+                best_detection = detection
+                best_confidence = numeric_confidence
+            if (
+                detection.get("status") == "not_found"
+                or confidence is None
+                or numeric_confidence <= config.yolo.confidence_threshold
+            ):
+                continue
+            position = _extract_object_world_position(
+                node, detection["bbox"], config
+            )
+            confirmations.append((numeric_confidence, detection, position))
+
+        if not confirmations:
             return _failure_result(
                 target,
-                "Candidate failed the closer-look confidence confirmation.",
+                "Candidate failed both up/down closer-look confirmations.",
                 state="close_confirmation",
-                detection=final_detection,
+                detection=best_detection,
                 observations=observations,
             )
 
-        final_position = _extract_object_world_position(
-            node, final_detection["bbox"], config
+        _, final_detection, final_position = max(
+            confirmations, key=lambda confirmation: confirmation[0]
         )
         _persist_dynamic_coordinate_3d(
             config.paths.dynamic_semantic_coordinates,

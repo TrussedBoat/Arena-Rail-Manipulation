@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+from pathlib import Path
+import sys
+
 import rclpy
 import numpy as np
 from rclpy.node import Node
@@ -8,13 +11,22 @@ from geometry_msgs.msg import Pose
 from std_msgs.msg import Bool, Float64
 import copy
 
+# This script is launched directly, so expose the orchestrator source directory
+# before importing the shared runtime configuration.
+ORCHESTRATOR_SRC = Path(__file__).resolve().parents[1] / 'agent_orchestrator' / 'src'
+if str(ORCHESTRATOR_SRC) not in sys.path:
+    sys.path.insert(0, str(ORCHESTRATOR_SRC))
 
-DIRECT_TARGET_POSITION_TOLERANCE = 0.02
+from config import load_runtime_config
+
 DIRECT_TARGET_STABLE_SAMPLES = 5
 
 class RailUnifiedBridge(Node):
     def __init__(self):
         super().__init__('rail_unified_bridge_node')
+        self.direct_target_position_tolerance = (
+            load_runtime_config().search.wrist_joint_tolerance
+        )
         
         # Cache for last known joint states (to fill partial commands)
         self.last_state1 = JointState()
@@ -80,7 +92,11 @@ class RailUnifiedBridge(Node):
         self.create_subscription(JointState, '/sim/rail2/joint_command', self.cb_sys2_relay, 10)
         self.create_subscription(JointState, '/sim/franka2_rail/joint_command', self.cb_sys2_relay, 10)
 
-        self.get_logger().info("Unified Splitter/Relay Bridge Active with Position and Velocity Caching.")
+        self.get_logger().info(
+            "Unified Splitter/Relay Bridge Active with Position and Velocity "
+            f"Caching (direct Panda tolerance="
+            f"{self.direct_target_position_tolerance:.4f}rad)."
+        )
         self._publish_direct_control_state()
 
     # ---------------------------------------------------------
@@ -155,7 +171,8 @@ class RailUnifiedBridge(Node):
             return
 
         converged = all(
-            abs(actual_positions[name] - target) <= DIRECT_TARGET_POSITION_TOLERANCE
+            abs(actual_positions[name] - target)
+            <= self.direct_target_position_tolerance
             for name, target in self.direct_target_positions.items()
         )
         if not converged:

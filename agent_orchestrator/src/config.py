@@ -54,7 +54,7 @@ SEARCH_RAIL_MIN             = -1.20  # metres
 SEARCH_RAIL_MAX             =  1.60   # metres
 SEARCH_RAIL_WAYPOINT_SPACING = 0.40  # metres between scan stops
 # Override at runtime with YOLO_VLM_RAIL_SPEED (metres/second).
-SEARCH_RAIL_SPEED           = 0.25
+SEARCH_RAIL_SPEED           = 0.20
 SEARCH_J6_SPEED             = 0.5
 SEARCH_J6_MIN               = 0.8
 SEARCH_J6_MAX               = 1.3
@@ -85,8 +85,10 @@ TARGETED_SCAN_VIEWPOINTS        = 7
 TARGETED_CAPTURE_FPS            = 0.3 #lower it if the wrist camera is not able to capture fast enough
 TARGETED_CANDIDATE_CONFIDENCE   = 0.30
 TARGETED_DESK_WIDTH             = 1.0
+TARGETED_TABLE_SCAN_Y           = 0.75
 TARGETED_ARC_RADIUS             = 0.50
 TARGETED_SCAN_HEIGHT            = 0.70
+TARGETED_DESK_SURFACE_Z         = 0.0
 TARGETED_SCAN_ROLL              = 3.14
 TARGETED_SCAN_PITCH             = -1.0
 TARGETED_CLOSE_STANDOFF         = 0.30
@@ -185,8 +187,10 @@ class SearchConfig:
     targeted_capture_fps: float
     targeted_candidate_confidence: float
     targeted_desk_width: float
+    targeted_table_scan_y: float
     targeted_arc_radius: float
     targeted_scan_height: float
+    targeted_desk_surface_z: float
     targeted_scan_roll: float
     targeted_scan_pitch: float
     targeted_close_standoff: float
@@ -420,11 +424,19 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             targeted_desk_width=_env_float(
                 source, "YOLO_VLM_TARGETED_DESK_WIDTH", TARGETED_DESK_WIDTH
             ),
+            targeted_table_scan_y=_env_float(
+                source, "YOLO_VLM_TARGETED_TABLE_SCAN_Y", TARGETED_TABLE_SCAN_Y
+            ),
             targeted_arc_radius=_env_float(
                 source, "YOLO_VLM_TARGETED_ARC_RADIUS", TARGETED_ARC_RADIUS
             ),
             targeted_scan_height=_env_float(
                 source, "YOLO_VLM_TARGETED_SCAN_HEIGHT", TARGETED_SCAN_HEIGHT
+            ),
+            targeted_desk_surface_z=_env_float(
+                source,
+                "YOLO_VLM_TARGETED_DESK_SURFACE_Z",
+                TARGETED_DESK_SURFACE_Z,
             ),
             targeted_scan_roll=_env_float(
                 source, "YOLO_VLM_TARGETED_SCAN_ROLL", TARGETED_SCAN_ROLL
@@ -772,6 +784,7 @@ def validate_runtime_config(
     for label, value in (
         ("targeted capture FPS", config.search.targeted_capture_fps),
         ("targeted desk width", config.search.targeted_desk_width),
+        ("targeted table scan Y", config.search.targeted_table_scan_y),
         ("targeted arc radius", config.search.targeted_arc_radius),
         ("targeted scan height", config.search.targeted_scan_height),
         ("targeted close stand-off", config.search.targeted_close_standoff),
@@ -779,6 +792,17 @@ def validate_runtime_config(
     ):
         if not math.isfinite(value) or value <= 0:
             errors.append(f"{label} must be finite and positive, got {value}")
+    if config.search.targeted_table_scan_y >= config.search.targeted_desk_width:
+        errors.append(
+            "targeted table scan Y must be inside the desk edge, got "
+            f"{config.search.targeted_table_scan_y} >= "
+            f"{config.search.targeted_desk_width}"
+        )
+    if not math.isfinite(config.search.targeted_desk_surface_z):
+        errors.append(
+            "targeted desk surface Z must be finite, got "
+            f"{config.search.targeted_desk_surface_z}"
+        )
     if not 0 < config.search.targeted_candidate_confidence < config.yolo.confidence_threshold:
         errors.append(
             "targeted candidate confidence must be between 0 and the final YOLO "
