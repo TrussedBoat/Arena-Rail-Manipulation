@@ -17,6 +17,9 @@ ORCHESTRATOR_SRC = Path(__file__).resolve().parents[1] / 'agent_orchestrator' / 
 if str(ORCHESTRATOR_SRC) not in sys.path:
     sys.path.insert(0, str(ORCHESTRATOR_SRC))
 
+import ros_logger
+ros_logger.setup_ros_logging()
+
 from config import load_runtime_config
 
 DIRECT_TARGET_STABLE_SAMPLES = 5

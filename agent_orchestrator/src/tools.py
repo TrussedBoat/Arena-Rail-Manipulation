@@ -223,7 +223,11 @@ class DeterministicYOLODetector:
                         }
                     )
                     
-        cv2.imshow("YOLO Search", frame)
+        scale = 0.6
+        vis_width = int(frame.shape[1] * scale)
+        vis_height = int(frame.shape[0] * scale)
+        vis_frame = cv2.resize(frame, (vis_width, vis_height), interpolation=cv2.INTER_AREA)
+        cv2.imshow("YOLO Search", vis_frame)
         cv2.waitKey(1)
 
         if not candidates:
@@ -884,7 +888,7 @@ def _extract_object_world_position(
     y_cam = (v - cy) * depth_m / fy
     z_cam = depth_m
     p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
-    print(f"[POSITION] camera frame: ({x_cam:.3f}, {y_cam:.3f}, {z_cam:.3f})")
+    #print(f"[POSITION] camera frame: ({x_cam:.3f}, {y_cam:.3f}, {z_cam:.3f})")
 
     # ── 5. TF lookup: camera → rail-zero global frame ─────────────────────
     try:
@@ -1212,274 +1216,6 @@ def general_mapping(target_object: str) -> dict[str, object]:
         )
         
 
-# ─────────────────────────────────────────────────────────────────────
-# TARGETED SEARCH TOOL
-#
-# Human-like search behaviour:
-#   1. Check YOLO model supports the label.
-#   2. Perform a right-left J1 pan sweep (J1=+1.57 → J1=-1.57) from current
-#      rail position, capturing YOLO frames continuously.
-#   3. If found  → halt, extract approx 3-D position, move rail to X, re-detect
-#      for precision, persist, return coordinates.
-#   4. If not found → check distance to table centre.
-#      • If already within 0.3 m → return not_found.
-#      • Else → move rail to centre, repeat pan sweep once more.
-#      • If still not found → return not_found.
-#
-# NOTE: J1 pan angles (+1.57 / -1.57) are temporary placeholders.
-#       They will be replaced with IK-computed angles later.
-# ─────────────────────────────────────────────────────────────────────
-
-_TARGETED_SCAN_J1_ANGLES: list[float] = [1.57, -1.57]
-_TABLE_CENTRE_PROXIMITY_THRESHOLD_M: float = 0.30
-
-
-def _targeted_j1_pan_scan(
-    node: object,
-    target: str,
-    detector: object,
-    config: RuntimeConfig,
-) -> "dict | None":
-    """
-    Pan J1 right then left while reading YOLO frames.
-    Returns the first high-confidence detection dict, or None if not found.
-    """
-    for j1_target in _TARGETED_SCAN_J1_ANGLES:
-        print(f"[TARGETED][PAN] Moving J1 to {j1_target:.2f} rad...")
-        try:
-            _command_wrist_and_wait(node, j1_target, config)
-        except RuntimeConfigurationError as e:
-            print(f"[TARGETED][PAN] J1 command failed: {e}. Skipping this angle.")
-            continue
-
-        time.sleep(1.0)
-
-        for _ in range(4):
-            node.latest_b64_image = None
-            try:
-                get_latest_ros_image(timeout_sec=2.0)
-            except TimeoutError:
-                continue
-
-            detection = detect_target_in_latest_frame(target, timeout_sec=1.0)
-            conf = detection.get("confidence")
-            if (
-                detection.get("status") != "not_found"
-                and conf is not None
-                and float(conf) >= 0.5
-            ):
-                print(
-                    f"[TARGETED][FOUND] Detected '{target}' at J1={j1_target:.2f} rad "
-                    f"with confidence {conf:.2f}."
-                )
-                return detection
-            time.sleep(0.25)
-
-    return None
-
-
-def _legacy_targeted_search(target_object: str) -> dict[str, object]:
-    """
-    Targeted search tool: human-like right/left J1 pan sweep to locate an object.
-
-    Designed for two scenarios:
-      - Object not yet in the semantic map.
-      - Object was in the map but may have been physically moved (stale entry).
-
-    Workflow:
-      1. Pan J1 right (+1.57) then left (-1.57) from current rail position.
-      2. If detected: move rail to approx object X, run final precision detection,
-         persist coordinates, return them.
-      3. If not detected: if already near table centre (< 0.3 m), give up.
-         Otherwise move to table centre and repeat the scan once.
-      4. If still not found: return failure.
-    """
-    target = _normalize_label(target_object or "")
-    if not target:
-        return _failure_result(target, "A non-empty target label is required.", state="initialize")
-
-    observations = 0
-
-    try:
-        config = get_runtime_config()
-        detector = _get_yolo_detector(config)
-
-        if not detector.supports_label(target):
-            return _failure_result(
-                target,
-                f"Configured YOLO checkpoint does not provide target class {target!r}.",
-                state="initialize",
-            )
-
-        node = get_shared_node()
-        if not _wait_for_search_telemetry(node):
-            return _failure_result(
-                target,
-                "Timed out waiting for rail, wrist, and session-origin telemetry.",
-                state="initialize",
-            )
-
-        table_centre = (config.search.rail_min_position + config.search.rail_max_position) / 2.0
-        current_rail = float(node.current_rail_position)
-        print(
-            f"[TARGETED][INIT] target={target!r}, rail={current_rail:.3f}m, "
-            f"table_centre={table_centre:.3f}m."
-        )
-
-        # First scan pass from current position
-        print("[TARGETED][SCAN1] Starting first right-left J1 pan scan...")
-        detection = _targeted_j1_pan_scan(node, target, detector, config)
-        observations += 1
-
-        # If not found: optionally move to table centre and retry
-        if detection is None:
-            dist_to_centre = abs(current_rail - table_centre)
-            if dist_to_centre <= _TABLE_CENTRE_PROXIMITY_THRESHOLD_M:
-                print(
-                    f"[TARGETED][SKIP] Already within {_TABLE_CENTRE_PROXIMITY_THRESHOLD_M:.2f} m "
-                    f"of table centre ({dist_to_centre:.3f} m). Skipping second scan."
-                )
-            else:
-                print(
-                    f"[TARGETED][MOVE] Moving to table centre ({table_centre:.3f} m) "
-                    f"for second scan..."
-                )
-                try:
-                    _command_rail_and_wait(node, table_centre, config)
-                except RuntimeConfigurationError as e:
-                    return _failure_result(
-                        target, f"Rail move to centre failed: {e}", state="centre_move"
-                    )
-
-                print("[TARGETED][SCAN2] Starting second right-left J1 pan scan at centre...")
-                detection = _targeted_j1_pan_scan(node, target, detector, config)
-                observations += 1
-
-        # Not found after all attempts
-        if detection is None:
-            return _failure_result(
-                target,
-                "Object not found after targeted right/left J1 pan scan (both positions).",
-                state="search_sweep",
-                observations=observations,
-            )
-
-        # Found: extract approx position and approach
-        print("[TARGETED][POSITION] Computing approximate global position...")
-        try:
-            approx_pos = _extract_object_world_position(node, detection["bbox"], config)
-        except RuntimeConfigurationError as pos_exc:
-            return _failure_result(
-                target,
-                f"Initial position extraction failed: {pos_exc}",
-                state="position_extract",
-                detection=detection,
-                observations=observations,
-            )
-
-        approx_x_clamped = max(
-            config.search.rail_min_position,
-            min(config.search.rail_max_position, approx_pos["x"]),
-        )
-
-        print(f"[TARGETED][APPROACH] Moving rail to approx X={approx_x_clamped:.3f} m...")
-        try:
-            _command_rail_and_wait(node, approx_x_clamped, config)
-        except RuntimeConfigurationError as e:
-            return _failure_result(
-                target,
-                f"Rail approach to object position failed: {e}",
-                state="approach_move",
-                detection=detection,
-                observations=observations,
-            )
-
-        # Settle, then take a fresh precise frame
-        time.sleep(1.0)
-        node.latest_b64_image = None
-        try:
-            get_latest_ros_image(timeout_sec=3.0)
-        except TimeoutError:
-            pass
-
-        print("[TARGETED][REFINE] Running final precision detection...")
-        refined_detection = detect_target_in_latest_frame(target, timeout_sec=2.0)
-        observations += 1
-
-        final_detection = detection
-        refined_conf = refined_detection.get("confidence")
-        if (
-            refined_detection.get("status") != "not_found"
-            and refined_conf is not None
-            and float(refined_conf) >= 0.4
-        ):
-            final_detection = refined_detection
-            print(f"[TARGETED][REFINE] Using refined detection (conf={refined_conf:.2f}).")
-        else:
-            print("[TARGETED][REFINE] Refined detection weak; using initial detection for coords.")
-
-        # Final 3-D extraction
-        try:
-            final_pos = _extract_object_world_position(node, final_detection["bbox"], config)
-        except RuntimeConfigurationError as pos_exc:
-            return _failure_result(
-                target,
-                f"Final position extraction failed: {pos_exc}",
-                state="position_extract",
-                detection=final_detection,
-                observations=observations,
-            )
-
-        # Persist coordinates
-        try:
-            _persist_dynamic_coordinate_3d(
-                config.paths.dynamic_semantic_coordinates,
-                target,
-                final_pos["x"],
-                final_pos["y"],
-                final_pos["z"],
-            )
-        except RuntimeConfigurationError as exc:
-            return _failure_result(
-                target,
-                str(exc),
-                state="persist_coordinate",
-                detection=final_detection,
-                observations=observations,
-            )
-
-        print(
-            f"[TARGETED][SUCCESS] '{target}' located and persisted at "
-            f"x={final_pos['x']:.3f} y={final_pos['y']:.3f} z={final_pos['z']:.3f}."
-        )
-        return {
-            "status": "success",
-            "success": True,
-            "state": "save_and_succeed",
-            "reason": None,
-            "target": target,
-            "confidence": final_detection["confidence"],
-            "bbox": final_detection["bbox"],
-            "center": final_detection.get("center"),
-            "x": final_pos["x"],
-            "y": final_pos["y"],
-            "z": final_pos["z"],
-            "depth_m": final_pos["depth_raw"],
-            "pixel_uv": final_pos["pixel_uv"],
-            "rail_position": float(node.current_rail_position),
-            "observations": observations,
-            "coordinate_path": str(config.paths.dynamic_semantic_coordinates),
-        }
-
-    except Exception as exc:
-        return _failure_result(
-            target,
-            f"Targeted search aborted safely: {exc}",
-            state="failure",
-            observations=observations,
-        )
-
-
 def _scan_pose_with_yolo(
     node: object,
     target: str,
@@ -1617,7 +1353,13 @@ def _scan_both_desk_sides(
 ) -> tuple[dict[str, object] | None, int | None, int]:
     observations = 0
     current_rail = float(node.current_rail_position)
-    for side, label in ((1, "left"), (-1, "right")):
+    for idx, (side, label) in enumerate(((1, "left"), (-1, "right"))):
+        if idx > 0:
+            print(f"[TARGETED][RRT] Returning to initial posture before scanning {label.upper()} side...")
+            try:
+                _command_default_standing_posture_and_wait(node, config)
+            except RuntimeConfigurationError as e:
+                print(f"[TARGETED][RRT] Failed to return to initial posture: {e}")
         arc_poses = generate_desk_arc(
             current_rail=current_rail,
             rail_min=config.search.rail_min_position,
@@ -1647,14 +1389,7 @@ def _scan_both_desk_sides(
             zip(arc_poses, targets, strict=True), start=1
         ):
             pose = _camera_look_at_scan_pose(node, arc_pose, target_point, config)
-            print(
-                f"[TARGETED][{label.upper()}] viewpoint {index}/{len(arc_poses)}: "
-                f"xyz=({pose.x:.3f},{pose.y:.3f},{pose.z:.3f}), "
-                f"rpy=({pose.roll:.3f},{pose.pitch:.3f},{pose.yaw:.3f}), "
-                f"desk_target=({target_point.global_x:.3f} global X; "
-                f"{target_point.x:.3f},{target_point.y:.3f},{target_point.z:.3f} "
-                f"in {config.cartesian.base_frame})."
-            )
+            print(f"[TARGETED][{label.upper()}] viewpoint {index}/{len(arc_poses)}")
             detection, count = _scan_pose_with_yolo(node, target, pose, config)
             observations += count
             if detection is not None:
@@ -1731,16 +1466,60 @@ def targeted_search(target_object: str) -> dict[str, object]:
                 observations=observations,
             )
 
-        print("[TARGETED][CANDIDATE] RRT held; extracting global 3-D position.")
+        print("[TARGETED][CANDIDATE] Extracting global 3-D position.")
         approximate = _extract_object_world_position(node, candidate["bbox"], config)
         approach_x = max(
             config.search.rail_min_position,
             min(config.search.rail_max_position, float(approximate["x"])),
         )
-        _command_rail_and_wait(node, approach_x, config)
+        approximate_coordinate_path = (
+            config.paths.dynamic_semantic_coordinates.with_name(
+                "semantic_distances_dynamic.json"
+            )
+        )
+        try:
+            _persist_dynamic_coordinate_3d(
+                approximate_coordinate_path,
+                target + "_approximate",
+                approximate["x"],
+                approximate["y"],
+                approximate["z"],
+            )
+        except RuntimeConfigurationError as exc:
+            # The approximate map is debug-only.  Its write failure must not
+            # prevent final localization from continuing.
+            print(f"[TARGETED][DEBUG] Couldn't save approximate target: {exc}")
 
+        print("[TARGETED][POSTURE] Returning arm to initial pose before approach.")
+        try:
+            _command_default_standing_posture_and_wait(node, config)
+        except RuntimeConfigurationError as exc:
+            return _failure_result(
+                target,
+                f"Couldn't return arm to initial pose before approaching target: {exc}",
+                state="initial_pose_recovery",
+                detection=candidate,
+                observations=observations,
+            )
+
+        print(f"[TARGETED][APPROACH] Moving to target rail position {approach_x:.3f}m.")
+        try:
+            _command_rail_and_wait(node, approach_x, config)
+        except RuntimeConfigurationError as exc:
+            return _failure_result(
+                target,
+                f"Rail approach to target failed: {exc}",
+                state="approach_move",
+                detection=candidate,
+                observations=observations,
+            )
+
+        # The rail-global frame and panda_link0 are rotated 180 degrees about
+        # Z, so panda_link0 Y is the opposite sign of global_origin Y.  Pick
+        # the close-scan table side from the approximate global Y accordingly.
+        scan_side = -1 if float(approximate["y"]) >= 0.0 else 1
         close_poses = close_view_tilt_poses(
-            side=candidate_side,
+            side=scan_side,
             standoff=config.search.targeted_close_standoff,
             height=config.search.targeted_scan_height,
             roll=config.search.targeted_scan_roll,
@@ -1749,27 +1528,42 @@ def targeted_search(target_object: str) -> dict[str, object]:
         confirmations: list[tuple[float, dict[str, object], dict[str, object]]] = []
         best_detection = candidate
         best_confidence = float(candidate.get("confidence") or 0.0)
-        for tilt_label, close_pose in zip(("up", "down"), close_poses, strict=True):
-            print(
-                f"[TARGETED][CONFIRM][{tilt_label.upper()}] "
-                f"z={close_pose.z:.3f}, pitch={close_pose.pitch:.3f}."
-            )
-            if not node.send_eef_pose(
-                close_pose.x,
-                close_pose.y,
-                close_pose.z,
-                close_pose.roll,
-                close_pose.pitch,
-                close_pose.yaw,
-                timeout_sec=config.cartesian.command_timeout_sec,
-                readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
-                tf_timeout_sec=config.cartesian.tf_timeout_sec,
-                base_frame=config.cartesian.base_frame,
-                eef_frame=config.cartesian.eef_frame,
-            ):
+        for tilt_label, close_pose in zip(("down", "up"), close_poses, strict=True):
+            print(f"[TARGETED][CONFIRM][{tilt_label.upper()}]")
+            try:
+                pose_completed = node.send_eef_pose(
+                    close_pose.x,
+                    close_pose.y,
+                    close_pose.z,
+                    close_pose.roll,
+                    close_pose.pitch,
+                    close_pose.yaw,
+                    timeout_sec=config.cartesian.command_timeout_sec,
+                    readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+                    tf_timeout_sec=config.cartesian.tf_timeout_sec,
+                    base_frame=config.cartesian.base_frame,
+                    eef_frame=config.cartesian.eef_frame,
+                )
+            except (RuntimeError, TimeoutError, ValueError) as exc:
+                pose_completed = False
+                pose_error = str(exc)
+            else:
+                pose_error = "did not complete"
+            if not pose_completed:
+                try:
+                    _return_targeted_search_to_home(node, config)
+                except RuntimeConfigurationError as recovery_exc:
+                    return _failure_result(
+                        target,
+                        f"Closer-look {tilt_label} RRT pose {pose_error}; "
+                        f"initial-pose recovery also failed: {recovery_exc}",
+                        state="home_recovery",
+                        detection=best_detection,
+                        observations=observations,
+                    )
                 return _failure_result(
                     target,
-                    f"Closer-look {tilt_label} RRT pose did not complete.",
+                    f"Closer-look {tilt_label} RRT pose {pose_error}; returned to initial pose.",
                     state="close_approach",
                     detection=best_detection,
                     observations=observations,
@@ -1796,11 +1590,27 @@ def targeted_search(target_object: str) -> dict[str, object]:
                 node, detection["bbox"], config
             )
             confirmations.append((numeric_confidence, detection, position))
+            print(
+                f"[TARGETED][CONFIRM] Target confirmed during {tilt_label} scan. "
+                "Continuing scan sequence to gather best candidate."
+            )
 
         if not confirmations:
+            print("[TARGETED][HOME] Target not confirmed; returning to initial pose.")
+            try:
+                _return_targeted_search_to_home(node, config)
+            except RuntimeConfigurationError as recovery_exc:
+                return _failure_result(
+                    target,
+                    "Candidate failed both up/down closer-look confirmations; "
+                    f"initial-pose recovery failed: {recovery_exc}",
+                    state="home_recovery",
+                    detection=best_detection,
+                    observations=observations,
+                )
             return _failure_result(
                 target,
-                "Candidate failed both up/down closer-look confirmations.",
+                "Candidate failed both up/down closer-look confirmations; returned to initial pose.",
                 state="close_confirmation",
                 detection=best_detection,
                 observations=observations,
@@ -1809,6 +1619,24 @@ def targeted_search(target_object: str) -> dict[str, object]:
         _, final_detection, final_position = max(
             confirmations, key=lambda confirmation: confirmation[0]
         )
+        final_rail_position = max(
+            config.search.rail_min_position,
+            min(config.search.rail_max_position, float(final_position["x"])),
+        )
+        print(
+            "[TARGETED][ALIGN] Keeping confirmation joint pose and moving rail to "
+            f"final target X={final_rail_position:.3f}m."
+        )
+        try:
+            _command_rail_and_wait(node, final_rail_position, config)
+        except RuntimeConfigurationError as exc:
+            return _failure_result(
+                target,
+                f"Target was confirmed but final rail alignment failed: {exc}",
+                state="final_alignment",
+                detection=final_detection,
+                observations=observations,
+            )
         _persist_dynamic_coordinate_3d(
             config.paths.dynamic_semantic_coordinates,
             target,
@@ -1833,6 +1661,7 @@ def targeted_search(target_object: str) -> dict[str, object]:
             "rail_position": float(node.current_rail_position),
             "observations": observations,
             "coordinate_path": str(config.paths.dynamic_semantic_coordinates),
+            "approximate_coordinate_path": str(approximate_coordinate_path),
         }
     except Exception as exc:
         return _failure_result(
@@ -1846,7 +1675,6 @@ def targeted_search(target_object: str) -> dict[str, object]:
 def get_latest_ros_image(timeout_sec=10.0) -> str:
     node = get_shared_node()
     start = time.time()
-    print("Waiting for image from ROS 2 topic...")
     while node.latest_b64_image is None:
         # get_shared_node() already owns a background ROS spin thread.
         time.sleep(0.05)
@@ -1986,7 +1814,7 @@ def move_rail_to_object(target_object: str) -> str:
         elif clean_target in distances:
             target_offset_x = distances[clean_target]["x"]
         else:
-            return f"Error: '{target_object}' not found in map."
+            return json.dumps({"error": "object not present", "target_object": target_object})
             
         node = get_shared_node()
         
@@ -2031,7 +1859,42 @@ def move_rail_to_object(target_object: str) -> str:
                     "the Cartesian controller retained arm ownership."
                 )
             return f"{move_result} Successfully returned to {clean_target}. The arm is safely at 0.0 rad."
-        return f"{move_result} Arrived at static destination '{clean_target}'."
+            
+        target_info = distances.get(clean_target, {})
+        obj_global_y = target_info.get("y")
+        obj_global_z = target_info.get("z")
+
+        if obj_global_y is not None and obj_global_z is not None:
+            from targeted_scan_geometry import ScanPose, DeskTarget
+            
+            obj_y_base = -obj_global_y
+            obj_z_base = obj_global_z
+            
+            eef_x = 0.0
+            eef_y = -0.2 if obj_y_base < 0 else 0.2
+            eef_z = 0.5
+            
+            pose_req = ScanPose(x=eef_x, y=eef_y, z=eef_z, roll=3.14, pitch=-0.3, yaw=0.0)
+            target_req = DeskTarget(global_x=absolute_target, x=0.0, y=obj_y_base, z=obj_z_base)
+            
+            print(f"[MOVE_RAIL] Pointing wrist camera at '{clean_target}'...")
+            try:
+                look_pose = _camera_look_at_scan_pose(node, pose_req, target_req, config)
+                pose_completed = node.send_eef_pose(
+                    look_pose.x, look_pose.y, look_pose.z,
+                    look_pose.roll, look_pose.pitch, look_pose.yaw,
+                    timeout_sec=config.cartesian.command_timeout_sec,
+                    readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+                    tf_timeout_sec=config.cartesian.tf_timeout_sec,
+                    base_frame=config.cartesian.base_frame,
+                    eef_frame=config.cartesian.eef_frame,
+                )
+                if not pose_completed or not node.wait_for_eef_motion(0.0):
+                    print(f"[MOVE_RAIL] Warning: Could not complete look-at motion for '{clean_target}'.")
+            except Exception as e:
+                print(f"[MOVE_RAIL] Error computing/executing look-at pose: {e}")
+
+        return f"{move_result} Arrived at destination '{clean_target}' and pointed camera."
         
     except Exception as e:
         return f"Error executing navigation: {e}"

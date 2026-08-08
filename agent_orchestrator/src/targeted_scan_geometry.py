@@ -210,9 +210,9 @@ def close_view_tilt_poses(
     roll: float,
     pitch: float,
     z_delta: float = 0.05,
-    pitch_delta: float = 0.15,
+    pitch_delta: float = 0.30,
 ) -> list[ScanPose]:
-    """Return a small upper/lower head-tilt pair for close confirmation."""
+    """Return a small lower/upper head-tilt pair for close confirmation."""
     if not all(
         math.isfinite(value)
         for value in (standoff, height, roll, pitch, z_delta, pitch_delta)
@@ -227,15 +227,15 @@ def close_view_tilt_poses(
         close_view_pose(
             side=side,
             standoff=standoff,
-            height=height + z_delta,
+            height=height - z_delta,
             roll=roll,
-            pitch=pitch + pitch_delta,
+            pitch=pitch - pitch_delta,
         ),
         close_view_pose(
             side=side,
             standoff=standoff,
-            height=height - z_delta,
+            height=height + z_delta,
             roll=roll,
-            pitch=pitch - pitch_delta,
+            pitch=pitch + pitch_delta,
         ),
     ]

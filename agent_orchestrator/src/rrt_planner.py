@@ -22,6 +22,8 @@ import traceback
 import mplib
 import numpy as np
 import rclpy
+import ros_logger
+ros_logger.setup_ros_logging()
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Pose
 from rclpy.executors import ExternalShutdownException

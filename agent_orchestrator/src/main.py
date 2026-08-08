@@ -3,6 +3,10 @@ import time
 import re
 import rclpy
 import subprocess
+import argparse
+import ros_logger
+ros_logger.setup_ros_logging()
+
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 from config import load_runtime_config, set_runtime_config, validate_runtime_config
@@ -17,6 +21,10 @@ from config import load_runtime_config, set_runtime_config, validate_runtime_con
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--show-think", action="store_true", help="Do not filter out <think> tags from the terminal output")
+    args, _ = parser.parse_known_args()
+
     tools = None
     runtime_started = False
     ros_initialized = False
@@ -67,12 +75,18 @@ def main() -> int:
                         "You have the freedom to plan the necessary steps to complete the task.\n\n"
                         "CRITICAL PIPELINE RULES:\n"
                         "1. INITIALIZATION: You MUST call 'start_joint_controller' as your very first step to activate the robot hardware.\n"
-                        "2. HOMING & COMPLETION: When the task is complete, you MUST call 'move_rail_to_object' with target_object='home' to safely return the robot to its base, and immediately followed by 'finish_task' with a completion summary.\n\n"
+                        "2. REASONING & PLANNING: In your very first action's <think> block, you MUST explicitly list all items/objects concerned in the task. Before any pick or place script executes, every concerned object MUST have a known location and its physical presence MUST be visually confirmed via 'get_camera_frame'.\n"
+                        "3. PICK/PLACE ORDERING: The object to be manipulated (e.g., picked up) MUST be the LAST object confirmed so that the robot is physically positioned in front of it when the manipulation script is called.\n"
+                        "4. HOMING & COMPLETION: When the task is complete, or if it must be aborted, you MUST call 'move_rail_to_object' with target_object='home' to safely return the robot to its base, and immediately followed by 'finish_task' with a completion summary.\n\n"
+                        "OBJECT SEARCH & VERIFICATION WORKFLOW:\n"
+                        "To locate and verify any object, you MUST strictly follow this loop:\n"
+                        "  A. Call 'move_rail_to_object' to go to the object's known coordinates.\n"
+                        "  B. If (A) succeeds, call 'get_camera_frame' to visually confirm the object is actually in the frame. If it is in the frame, the object is confirmed! If it is not in the frame, proceed to (C).\n"
+                        "  C. If (A) returns an error (e.g., object location is unknown) OR if (B) fails (object not in frame), you MUST call 'targeted_search' for that object.\n"
+                        "  D. If 'targeted_search' finds it, the object is confirmed! If 'targeted_search' fails to find it, the object is missing. You must then abort the task and return home.\n\n"
                         "EXECUTION RULES:\n"
-                        "- You can call any other tools in the order you see fit (e.g., search, pick, navigate, place).\n"
                         "- Call exactly one tool per step.\n"
-                        "- move_eef_to_pose uses RRT with self-collision, joint-limit, and singularity validation; stop if planning or execution fails.\n"
-                        "- Stop immediately if any step fails."
+                        "- Stop immediately if any critical step fails without a fallback."
                     )),
                     HumanMessage(content=f"task: {user_task}")
                 ],
@@ -100,9 +114,10 @@ def main() -> int:
 
                 cleaned_content = msg.content
                 if isinstance(msg, AIMessage):
-                    cleaned_content = re.sub(r'<think>.*?</think>', '', cleaned_content, flags=re.DOTALL)
-                    if "\n\n" in cleaned_content and len(cleaned_content.split("\n\n")) > 1:
-                        cleaned_content = cleaned_content.split("\n\n")[-1]
+                    if not args.show_think:
+                        cleaned_content = re.sub(r'<think>.*?</think>', '', cleaned_content, flags=re.DOTALL)
+                        if "\n\n" in cleaned_content and len(cleaned_content.split("\n\n")) > 1:
+                            cleaned_content = cleaned_content.split("\n\n")[-1]
                 
                 cleaned_content = cleaned_content.strip()
                 if not cleaned_content or cleaned_content in seen_responses:

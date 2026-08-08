@@ -101,7 +101,7 @@ python3 "$PANDA_CONTROLLER" --ros-args \
     -p joint_command_topic:=/cartesian/joint_command \
     -p gripper_cmd_topic:=/gripper/command \
     -p controller_state_topic:=/panda/controller_state \
-    -p controller_ready_topic:=/panda/controller_ready &
+    -p controller_ready_topic:=/panda/controller_ready >> agent_ros.log 2>&1 &
 CARTESIAN_PID=$!
 
 cleanup() {
@@ -111,4 +111,4 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[+] Starting Robotic Task Orchestrator..."
-python3 agent_orchestrator/src/main.py
+python3 agent_orchestrator/src/main.py "$@"

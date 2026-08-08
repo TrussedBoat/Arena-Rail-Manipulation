@@ -24,7 +24,7 @@ VLM_MMPROJ_FILENAME = "mmproj-Qwen3VL-8B-Instruct-F16.gguf"
 VLM_MODEL_ALIAS     = "Qwen3VL-8B-Instruct-Q4_K_M"
 
 # --- YOLO checkpoint ---
-YOLO_CHECKPOINT_PATH: Path | None = PROJECT_ROOT / "agent_orchestrator/models/yolo11m.pt"
+YOLO_CHECKPOINT_PATH: Path | None = PROJECT_ROOT / "agent_orchestrator/models/yolo26x.pt"
 
 
 # --- VLM server settings ---
@@ -43,7 +43,7 @@ VLM_TOTAL_GPU_VRAM_GB      = 16.0
 VLM_SERVER_EXTRA_ARGS      = ""
 
 # --- YOLO settings ---
-YOLO_CONFIDENCE_THRESHOLD  = 0.85
+YOLO_CONFIDENCE_THRESHOLD  = 0.75
 YOLO_IMAGE_SIZE            = 640
 YOLO_DEVICE                = "cuda:0"
 YOLO_MAX_DETECTIONS        = 100
@@ -83,14 +83,14 @@ DEPTH_PATCH_RADIUS          = 2
 # --- RRT targeted-search scan ---
 TARGETED_SCAN_VIEWPOINTS        = 7
 TARGETED_CAPTURE_FPS            = 0.3 #lower it if the wrist camera is not able to capture fast enough
-TARGETED_CANDIDATE_CONFIDENCE   = 0.30
+TARGETED_CANDIDATE_CONFIDENCE   = 0.50
 TARGETED_DESK_WIDTH             = 1.0
 TARGETED_TABLE_SCAN_Y           = 0.75
 TARGETED_ARC_RADIUS             = 0.50
-TARGETED_SCAN_HEIGHT            = 0.70
 TARGETED_DESK_SURFACE_Z         = 0.0
+TARGETED_SCAN_HEIGHT            = 0.50
 TARGETED_SCAN_ROLL              = 3.14
-TARGETED_SCAN_PITCH             = -1.0
+TARGETED_SCAN_PITCH             = -0.3
 TARGETED_CLOSE_STANDOFF         = 0.30
 TARGETED_CANCEL_TIMEOUT_SEC     = 3.0
 
@@ -735,9 +735,9 @@ def validate_runtime_config(
             + ", ".join(conflicting_options)
         )
 
-    if config.yolo.confidence_threshold != 0.85:
+    if not (0.0 <= config.yolo.confidence_threshold <= 1.0):
         errors.append(
-            "YOLO confidence threshold must be exactly 0.85, got "
+            "YOLO confidence threshold must be between 0.0 and 1.0, got "
             f"{config.yolo.confidence_threshold}"
         )
     if config.yolo.image_size <= 0:

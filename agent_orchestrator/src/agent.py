@@ -16,7 +16,7 @@ from tools import (
     turn_panda_arm,
     home_panda_arm,
     move_rail_relative,
-    move_eef_to_pose,
+    get_latest_ros_image,
 )
 
 runtime_config = get_runtime_config()
@@ -44,10 +44,9 @@ tool_definitions = [
         "function": {
             "name": "targeted_search",
             "description": (
-                "RRT wrist-camera search over both desk rows. It runs YOLO during inward "
-                "arc motions, safely stops on a candidate, depth-localizes it, and saves "
-                "coordinates only after a high-confidence closer look. If both sides fail "
-                "from the current rail position, it retries at rail centre. "
+                "RRT wrist-camera search over both desk rows. Use this as the primary fallback "
+                "when 'move_rail_to_object' fails (object unknown) OR when 'get_camera_frame' "
+                "visual verification fails. If this tool fails, the object is missing and you MUST abort. "
                 "Pass one normalized canonical label such as 'apple'."
             ),
             "parameters": {
@@ -89,7 +88,7 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "execute_pick_script",
-            "description": "Execute the physical picking motion to grab the target object. Only use this if the user explicitly asked to pick something up.",
+            "description": "Execute the physical picking motion. You MUST be looking at the object and have successfully verified its presence via 'get_camera_frame' before calling this.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -107,7 +106,7 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "move_rail_to_object",
-            "description": "Move the robot's base rail to the location of a known object (e.g. 'apple', 'purple bowl', or 'home'). Use this to approach an object.",
+            "description": "Move the robot's base rail to the known location of an object. If it succeeds, you MUST next call 'get_camera_frame' to verify. If it errors (unknown object), you MUST fallback to 'targeted_search'.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -143,7 +142,7 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "execute_place_script",
-            "description": "Execute the physical placing motion to drop a held object at the current location.",
+            "description": "Execute the physical placing motion to drop a held object. You MUST have already verified the location of the placement destination before beginning the task.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -191,24 +190,12 @@ tool_definitions = [
     {
         "type": "function",
         "function": {
-            "name": "move_eef_to_pose",
-            "description": (
-                "Plan and execute a self-collision-free RRT motion for the Franka end "
-                "effector to an absolute pose relative to panda_link0. XYZ values are "
-                "metres and roll/pitch/yaw are radians. The plan is rejected if it violates "
-                "joint limits or the configured singularity threshold."
-            ),
+            "name": "get_camera_frame",
+            "description": "Get the current camera frame. You MUST use this to visually verify the presence of an object after moving to its suspected location and before manipulating it.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "x": {"type": "number", "description": "EEF X position in metres."},
-                    "y": {"type": "number", "description": "EEF Y position in metres."},
-                    "z": {"type": "number", "description": "EEF Z position in metres."},
-                    "roll": {"type": "number", "description": "Roll in radians."},
-                    "pitch": {"type": "number", "description": "Pitch in radians."},
-                    "yaw": {"type": "number", "description": "Yaw in radians."},
-                },
-                "required": ["x", "y", "z", "roll", "pitch", "yaw"],
+                "properties": {},
+                "required": [],
                 "additionalProperties": False,
             },
         },
@@ -233,6 +220,12 @@ tool_definitions = [
     }
 ]
 
+for t in tool_definitions:
+    t["function"]["parameters"]["properties"]["thought"] = {
+        "type": "string",
+        "description": "Mandatory step-by-step logical reasoning and verification before taking this action. Output your thoughts wrapped in <think> tags."
+    }
+    t["function"]["parameters"]["required"].append("thought")
 llm = ChatOpenAI(
     base_url=runtime_config.vlm.api_base_url,
     api_key="not-needed",
@@ -276,14 +269,7 @@ tools_impl = {
         args.get("target_rad")
     ),
     "home_panda_arm": lambda _: home_panda_arm(),
-    "move_eef_to_pose": lambda args: move_eef_to_pose(
-        args.get("x"),
-        args.get("y"),
-        args.get("z"),
-        args.get("roll"),
-        args.get("pitch"),
-        args.get("yaw"),
-    ),
+    "get_camera_frame": lambda _: get_latest_ros_image(timeout_sec=10.0),
     "finish_task": lambda args: {
         "status": "success",
         "success": True,
@@ -337,7 +323,7 @@ def _format_tool_result(result: object) -> str:
     return str(result)
 
 
-def _tool_message(tool_call: dict, content: str, index: int = 0) -> ToolMessage:
+def _tool_message(tool_call: dict, content: any, index: int = 0) -> ToolMessage:
     tool_call_id = str(tool_call.get("id") or f"pipeline_call_{index}")
     return ToolMessage(content=content, tool_call_id=tool_call_id)
 
@@ -414,6 +400,15 @@ def execute_tools(state: AgentState) -> dict:
         )
 
     try:
+        import sys
+        import re
+        if "--show-think" in sys.argv:
+            thought = arguments.get("thought", "")
+            if thought:
+                # Optionally strip the actual tags if they were included
+                thought = re.sub(r'</?think>', '', thought).strip()
+                print(f"\n[AI THOUGHT]:\n{thought}")
+        
         print(f"\n[TOOL TRIGGERED]: Executing function {tool_name!r}...")
         raw_result = tools_impl[tool_name](arguments)
         print(f"[TOOL COMPLETED]: {tool_name!r} execution completed.")
@@ -425,7 +420,14 @@ def execute_tools(state: AgentState) -> dict:
             reason,
         )
 
-    result_message = _tool_message(tool_call, _format_tool_result(raw_result))
+    if tool_name == "get_camera_frame" and isinstance(raw_result, str) and len(raw_result) > 1000:
+        content = [
+            {"type": "text", "text": "Here is the camera frame:"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{raw_result}"}}
+        ]
+        result_message = _tool_message(tool_call, content)
+    else:
+        result_message = _tool_message(tool_call, _format_tool_result(raw_result))
     if not _tool_result_succeeded(tool_name, raw_result):
         reason = f"{tool_name} failed: {_format_tool_result(raw_result)}"
         return _failed_update(state, [result_message], reason)

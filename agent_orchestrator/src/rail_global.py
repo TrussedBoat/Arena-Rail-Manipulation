@@ -12,6 +12,8 @@ from __future__ import annotations
 import math
 
 import rclpy
+import ros_logger
+ros_logger.setup_ros_logging()
 from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
 from rclpy.qos import (
