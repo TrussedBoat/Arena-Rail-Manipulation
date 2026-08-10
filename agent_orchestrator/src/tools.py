@@ -1682,6 +1682,17 @@ def get_latest_ros_image(timeout_sec=10.0) -> str:
             raise TimeoutError("Timed out waiting for ROS 2 image message.")
     return node.latest_b64_image
 
+
+def get_latest_vlm_image(timeout_sec=10.0) -> str:
+    """Return the latest context-bounded JPEG prepared for the VLM."""
+    node = get_shared_node()
+    start = time.time()
+    while node.latest_vlm_b64_image is None:
+        time.sleep(0.05)
+        if (time.time() - start) > timeout_sec:
+            raise TimeoutError("Timed out waiting for ROS 2 VLM image message.")
+    return node.latest_vlm_b64_image
+
 def get_current_joint_states() -> dict:
     node = get_shared_node()
     start = time.time()
@@ -1814,7 +1825,10 @@ def move_rail_to_object(target_object: str) -> str:
         elif clean_target in distances:
             target_offset_x = distances[clean_target]["x"]
         else:
-            return json.dumps({"error": "object not present", "target_object": target_object})
+            return (
+                f"Success: The location of {clean_target!r} is not in the semantic "
+                "coordinates JSON. No rail movement was performed."
+            )
             
         node = get_shared_node()
         

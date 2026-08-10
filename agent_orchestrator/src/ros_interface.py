@@ -18,6 +18,7 @@ from geometry_msgs.msg import Pose
 from scipy.spatial.transform import Rotation
 
 _shared_node = None
+VLM_CAMERA_MAX_SIDE_PX = 256
 
 def get_shared_node():
     global _shared_node
@@ -69,6 +70,7 @@ class RobotHardwareInterface(Node):
         
         self.bridge = CvBridge()
         self.latest_b64_image = None
+        self.latest_vlm_b64_image = None
         self.latest_depth_image = None  # raw numpy float32 depth frame (metres)
         self.current_rail_position = None
         self.current_panda_joint1 = None
@@ -262,8 +264,29 @@ class RobotHardwareInterface(Node):
     def image_callback(self, msg):
         try:
             cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            _, buffer = cv2.imencode('.png', cv_img)
+            encoded, buffer = cv2.imencode(
+                ".jpg", cv_img, [cv2.IMWRITE_JPEG_QUALITY, 90]
+            )
+            if not encoded:
+                raise RuntimeError("OpenCV could not JPEG-encode the camera frame")
             self.latest_b64_image = base64.b64encode(buffer).decode('utf-8')
+
+            height, width = cv_img.shape[:2]
+            longest_side = max(height, width)
+            vlm_img = cv_img
+            if longest_side > VLM_CAMERA_MAX_SIDE_PX:
+                scale = VLM_CAMERA_MAX_SIDE_PX / longest_side
+                vlm_img = cv2.resize(
+                    cv_img,
+                    (round(width * scale), round(height * scale)),
+                    interpolation=cv2.INTER_AREA,
+                )
+            encoded, buffer = cv2.imencode(
+                ".jpg", vlm_img, [cv2.IMWRITE_JPEG_QUALITY, 90]
+            )
+            if not encoded:
+                raise RuntimeError("OpenCV could not JPEG-encode the VLM camera frame")
+            self.latest_vlm_b64_image = base64.b64encode(buffer).decode('utf-8')
         except Exception as e:
             self.get_logger().error(f"Image processing exception: {e}")
 

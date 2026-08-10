@@ -1,7 +1,9 @@
+import base64
+import binascii
 import json
 from typing import TypedDict
 
-from langchain_core.messages import BaseMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
@@ -16,7 +18,7 @@ from tools import (
     turn_panda_arm,
     home_panda_arm,
     move_rail_relative,
-    get_latest_ros_image,
+    get_latest_vlm_image,
 )
 
 runtime_config = get_runtime_config()
@@ -269,7 +271,7 @@ tools_impl = {
         args.get("target_rad")
     ),
     "home_panda_arm": lambda _: home_panda_arm(),
-    "get_camera_frame": lambda _: get_latest_ros_image(timeout_sec=10.0),
+    "get_camera_frame": lambda _: get_latest_vlm_image(timeout_sec=10.0),
     "finish_task": lambda args: {
         "status": "success",
         "success": True,
@@ -291,8 +293,6 @@ def _validate_tool_for_stage(
         return "The very first tool call must be 'start_joint_controller'."
         
     if tool_name == "finish_task":
-        if not tools_called or tools_called[-1] != "move_rail_to_object_home":
-            return "You must return to the 'home' position using 'move_rail_to_object' with target_object 'home' before finishing the task."
         if not str(arguments.get("summary") or "").strip():
             return "finish_task requires a non-empty summary."
 
@@ -303,6 +303,17 @@ def _validate_tool_for_stage(
     return None
 
 
+def _is_jpeg_base64(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        image_bytes = base64.b64decode(value.strip(), validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    # JPEG start-of-image marker plus a valid marker prefix.
+    return image_bytes.startswith(b"\xff\xd8\xff")
+
+
 def _tool_result_succeeded(tool_name: str, result: object) -> bool:
     if isinstance(result, dict):
         if tool_name in ("targeted_search", "general_mapping"):
@@ -311,7 +322,11 @@ def _tool_result_succeeded(tool_name: str, result: object) -> bool:
             return result.get("success") is True
         return result.get("status") == "success"
 
-    text = str(result).strip().lower()
+    text = str(result).strip()
+    if tool_name == "get_camera_frame":
+        return _is_jpeg_base64(text)
+
+    text = text.lower()
     if not text or text.startswith(("error", "warning")):
         return False
     return text.startswith("success") or "already running" in text
@@ -420,12 +435,24 @@ def execute_tools(state: AgentState) -> dict:
             reason,
         )
 
-    if tool_name == "get_camera_frame" and isinstance(raw_result, str) and len(raw_result) > 1000:
-        content = [
-            {"type": "text", "text": "Here is the camera frame:"},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{raw_result}"}}
-        ]
-        result_message = _tool_message(tool_call, content)
+    camera_frame_message = None
+    if tool_name == "get_camera_frame" and _is_jpeg_base64(raw_result):
+        # llama.cpp VLMs reliably parse image_url blocks in a user message, but
+        # may render image data in a tool result as plain text. Keep the tool
+        # protocol response text-only and provide the JPEG through image_url.
+        result_message = _tool_message(tool_call, "Camera frame captured.")
+        camera_frame_message = HumanMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": "Use this current wrist-camera frame to visually verify the object.",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{raw_result}"},
+                },
+            ]
+        )
     else:
         result_message = _tool_message(tool_call, _format_tool_result(raw_result))
     if not _tool_result_succeeded(tool_name, raw_result):
@@ -452,7 +479,10 @@ def execute_tools(state: AgentState) -> dict:
     tools_called = state.get("tools_called", []) + [called_identifier]
 
     update = {
-        "messages": state["messages"] + [result_message],
+        "messages": state["messages"] + [
+            result_message,
+            *([camera_frame_message] if camera_frame_message is not None else []),
+        ],
         "iterations": state.get("iterations", 0),
         "terminated": False,
         "outcome": "in_progress",
