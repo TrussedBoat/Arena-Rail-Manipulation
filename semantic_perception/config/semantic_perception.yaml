@@ -1,0 +1,62 @@
+semantic_perception:
+  ros__parameters:
+    topics:
+      color: /sim/rail_franka1/cam/wrist/color/image_raw
+      aligned_depth: /sim/rail_franka1/cam/wrist/depth/image_raw
+    camera:
+      fx: 907.00
+      fy: 905.69
+      cx: 567.74
+      cy: 488.32
+      image_width: 1280
+      image_height: 720
+      # Image headers use sim_camera, while the robot TF tree uses wrist_camera.
+      tf_frame_override: wrist_camera
+    reference_frame: global_origin
+    processing_rate_hz: 5.0
+    sync:
+      queue_size: 8
+      slop_sec: 0.05
+    tf_timeout_sec: 0.2
+    tf:
+      # Simulator RGB frames use wall time while robot TF uses simulation time.
+      fallback_to_latest: true
+    detector:
+      backend: ultralytics
+      model_path: ""
+      device: cuda:0
+      image_size: 640
+      confidence_threshold: 0.50
+      max_detections: 100
+      max_bbox_area_fraction: 0.55
+    depth:
+      scale_16uc1: 0.001
+      inner_bbox_fraction: 0.5
+      minimum_valid_pixels: 20
+      minimum_m: 0.05
+      maximum_m: 5.0
+    association:
+      mahalanobis_threshold: 11.345
+    filter:
+      confirmation_hits: 3
+      confirmation_window_sec: 3.0
+      stale_after_sec: 300.0
+    class:
+      confirmation_probability: 0.70
+      max_explicit_classes: 4
+      evidence_decay: 0.95
+    uncertainty:
+      pixel_stddev_px: 2.0
+      extrinsic_stddev_m: 0.005
+      world_stddev_m: 0.005
+      process_noise_stddev_m: 0.002
+    registry:
+      path: semantic_objects.json
+      legacy_coordinates_path: semantic_distances_dynamic.json
+      write_legacy_coordinates: false
+      persistence_interval_sec: 1.0
+    search:
+      default_timeout_sec: 30.0
+    debug:
+      publish_annotated: false
+      annotated_topic: /semantic/debug/yolo

@@ -1,0 +1,11 @@
+semantic_perception:
+  ros__parameters:
+    camera:
+      # Set this to the camera frame available in the real robot's TF tree.
+      # Empty means use the image header frame_id.
+      tf_frame_override: ""
+    uncertainty:
+      pixel_stddev_px: 2.0
+      extrinsic_stddev_m: 0.015
+      world_stddev_m: 0.010
+      process_noise_stddev_m: 0.003

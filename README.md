@@ -18,6 +18,9 @@ A high-fidelity simulation environment for the **Home Robotics Arena**, built on
 ### 🎥 Multimedia & Vision
 - **TV Streaming**: Dynamically project any ROS 2 image topic onto the wall-mounted TV.
 - **Multi-Camera Setup**: Integrated Franka wrist cameras, side cameras, and pick-and-place perspectives.
+- **Semantic Perception**: Synchronized RGB-D detection, timestamped TF localization,
+  object-presence filtering, and persistent semantic mapping. See
+  [`semantic_perception/README.md`](semantic_perception/README.md).
 
 ### 🛠️ Developer Tools
 - **Modular Architecture**: Clean separation between ROS nodes, UI, and device configurations.
@@ -38,6 +41,7 @@ scripts/
 ├── arena.py            # Simulation entry point
 ├── arena_controller.py # Interactive CLI controller
 └── start_arena.sh      # Unified startup script
+semantic_perception/    # RGB-D detector, tracker, registry, and ROS APIs
 ```
 
 ---

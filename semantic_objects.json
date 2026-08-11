@@ -1,0 +1,1233 @@
+{
+  "objects": [
+    {
+      "class_distribution": {
+        "bed": 0.405863,
+        "other": 0.454244,
+        "refrigerator": 0.139893
+      },
+      "class_evidence_weight": 14.729598,
+      "class_name": "unknown",
+      "class_probability": 0.454244,
+      "confidence": 0.454244,
+      "first_seen": "2026-08-11T14:21:35.470340Z",
+      "id": "object_001",
+      "last_seen": "2026-08-11T14:35:39.664160Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 26,
+      "position": {
+        "x": -1.415876,
+        "y": -0.009778,
+        "z": -0.015531
+      },
+      "position_covariance": [
+        0.0008098857,
+        -5e-10,
+        -1.835e-07,
+        -5e-10,
+        0.0008098655,
+        7.9e-09,
+        -1.835e-07,
+        7.9e-09,
+        0.0008112837
+      ],
+      "position_stddev_m": 0.028483,
+      "state": "candidate"
+    },
+    {
+      "class_distribution": {
+        "bench": 0.052251,
+        "book": 0.027962,
+        "chair": 0.439285,
+        "keyboard": 0.160166,
+        "other": 0.320336
+      },
+      "class_evidence_weight": 10.734175,
+      "class_name": "chair",
+      "class_probability": 0.439285,
+      "confidence": 0.439285,
+      "first_seen": "2026-08-11T14:21:46.159425Z",
+      "id": "object_002",
+      "last_seen": "2026-08-11T14:25:03.379929Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 15,
+      "position": {
+        "x": -0.770079,
+        "y": -1.301914,
+        "z": -0.102697
+      },
+      "position_covariance": [
+        0.0008797651,
+        5.623e-07,
+        1.27e-08,
+        5.623e-07,
+        0.0009413225,
+        7.88835e-05,
+        1.27e-08,
+        7.88835e-05,
+        0.000934626
+      ],
+      "position_stddev_m": 0.030681,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "banana": 0.009873,
+        "chair": 0.038508,
+        "laptop": 0.362451,
+        "other": 0.277428,
+        "remote": 0.311741
+      },
+      "class_evidence_weight": 14.729598,
+      "class_name": "laptop",
+      "class_probability": 0.362451,
+      "confidence": 0.362451,
+      "first_seen": "2026-08-11T14:21:59.731705Z",
+      "id": "object_003",
+      "last_seen": "2026-08-11T14:25:48.548423Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 26,
+      "position": {
+        "x": 0.466211,
+        "y": -0.783219,
+        "z": 0.059292
+      },
+      "position_covariance": [
+        0.0008222631,
+        -7.1048e-06,
+        -1.20817e-05,
+        -7.1048e-06,
+        0.0008192033,
+        1.60073e-05,
+        -1.20817e-05,
+        1.60073e-05,
+        0.0008377109
+      ],
+      "position_stddev_m": 0.028943,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "bowl": 0.069682,
+        "cup": 0.580989,
+        "other": 0.344795,
+        "spoon": 0.004534
+      },
+      "class_evidence_weight": 19.356555,
+      "class_name": "cup",
+      "class_probability": 0.580989,
+      "confidence": 0.580989,
+      "first_seen": "2026-08-11T14:22:10.290636Z",
+      "id": "object_004",
+      "last_seen": "2026-08-11T14:27:11.577915Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 67,
+      "position": {
+        "x": 1.265424,
+        "y": 0.430618,
+        "z": 0.063961
+      },
+      "position_covariance": [
+        0.0008405033,
+        6.6511e-06,
+        -3.26552e-05,
+        6.6511e-06,
+        0.0008074574,
+        -6.3906e-06,
+        -3.26552e-05,
+        -6.3906e-06,
+        0.0008371906
+      ],
+      "position_stddev_m": 0.028991,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "apple": 0.14381,
+        "laptop": 0.019339,
+        "other": 0.330565,
+        "sink": 0.506286
+      },
+      "class_evidence_weight": 19.686208,
+      "class_name": "sink",
+      "class_probability": 0.506286,
+      "confidence": 0.506286,
+      "first_seen": "2026-08-11T14:22:15.855197Z",
+      "id": "object_005",
+      "last_seen": "2026-08-11T14:25:45.066676Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 81,
+      "position": {
+        "x": 1.297394,
+        "y": -0.61434,
+        "z": 0.105542
+      },
+      "position_covariance": [
+        0.0009928946,
+        -9.28501e-05,
+        -0.0001476442,
+        -9.28501e-05,
+        0.0008528027,
+        7.37801e-05,
+        -0.0001476442,
+        7.37801e-05,
+        0.0009239361
+      ],
+      "position_stddev_m": 0.03151,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "bowl": 0.108592,
+        "cup": 0.170227,
+        "other": 0.372441,
+        "scissors": 0.221418,
+        "spoon": 0.127322
+      },
+      "class_evidence_weight": 7.395012,
+      "class_name": "unknown",
+      "class_probability": 0.372441,
+      "confidence": 0.372441,
+      "first_seen": "2026-08-11T14:22:33.341437Z",
+      "id": "object_006",
+      "last_seen": "2026-08-11T14:27:13.959973Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 9,
+      "position": {
+        "x": 1.123474,
+        "y": 0.462883,
+        "z": 0.061928
+      },
+      "position_covariance": [
+        0.0011210706,
+        1.67692e-05,
+        -5.09435e-05,
+        1.67692e-05,
+        0.0010507321,
+        -1.03928e-05,
+        -5.09435e-05,
+        -1.03928e-05,
+        0.0010832511
+      ],
+      "position_stddev_m": 0.033482,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "laptop": 0.174035,
+        "other": 0.333611,
+        "sink": 0.338238,
+        "spoon": 0.154115
+      },
+      "class_evidence_weight": 3.709875,
+      "class_name": "sink",
+      "class_probability": 0.338238,
+      "confidence": 0.338238,
+      "first_seen": "2026-08-11T14:22:39.241712Z",
+      "id": "object_007",
+      "last_seen": "2026-08-11T14:24:00.293066Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 4,
+      "position": {
+        "x": 1.274261,
+        "y": -0.122058,
+        "z": 0.304462
+      },
+      "position_covariance": [
+        0.0035342436,
+        -0.0002725337,
+        -0.0002933128,
+        -0.0002725337,
+        0.0019713333,
+        4.9533e-05,
+        -0.0002933128,
+        4.9533e-05,
+        0.0019681776
+      ],
+      "position_stddev_m": 0.05945,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "bird": 0.109695,
+        "cell_phone": 0.161138,
+        "laptop": 0.222774,
+        "other": 0.368298,
+        "remote": 0.138095
+      },
+      "class_evidence_weight": 4.524381,
+      "class_name": "unknown",
+      "class_probability": 0.368298,
+      "confidence": 0.368298,
+      "first_seen": "2026-08-11T14:22:39.241712Z",
+      "id": "object_008",
+      "last_seen": "2026-08-11T14:25:54.175585Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 5,
+      "position": {
+        "x": 0.012303,
+        "y": -0.638521,
+        "z": -0.013375
+      },
+      "position_covariance": [
+        0.001659062,
+        -5.81155e-05,
+        -8.35553e-05,
+        -5.81155e-05,
+        0.0016304762,
+        9.17304e-05,
+        -8.35553e-05,
+        9.17304e-05,
+        0.0017563283
+      ],
+      "position_stddev_m": 0.041909,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "other": 0.356872,
+        "oven": 0.643128
+      },
+      "class_evidence_weight": 1.0,
+      "class_name": "oven",
+      "class_probability": 0.643128,
+      "confidence": 0.643128,
+      "first_seen": "2026-08-11T14:22:41.520271Z",
+      "id": "object_009",
+      "last_seen": "2026-08-11T14:22:41.520271Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 1,
+      "position": {
+        "x": -1.284962,
+        "y": -1.875785,
+        "z": -1.018839
+      },
+      "position_covariance": [
+        0.0075281519,
+        0.002322099,
+        0.0026033407,
+        0.002322099,
+        0.0319567633,
+        0.0276231698,
+        0.0026033407,
+        0.0276231698,
+        0.0382802109
+      ],
+      "position_stddev_m": 0.195653,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "book": 0.712318,
+        "clock": 0.007282,
+        "other": 0.2804
+      },
+      "class_evidence_weight": 16.12577,
+      "class_name": "book",
+      "class_probability": 0.712318,
+      "confidence": 0.712318,
+      "first_seen": "2026-08-11T14:22:42.301287Z",
+      "id": "object_010",
+      "last_seen": "2026-08-11T14:25:00.955465Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 32,
+      "position": {
+        "x": -0.86755,
+        "y": -0.843014,
+        "z": 0.014466
+      },
+      "position_covariance": [
+        0.0008544513,
+        2.52708e-05,
+        4.17299e-05,
+        2.52708e-05,
+        0.0008208277,
+        2.23466e-05,
+        4.17299e-05,
+        2.23466e-05,
+        0.0008441074
+      ],
+      "position_stddev_m": 0.029231,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "clock": 0.54491,
+        "other": 0.359077,
+        "refrigerator": 0.096013
+      },
+      "class_evidence_weight": 4.524381,
+      "class_name": "clock",
+      "class_probability": 0.54491,
+      "confidence": 0.54491,
+      "first_seen": "2026-08-11T14:22:50.089557Z",
+      "id": "object_011",
+      "last_seen": "2026-08-11T14:27:46.134566Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 5,
+      "position": {
+        "x": -1.274026,
+        "y": -0.292403,
+        "z": -0.294272
+      },
+      "position_covariance": [
+        0.0016076607,
+        7.36014e-05,
+        0.0002199872,
+        7.36014e-05,
+        0.0017568165,
+        0.0005360177,
+        0.0002199872,
+        0.0005360177,
+        0.0031781238
+      ],
+      "position_stddev_m": 0.056375,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "keyboard": 0.004893,
+        "laptop": 0.870544,
+        "other": 0.124563
+      },
+      "class_evidence_weight": 18.746557,
+      "class_name": "laptop",
+      "class_probability": 0.870544,
+      "confidence": 0.870544,
+      "first_seen": "2026-08-11T14:22:56.406677Z",
+      "id": "object_012",
+      "last_seen": "2026-08-11T14:26:25.585255Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 54,
+      "position": {
+        "x": -1.077412,
+        "y": 0.678397,
+        "z": 0.033181
+      },
+      "position_covariance": [
+        0.0009724392,
+        -4.46331e-05,
+        0.0001040195,
+        -4.46331e-05,
+        0.0008184392,
+        -2.78027e-05,
+        0.0001040195,
+        -2.78027e-05,
+        0.0008720288
+      ],
+      "position_stddev_m": 0.031184,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "chair": 0.005634,
+        "mouse": 0.043967,
+        "other": 0.210618,
+        "person": 0.00416,
+        "remote": 0.735622
+      },
+      "class_evidence_weight": 17.429757,
+      "class_name": "remote",
+      "class_probability": 0.735622,
+      "confidence": 0.735622,
+      "first_seen": "2026-08-11T14:23:09.545894Z",
+      "id": "object_013",
+      "last_seen": "2026-08-11T14:26:26.435667Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 40,
+      "position": {
+        "x": -0.719569,
+        "y": 0.950437,
+        "z": 0.049827
+      },
+      "position_covariance": [
+        0.0008103306,
+        -3.3847e-06,
+        4.0804e-06,
+        -3.3847e-06,
+        0.0008091421,
+        -3.4534e-06,
+        4.0804e-06,
+        -3.4534e-06,
+        0.0008103845
+      ],
+      "position_stddev_m": 0.028467,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "bench": 0.21178,
+        "chair": 0.405026,
+        "other": 0.383194
+      },
+      "class_evidence_weight": 6.731591,
+      "class_name": "chair",
+      "class_probability": 0.405026,
+      "confidence": 0.405026,
+      "first_seen": "2026-08-11T14:23:11.964154Z",
+      "id": "object_014",
+      "last_seen": "2026-08-11T14:26:24.546698Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 8,
+      "position": {
+        "x": -0.886738,
+        "y": 1.434991,
+        "z": -0.091186
+      },
+      "position_covariance": [
+        0.0013249787,
+        -0.0002545583,
+        0.0001898706,
+        -0.0002545583,
+        0.0014354218,
+        -0.0002384822,
+        0.0001898706,
+        -0.0002384822,
+        0.0012983578
+      ],
+      "position_stddev_m": 0.037887,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "bowl": 0.524617,
+        "dining_table": 0.145047,
+        "frisbee": 0.114613,
+        "other": 0.215723
+      },
+      "class_evidence_weight": 15.481289,
+      "class_name": "bowl",
+      "class_probability": 0.524617,
+      "confidence": 0.524617,
+      "first_seen": "2026-08-11T14:23:22.422019Z",
+      "id": "object_015",
+      "last_seen": "2026-08-11T14:26:40.413477Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 29,
+      "position": {
+        "x": 0.359973,
+        "y": 0.526633,
+        "z": 0.139798
+      },
+      "position_covariance": [
+        0.0009771956,
+        7.18207e-05,
+        -7.32384e-05,
+        7.18207e-05,
+        0.000839066,
+        -3.07152e-05,
+        -7.32384e-05,
+        -3.07152e-05,
+        0.0008431787
+      ],
+      "position_stddev_m": 0.03126,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "dining_table": 0.554861,
+        "other": 0.445139
+      },
+      "class_evidence_weight": 1.0,
+      "class_name": "dining_table",
+      "class_probability": 0.554861,
+      "confidence": 0.554861,
+      "first_seen": "2026-08-11T14:23:24.120934Z",
+      "id": "object_016",
+      "last_seen": "2026-08-11T14:23:24.120934Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 1,
+      "position": {
+        "x": 0.542613,
+        "y": -0.228147,
+        "z": 0.036327
+      },
+      "position_covariance": [
+        0.0146735547,
+        -0.0035620074,
+        -0.0032571671,
+        -0.0035620074,
+        0.009030155,
+        0.0015771968,
+        -0.0032571671,
+        0.0015771968,
+        0.0087476634
+      ],
+      "position_stddev_m": 0.121134,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "bowl": 0.311507,
+        "frisbee": 0.482147,
+        "other": 0.206346
+      },
+      "class_evidence_weight": 18.925329,
+      "class_name": "frisbee",
+      "class_probability": 0.482147,
+      "confidence": 0.482147,
+      "first_seen": "2026-08-11T14:23:28.265774Z",
+      "id": "object_017",
+      "last_seen": "2026-08-11T14:27:18.013022Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 57,
+      "position": {
+        "x": 0.162365,
+        "y": 0.466704,
+        "z": 0.05903
+      },
+      "position_covariance": [
+        0.000806717,
+        7.785e-07,
+        -1.758e-06,
+        7.785e-07,
+        0.0008068857,
+        -1.7536e-06,
+        -1.758e-06,
+        -1.7536e-06,
+        0.0008128145
+      ],
+      "position_stddev_m": 0.02851,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "chair": 0.904909,
+        "other": 0.095091
+      },
+      "class_evidence_weight": 18.538045,
+      "class_name": "chair",
+      "class_probability": 0.904909,
+      "confidence": 0.904909,
+      "first_seen": "2026-08-11T14:23:28.265774Z",
+      "id": "object_018",
+      "last_seen": "2026-08-11T14:27:11.577915Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 51,
+      "position": {
+        "x": 1.489206,
+        "y": 1.312926,
+        "z": -0.03268
+      },
+      "position_covariance": [
+        0.000921065,
+        0.0001273917,
+        -9.25917e-05,
+        0.0001273917,
+        0.0009478485,
+        -0.0001029604,
+        -9.25917e-05,
+        -0.0001029604,
+        0.0008814054
+      ],
+      "position_stddev_m": 0.030787,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "chair": 0.882287,
+        "other": 0.117713
+      },
+      "class_evidence_weight": 5.298162,
+      "class_name": "chair",
+      "class_probability": 0.882287,
+      "confidence": 0.882287,
+      "first_seen": "2026-08-11T14:23:59.065181Z",
+      "id": "object_019",
+      "last_seen": "2026-08-11T14:27:14.780879Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 6,
+      "position": {
+        "x": 0.925073,
+        "y": 1.530626,
+        "z": -0.278336
+      },
+      "position_covariance": [
+        0.0014638266,
+        0.0001906131,
+        -0.0001593537,
+        0.0001906131,
+        0.0017380252,
+        -0.0003093079,
+        -0.0001593537,
+        -0.0003093079,
+        0.0016253813
+      ],
+      "position_stddev_m": 0.04169,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "clock": 0.615967,
+        "other": 0.384033
+      },
+      "class_evidence_weight": 2.8525,
+      "class_name": "clock",
+      "class_probability": 0.615967,
+      "confidence": 0.615967,
+      "first_seen": "2026-08-11T14:24:19.943038Z",
+      "id": "object_020",
+      "last_seen": "2026-08-11T14:24:21.267395Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 3,
+      "position": {
+        "x": -1.221112,
+        "y": 0.338697,
+        "z": -0.518214
+      },
+      "position_covariance": [
+        0.0025640135,
+        -0.0001765398,
+        0.0005392303,
+        -0.0001765398,
+        0.002910734,
+        -0.0012852564,
+        0.0005392303,
+        -0.0012852564,
+        0.0064138871
+      ],
+      "position_stddev_m": 0.080087,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "clock": 0.680925,
+        "other": 0.319075
+      },
+      "class_evidence_weight": 8.623998,
+      "class_name": "clock",
+      "class_probability": 0.680925,
+      "confidence": 0.680925,
+      "first_seen": "2026-08-11T14:24:29.779018Z",
+      "id": "object_021",
+      "last_seen": "2026-08-11T14:27:30.934039Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 11,
+      "position": {
+        "x": -0.508309,
+        "y": -0.225894,
+        "z": -0.018084
+      },
+      "position_covariance": [
+        0.0009478547,
+        1.2521e-06,
+        3.6801e-06,
+        1.2521e-06,
+        0.0009504581,
+        9.069e-06,
+        3.6801e-06,
+        9.069e-06,
+        0.0009738636
+      ],
+      "position_stddev_m": 0.031207,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "clock": 0.632235,
+        "other": 0.367765
+      },
+      "class_evidence_weight": 5.298162,
+      "class_name": "clock",
+      "class_probability": 0.632235,
+      "confidence": 0.632235,
+      "first_seen": "2026-08-11T14:24:29.779018Z",
+      "id": "object_022",
+      "last_seen": "2026-08-11T14:27:32.128011Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 6,
+      "position": {
+        "x": -0.677769,
+        "y": 0.343061,
+        "z": -0.518679
+      },
+      "position_covariance": [
+        0.0013701832,
+        -1.432e-05,
+        4.33104e-05,
+        -1.432e-05,
+        0.0013989501,
+        -0.0001048835,
+        4.33104e-05,
+        -0.0001048835,
+        0.0016805893
+      ],
+      "position_stddev_m": 0.040995,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "clock": 0.237223,
+        "other": 0.333208,
+        "refrigerator": 0.429569
+      },
+      "class_evidence_weight": 8.623998,
+      "class_name": "refrigerator",
+      "class_probability": 0.429569,
+      "confidence": 0.429569,
+      "first_seen": "2026-08-11T14:24:33.916495Z",
+      "id": "object_023",
+      "last_seen": "2026-08-11T14:27:30.934039Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 11,
+      "position": {
+        "x": -0.326166,
+        "y": 0.26151,
+        "z": 0.042556
+      },
+      "position_covariance": [
+        0.000947328,
+        -8.7e-08,
+        1.617e-07,
+        -8.7e-08,
+        0.0009480406,
+        -1.3201e-06,
+        1.617e-07,
+        -1.3201e-06,
+        0.0009495864
+      ],
+      "position_stddev_m": 0.030815,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "chair": 0.845735,
+        "other": 0.154265
+      },
+      "class_evidence_weight": 12.055714,
+      "class_name": "chair",
+      "class_probability": 0.845735,
+      "confidence": 0.845735,
+      "first_seen": "2026-08-11T14:24:43.900306Z",
+      "id": "object_024",
+      "last_seen": "2026-08-11T14:24:54.744079Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 18,
+      "position": {
+        "x": -1.164163,
+        "y": -1.376003,
+        "z": -0.039707
+      },
+      "position_covariance": [
+        0.0009528508,
+        0.0001227384,
+        8.84075e-05,
+        0.0001227384,
+        0.0009572958,
+        9.02087e-05,
+        8.84075e-05,
+        9.02087e-05,
+        0.000897288
+      ],
+      "position_stddev_m": 0.03094,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "bench": 0.046956,
+        "chair": 0.723398,
+        "other": 0.229646
+      },
+      "class_evidence_weight": 7.395012,
+      "class_name": "chair",
+      "class_probability": 0.723398,
+      "confidence": 0.723398,
+      "first_seen": "2026-08-11T14:24:54.744079Z",
+      "id": "object_025",
+      "last_seen": "2026-08-11T14:24:59.266683Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 9,
+      "position": {
+        "x": -1.089526,
+        "y": -1.417509,
+        "z": -0.110341
+      },
+      "position_covariance": [
+        0.0012532089,
+        0.0002106382,
+        0.0001698285,
+        0.0002106382,
+        0.0012568891,
+        0.0001721444,
+        0.0001698285,
+        0.0001721444,
+        0.0011841499
+      ],
+      "position_stddev_m": 0.035453,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "apple": 0.216593,
+        "laptop": 0.24416,
+        "other": 0.386343,
+        "sink": 0.152904
+      },
+      "class_evidence_weight": 9.733158,
+      "class_name": "unknown",
+      "class_probability": 0.386343,
+      "confidence": 0.386343,
+      "first_seen": "2026-08-11T14:25:22.180713Z",
+      "id": "object_026",
+      "last_seen": "2026-08-11T14:25:47.984469Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 13,
+      "position": {
+        "x": 1.172733,
+        "y": -0.589578,
+        "z": 0.078118
+      },
+      "position_covariance": [
+        0.0009655868,
+        -2.56565e-05,
+        -5.63303e-05,
+        -2.56565e-05,
+        0.0009019064,
+        1.98e-05,
+        -5.63303e-05,
+        1.98e-05,
+        0.0009355137
+      ],
+      "position_stddev_m": 0.031074,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "cake": 0.182041,
+        "other": 0.377307,
+        "vase": 0.440651
+      },
+      "class_evidence_weight": 2.8525,
+      "class_name": "vase",
+      "class_probability": 0.440651,
+      "confidence": 0.440651,
+      "first_seen": "2026-08-11T14:25:35.611646Z",
+      "id": "object_027",
+      "last_seen": "2026-08-11T14:25:38.504662Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 3,
+      "position": {
+        "x": 2.064029,
+        "y": -0.040684,
+        "z": 0.184191
+      },
+      "position_covariance": [
+        0.0027603346,
+        5.90875e-05,
+        -9.19416e-05,
+        5.90875e-05,
+        0.0025036958,
+        -2.07664e-05,
+        -9.19416e-05,
+        -2.07664e-05,
+        0.0025224246
+      ],
+      "position_stddev_m": 0.052539,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "other": 0.424314,
+        "potted_plant": 0.32858,
+        "vase": 0.247106
+      },
+      "class_evidence_weight": 1.95,
+      "class_name": "unknown",
+      "class_probability": 0.424314,
+      "confidence": 0.424314,
+      "first_seen": "2026-08-11T14:25:45.066676Z",
+      "id": "object_028",
+      "last_seen": "2026-08-11T14:25:47.459557Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 2,
+      "position": {
+        "x": 2.172133,
+        "y": -0.512082,
+        "z": 0.392811
+      },
+      "position_covariance": [
+        0.0040317929,
+        -4.24869e-05,
+        -6.1237e-05,
+        -4.24869e-05,
+        0.003688147,
+        7.8696e-06,
+        -6.1237e-05,
+        7.8696e-06,
+        0.00368983
+      ],
+      "position_stddev_m": 0.063496,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "other": 0.439074,
+        "vase": 0.560926
+      },
+      "class_evidence_weight": 1.95,
+      "class_name": "vase",
+      "class_probability": 0.560926,
+      "confidence": 0.560926,
+      "first_seen": "2026-08-11T14:25:46.722108Z",
+      "id": "object_029",
+      "last_seen": "2026-08-11T14:25:46.976875Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 2,
+      "position": {
+        "x": 2.338316,
+        "y": -1.622829,
+        "z": 0.203463
+      },
+      "position_covariance": [
+        0.0038341127,
+        -0.0001135855,
+        -3.76032e-05,
+        -0.0001135855,
+        0.0037690352,
+        2.98717e-05,
+        -3.76032e-05,
+        2.98717e-05,
+        0.0036921687
+      ],
+      "position_stddev_m": 0.06192,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "other": 0.367261,
+        "vase": 0.632739
+      },
+      "class_evidence_weight": 1.0,
+      "class_name": "vase",
+      "class_probability": 0.632739,
+      "confidence": 0.632739,
+      "first_seen": "2026-08-11T14:25:47.459557Z",
+      "id": "object_030",
+      "last_seen": "2026-08-11T14:25:47.459557Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 1,
+      "position": {
+        "x": 2.036667,
+        "y": -1.86087,
+        "z": 0.00442
+      },
+      "position_covariance": [
+        0.0075691077,
+        -0.0002513951,
+        -0.0001047207,
+        -0.0002513951,
+        0.0075668693,
+        0.0001077241,
+        -0.0001047207,
+        0.0001077241,
+        0.0073603394
+      ],
+      "position_stddev_m": 0.087001,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "other": 0.192781,
+        "sink": 0.807219
+      },
+      "class_evidence_weight": 1.95,
+      "class_name": "sink",
+      "class_probability": 0.807219,
+      "confidence": 0.807219,
+      "first_seen": "2026-08-11T14:25:47.984469Z",
+      "id": "object_031",
+      "last_seen": "2026-08-11T14:25:48.548423Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 2,
+      "position": {
+        "x": 1.016875,
+        "y": -0.824911,
+        "z": -0.064506
+      },
+      "position_covariance": [
+        0.006206839,
+        -0.0017611584,
+        -0.0029637922,
+        -0.0017611584,
+        0.0049038395,
+        0.0020641029,
+        -0.0029637922,
+        0.0020641029,
+        0.0071521641
+      ],
+      "position_stddev_m": 0.08457,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "bench": 0.083794,
+        "chair": 0.719707,
+        "other": 0.196499
+      },
+      "class_evidence_weight": 14.993118,
+      "class_name": "chair",
+      "class_probability": 0.719707,
+      "confidence": 0.719707,
+      "first_seen": "2026-08-11T14:26:07.895189Z",
+      "id": "object_032",
+      "last_seen": "2026-08-11T14:26:23.404912Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 27,
+      "position": {
+        "x": -1.071387,
+        "y": 1.49942,
+        "z": -0.049313
+      },
+      "position_covariance": [
+        0.0009347861,
+        -0.0001503762,
+        0.0001040894,
+        -0.0001503762,
+        0.0009902851,
+        -0.0001258351,
+        0.0001040894,
+        -0.0001258351,
+        0.0008977923
+      ],
+      "position_stddev_m": 0.031469,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "airplane": 0.301655,
+        "laptop": 0.402762,
+        "other": 0.295582
+      },
+      "class_evidence_weight": 1.95,
+      "class_name": "laptop",
+      "class_probability": 0.402762,
+      "confidence": 0.402762,
+      "first_seen": "2026-08-11T14:26:11.673422Z",
+      "id": "object_033",
+      "last_seen": "2026-08-11T14:26:13.390860Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 2,
+      "position": {
+        "x": -1.245288,
+        "y": 0.535403,
+        "z": 0.262072
+      },
+      "position_covariance": [
+        0.005752125,
+        -0.0007540363,
+        0.0010539292,
+        -0.0007540363,
+        0.0039665995,
+        -0.0003964178,
+        0.0010539292,
+        -0.0003964178,
+        0.0042259742
+      ],
+      "position_stddev_m": 0.075843,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "chair": 0.343012,
+        "other": 0.453175,
+        "sink": 0.203813
+      },
+      "class_evidence_weight": 2.8525,
+      "class_name": "unknown",
+      "class_probability": 0.453175,
+      "confidence": 0.453175,
+      "first_seen": "2026-08-11T14:27:00.029276Z",
+      "id": "object_034",
+      "last_seen": "2026-08-11T14:27:04.570160Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 3,
+      "position": {
+        "x": 2.261299,
+        "y": 0.571685,
+        "z": 0.222176
+      },
+      "position_covariance": [
+        0.002695403,
+        2.47916e-05,
+        -4.89753e-05,
+        2.47916e-05,
+        0.0024952426,
+        -5.7869e-06,
+        -4.89753e-05,
+        -5.7869e-06,
+        0.0025044732
+      ],
+      "position_stddev_m": 0.051917,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "chair": 0.833381,
+        "other": 0.166619
+      },
+      "class_evidence_weight": 1.0,
+      "class_name": "chair",
+      "class_probability": 0.833381,
+      "confidence": 0.833381,
+      "first_seen": "2026-08-11T14:27:14.780879Z",
+      "id": "object_035",
+      "last_seen": "2026-08-11T14:27:14.780879Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 1,
+      "position": {
+        "x": 0.090457,
+        "y": 2.218481,
+        "z": -0.955688
+      },
+      "position_covariance": [
+        0.0073157893,
+        -4.65e-06,
+        7.4299e-06,
+        -4.65e-06,
+        0.0073360634,
+        -1.10766e-05,
+        7.4299e-06,
+        -1.10766e-05,
+        0.0073229935
+      ],
+      "position_stddev_m": 0.085651,
+      "state": "stale"
+    },
+    {
+      "class_distribution": {
+        "clock": 0.58288,
+        "other": 0.41712
+      },
+      "class_evidence_weight": 1.0,
+      "class_name": "clock",
+      "class_probability": 0.58288,
+      "confidence": 0.58288,
+      "first_seen": "2026-08-11T14:27:31.717171Z",
+      "id": "object_036",
+      "last_seen": "2026-08-11T14:27:31.717171Z",
+      "model_id": "yolo26x.pt",
+      "observation_count": 1,
+      "position": {
+        "x": -0.700382,
+        "y": -0.349436,
+        "z": -0.516852
+      },
+      "position_covariance": [
+        0.007305738,
+        1.1579e-06,
+        3.4767e-06,
+        1.1579e-06,
+        0.0073080488,
+        8.382e-06,
+        3.4767e-06,
+        8.382e-06,
+        0.007325034
+      ],
+      "position_stddev_m": 0.085586,
+      "state": "stale"
+    }
+  ],
+  "reference_frame": "global_origin",
+  "schema_version": 2,
+  "updated_at": "2026-08-11T14:35:41.678641Z"
+}

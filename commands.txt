@@ -1,6 +1,9 @@
 to run the VLM in the think mode:
 ./run_orchestrator.sh --show-think
 
+to run the semantic node:
+./run_semantic_perception.sh
+
 
 agent_env enviroment activation:
 source ~/workspace//Arena-RealSim/agent_orchestrator/agent_env/bin/activate
@@ -8,10 +11,15 @@ source ~/workspace//Arena-RealSim/agent_orchestrator/agent_env/bin/activate
 #for looiking left
 python3 scripts/send_pose_cmd.py 0.00 0.30 0.7 3.14 -1.56 1.56
 
+
+for seeing the robot output
 python3 scripts/view_wrist_camera.py --scale 0.6 # open (agent_env) for this
 
-python3 scripts/object_map_publisher.py # open (agent_env) for this
+for debugging semantic yolo object detector
+./run_semantic_perception.sh --rviz --publish-debug
+python3 scripts/view_wrist_camera.py --topic /semantic/debug/yolo --scale 0.6
 
+python3 scripts/object_map_publisher.py # open (agent_env) for this
 
 ros2 topic echo /rrt/status for monitoring the RRT status
 
@@ -41,4 +49,20 @@ my current vision for the tool calling for the task of:
 4 targeted search for apple if found 5 if not "apple is not present"
 5 pick the apple
 6 finished
+
+
+
+  ./run_semantic_perception.sh --rviz --publish-debug \
+    -p detector.max_bbox_area_fraction:=0.40 \
+    -p depth.maximum_m:=2.0 \
+    -p class.confirmation_probability:=0.55 \
+    -p filter.confirmation_window_sec:=5.0 \
+    -p association.mahalanobis_threshold:=16.0 \
+    -p uncertainty.extrinsic_stddev_m:=0.03 \
+    -p uncertainty.world_stddev_m:=0.08 \
+    -p uncertainty.process_noise_stddev_m:=0.01 \
+    -p detector.image_size:=512 \
+    -p processing_rate_hz:=5.00
+
+
   

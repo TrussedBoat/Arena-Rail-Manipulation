@@ -1,0 +1,65 @@
+#!/bin/bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
+export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-1}"
+export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+
+VENV_PATH="$SCRIPT_DIR/agent_orchestrator/agent_env/bin/activate"
+if [ ! -f "$VENV_PATH" ]; then
+    echo "Error: agent environment not found: $VENV_PATH"
+    exit 1
+fi
+source "$VENV_PATH"
+source /opt/ros/humble/setup.bash
+
+HOME_ROBOTICS_SETUP="${ARENA_HOME_ROBOTICS_SETUP:-$HOME/workspace/home_robotics/homerobotics_ws/install/setup.bash}"
+if [ ! -f "$HOME_ROBOTICS_SETUP" ]; then
+    echo "Error: home_robotics setup not found: $HOME_ROBOTICS_SETUP"
+    exit 1
+fi
+source "$HOME_ROBOTICS_SETUP"
+
+MODEL_PATH="${ARENA_DETECTOR_MODEL:-$SCRIPT_DIR/agent_orchestrator/models/yolo26x.pt}"
+REGISTRY_PATH="${ARENA_OBJECT_REGISTRY:-$SCRIPT_DIR/semantic_objects.json}"
+LEGACY_PATH="${ARENA_DYNAMIC_COORDINATES:-$SCRIPT_DIR/semantic_distances_dynamic.json}"
+WRITE_LEGACY="${ARENA_WRITE_LEGACY_COORDINATES:-false}"
+USE_SIM_TIME="${ARENA_USE_SIM_TIME:-false}"
+PUBLISH_ANNOTATED_DEBUG="${ARENA_PUBLISH_ANNOTATED_DEBUG:-false}"
+START_RVIZ_VISUALIZER=false
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --publish-debug)
+            PUBLISH_ANNOTATED_DEBUG=true
+            shift
+            ;;
+        --rviz)
+            START_RVIZ_VISUALIZER=true
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+export PYTHONPATH="$SCRIPT_DIR/semantic_perception${PYTHONPATH:+:$PYTHONPATH}"
+
+if [ "$START_RVIZ_VISUALIZER" = true ]; then
+    python3 -m semantic_perception.rviz_visualizer &
+    RVIZ_VISUALIZER_PID=$!
+    trap 'kill "$RVIZ_VISUALIZER_PID" 2>/dev/null || true' EXIT INT TERM
+fi
+
+python3 -m semantic_perception.node --ros-args \
+  -p use_sim_time:="$USE_SIM_TIME" \
+  -p detector.model_path:="$MODEL_PATH" \
+  -p registry.path:="$REGISTRY_PATH" \
+  -p registry.legacy_coordinates_path:="$LEGACY_PATH" \
+  -p registry.write_legacy_coordinates:="$WRITE_LEGACY" \
+  -p debug.publish_annotated:="$PUBLISH_ANNOTATED_DEBUG" \
+  "$@"
