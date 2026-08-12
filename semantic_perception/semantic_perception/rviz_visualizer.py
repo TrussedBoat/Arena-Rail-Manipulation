@@ -14,6 +14,7 @@ class SemanticRvizVisualizer(Node):
         super().__init__("semantic_rviz_visualizer")
         self.declare_parameter("input_topic", "/semantic/objects")
         self.declare_parameter("marker_topic", "/semantic/rviz/markers")
+        self.declare_parameter("confirmed_only", False)
         # A zero lifetime is infinite. The registry publishes only when it
         # changes, so persistent markers are needed for a stable RViz map.
         self.declare_parameter("marker_lifetime_sec", 0.0)
@@ -50,8 +51,10 @@ class SemanticRvizVisualizer(Node):
         clear.action = Marker.DELETEALL
         markers.markers.append(clear)
         frame_id = message.header.frame_id or "global_origin"
-        confirmed_objects = [item for item in message.objects if item.state == "confirmed"]
-        for index, item in enumerate(confirmed_objects):
+        objects = message.objects
+        if bool(self.get_parameter("confirmed_only").value):
+            objects = [item for item in objects if item.state == "confirmed"]
+        for index, item in enumerate(objects):
             marker_id = index * 2
             radius = max(0.035, min(0.12, float(item.position_stddev_m) * 2.0))
             sphere = Marker()
@@ -79,7 +82,7 @@ class SemanticRvizVisualizer(Node):
             label.pose.orientation.w = 1.0
             label.scale.z = 0.08
             label.color.r = label.color.g = label.color.b = label.color.a = 1.0
-            label.text = f"{item.class_name}-{item.confidence:.2f}"
+            label.text = f"{item.class_name}[{item.state}]-{item.confidence:.2f}"
             label.lifetime = self._lifetime
             markers.markers.append(label)
         self._publisher.publish(markers)

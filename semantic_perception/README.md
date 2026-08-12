@@ -83,6 +83,9 @@ Or start it together with semantic perception using the launcher option:
 ./run_semantic_perception.sh --rviz
 ```
 
+Use `--rviz-confirmed-only` instead to hide candidates, ambiguous tracks, and
+stale objects from RViz.
+
 In RViz, set **Fixed Frame** to `global_origin`, then add a **MarkerArray**
 display with topic `/semantic/rviz/markers`. Green spheres are persistent,
 confirmed objects from `/semantic/objects`; their text labels show class,
@@ -133,13 +136,60 @@ explicit label, or `unknown` when `other` is largest. Target search additionally
 requires the representative class probability to be at least `0.70`.
 
 Spatial association uses the full measurement and track covariance with the
-3-D 99% chi-square Mahalanobis gate (`d² <= 11.345`). Matched positions and
-covariances are fused with a static Kalman update, and detections from one frame
-are assigned one-to-one to tracks.
+3-D 99% chi-square Mahalanobis gate (`d² <= 11.345`). Eligible matches are
+chosen globally with Hungarian assignment. By default, every valid YOLO crop in
+a frame is batched through the image encoder of pretrained MobileCLIP-S0, then
+L2-normalized. Incompatible appearance pairs are rejected above cosine distance
+`0.35`, and the remaining assignment cost combines normalized `d²` and cosine
+distance equally. The text encoder is never used.
 
-`semantic_objects.json` schema version 2 stores the class distribution and 3×3
-world-frame covariance. Schema version 1 and legacy coordinate files are
-migrated when loaded. The node
+Install Apple's official `mobileclip` package in the ROS Python environment
+(`git clone https://github.com/apple/ml-mobileclip.git && ./agent_orchestrator/agent_env/bin/pip install -e ./ml-mobileclip`)
+and download the MobileCLIP-S0 checkpoint before starting the node. Set
+`ARENA_MOBILECLIP_CHECKPOINT=/absolute/path/to/mobileclip_s0.pt`, or pass
+`-p appearance.mobileclip_checkpoint:=/absolute/path/to/mobileclip_s0.pt`.
+The node never downloads model weights at runtime and reports a clear startup
+error if the package or checkpoint is missing. Set `appearance.enabled:=false`
+to return to spatial-only matching; `mobilenet_v3_small` and
+`ultralytics_crop` remain available through `appearance.backend`.
+
+Distance weighting treats observations closer than 1 m as full quality. Beyond
+that distance, the world-frame covariance is inflated quadratically and class
+evidence is down-weighted inversely with distance, with a 0.25 minimum evidence
+weight. Configure `distance_weighting.reference_distance_m` and
+`distance_weighting.minimum_class_evidence_weight` for a different camera range.
+
+The node publishes `/semantic/association_diagnostics` for every processed
+frame. It records TF mode and timestamp offset, depth/MAD sampling statistics,
+box-derived pixel uncertainty, final covariance, and the selected association
+decision/cost. `uncertainty.bbox_diagonal_fraction` (default `0.10`) adds
+10% of the 2-D box diagonal in quadrature with base pixel uncertainty.
+Inspect it with:
+
+```bash
+ros2 topic echo /semantic/association_diagnostics
+```
+
+`association_decision=matched` means an existing track was updated;
+`new_track` means no eligible existing track survived the spatial and appearance
+gates; `depth_rejected` includes the depth-sampling rejection reason.
+Disable this diagnostic stream with `-p diagnostics.publish:=false`.
+
+Detections that touch the configured camera-edge margin are rejected before
+localization and appearance embedding. The default margin is 3% of each image
+dimension (`detector.border_margin_fraction=0.03`). With `--publish-debug`, the
+safe image region is magenta and rejected clipped boxes are red.
+
+YOLO confidence is not treated as `P(other)`. For an accepted detection with
+confidence `c`, its conditional class distribution is `class = 0.60 + 0.40c`
+and `other = 1 - class`; its total evidence contribution is still scaled by
+`c` and distance. Adjust the `0.60` floor with
+`class.conditional_reliability_floor`.
+Matched positions and covariances are fused with a static Kalman update.
+
+`semantic_objects.json` schema version 3 stores the class distribution, 3×3
+world-frame covariance, and the compatible appearance embedding when available.
+Schema versions 1–2 and legacy coordinate files are migrated when loaded. The node
 can also export the existing class-keyed `semantic_distances_dynamic.json`
 format by setting `registry.write_legacy_coordinates:=true`. It defaults to
 false until the old orchestrator writer is removed, preventing two processes

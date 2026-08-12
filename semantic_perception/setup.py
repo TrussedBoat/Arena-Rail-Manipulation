@@ -25,7 +25,6 @@ setup(
             "semantic_perception_node = semantic_perception.node:main",
             "yolo_debug_node = semantic_perception.yolo_debug:main",
             "semantic_rviz_visualizer = semantic_perception.rviz_visualizer:main",
-            "semantic_rviz_visualizer = semantic_perception.rviz_visualizer:main",
         ],
     },
 )

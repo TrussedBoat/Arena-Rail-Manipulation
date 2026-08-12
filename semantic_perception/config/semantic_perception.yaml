@@ -29,6 +29,19 @@ semantic_perception:
       confidence_threshold: 0.50
       max_detections: 100
       max_bbox_area_fraction: 0.55
+      border_margin_fraction: 0.03
+    appearance:
+      enabled: true
+      backend: mobileclip_s0
+      # Local pretrained checkpoint; runtime never downloads model weights.
+      mobileclip_checkpoint: ""
+      image_size: 224
+      max_cosine_distance: 0.35
+      cost_weight: 0.5
+      embedding_decay: 0.90
+    distance_weighting:
+      reference_distance_m: 1.0
+      minimum_class_evidence_weight: 0.25
     depth:
       scale_16uc1: 0.001
       inner_bbox_fraction: 0.5
@@ -37,16 +50,20 @@ semantic_perception:
       maximum_m: 5.0
     association:
       mahalanobis_threshold: 11.345
+      duplicate_merge_enabled: true
+      duplicate_merge_interval_frames: 25
     filter:
       confirmation_hits: 3
       confirmation_window_sec: 3.0
       stale_after_sec: 300.0
     class:
       confirmation_probability: 0.70
+      conditional_reliability_floor: 0.60
       max_explicit_classes: 4
       evidence_decay: 0.95
     uncertainty:
       pixel_stddev_px: 2.0
+      bbox_diagonal_fraction: 0.10
       extrinsic_stddev_m: 0.005
       world_stddev_m: 0.005
       process_noise_stddev_m: 0.002
@@ -60,3 +77,5 @@ semantic_perception:
     debug:
       publish_annotated: false
       annotated_topic: /semantic/debug/yolo
+    diagnostics:
+      publish: true

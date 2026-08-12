@@ -11,7 +11,13 @@ import numpy as np
 import message_filters
 import rclpy
 from interface.action import FindObject
-from interface.msg import ClassProbability, DetectedObject, DetectedObjectArray
+from interface.msg import (
+    AssociationDiagnostic,
+    AssociationDiagnosticArray,
+    ClassProbability,
+    DetectedObject,
+    DetectedObjectArray,
+)
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
@@ -30,8 +36,11 @@ import tf2_ros
 from tf2_ros import TransformException
 
 from .detector import ObjectDetector, create_detector
+from .appearance import create_appearance_provider
 from .localization import (
     LocalizedDetection,
+    DepthSamplingDiagnostics,
+    depth_sampling_diagnostics,
     FixedCameraCalibration,
     deproject_pixel,
     deprojection_covariance,
@@ -39,7 +48,7 @@ from .localization import (
     transform_covariance,
     transform_point,
 )
-from .registry import ObjectRegistry, ObjectTrack, RegistryConfig
+from .registry import AssociationResult, ObjectRegistry, ObjectTrack, RegistryConfig
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,22 @@ class SensorPacket:
     sequence: int
     color: Image
     depth: Image
+
+
+@dataclass(frozen=True)
+class RejectedDepthDetection:
+    class_name: str
+    confidence: float
+    bbox_xyxy: tuple[float, float, float, float]
+    reason: str
+
+
+@dataclass(frozen=True)
+class RejectedImageDetection:
+    class_name: str
+    confidence: float
+    bbox_xyxy: tuple[float, float, float, float]
+    reason: str
 
 
 class SemanticPerceptionNode(Node):
@@ -63,6 +88,8 @@ class SemanticPerceptionNode(Node):
         self._color_messages_received = 0
         self._depth_messages_received = 0
         self._synchronized_packets_received = 0
+        self._last_health_processed = 0
+        self._last_health_monotonic = time.monotonic()
         self._last_persist_monotonic = 0.0
         self._registry_dirty = False
         self._camera_calibration = self._camera_calibration_from_parameters()
@@ -76,6 +103,19 @@ class SemanticPerceptionNode(Node):
                 self.get_parameter("detector.confidence_threshold").value
             ),
             max_detections=int(self.get_parameter("detector.max_detections").value),
+            class_reliability_floor=float(
+                self.get_parameter("class.conditional_reliability_floor").value
+            ),
+        )
+        self._appearance_provider = create_appearance_provider(
+            enabled=bool(self.get_parameter("appearance.enabled").value),
+            backend=str(self.get_parameter("appearance.backend").value),
+            detector=self._detector,
+            device=str(self.get_parameter("detector.device").value),
+            image_size=int(self.get_parameter("appearance.image_size").value),
+            mobileclip_checkpoint=str(
+                self.get_parameter("appearance.mobileclip_checkpoint").value
+            ),
         )
         self._registry = ObjectRegistry(
             RegistryConfig(
@@ -96,6 +136,21 @@ class SemanticPerceptionNode(Node):
                 evidence_decay=float(self.get_parameter("class.evidence_decay").value),
                 process_noise_stddev_m=float(
                     self.get_parameter("uncertainty.process_noise_stddev_m").value
+                ),
+                appearance_max_cosine_distance=float(
+                    self.get_parameter("appearance.max_cosine_distance").value
+                ),
+                appearance_cost_weight=float(
+                    self.get_parameter("appearance.cost_weight").value
+                ),
+                appearance_embedding_decay=float(
+                    self.get_parameter("appearance.embedding_decay").value
+                ),
+                distance_evidence_reference_m=float(
+                    self.get_parameter("distance_weighting.reference_distance_m").value
+                ),
+                distance_evidence_min_weight=float(
+                    self.get_parameter("distance_weighting.minimum_class_evidence_weight").value
                 ),
             ),
             model_id=self._detector.model_id,
@@ -125,6 +180,9 @@ class SemanticPerceptionNode(Node):
         )
         self._debug_image_publisher = self.create_publisher(
             Image, str(self.get_parameter("debug.annotated_topic").value), 10
+        )
+        self._association_diagnostics_publisher = self.create_publisher(
+            AssociationDiagnosticArray, "/semantic/association_diagnostics", 10
         )
 
         color_topic = str(self.get_parameter("topics.color").value)
@@ -160,6 +218,7 @@ class SemanticPerceptionNode(Node):
         self._publish_registry()
         self.get_logger().info(
             f"Semantic perception ready: model={self._detector.model_id}, "
+            f"appearance={self._appearance_provider.provider_id}, "
             f"frame={self._reference_frame()}, rate={rate_hz:g} Hz"
         )
 
@@ -188,19 +247,33 @@ class SemanticPerceptionNode(Node):
         self.declare_parameter("detector.confidence_threshold", 0.50)
         self.declare_parameter("detector.max_detections", 100)
         self.declare_parameter("detector.max_bbox_area_fraction", 0.55)
+        self.declare_parameter("detector.border_margin_fraction", 0.03)
+        self.declare_parameter("appearance.enabled", True)
+        self.declare_parameter("appearance.backend", "mobileclip_s0")
+        self.declare_parameter("appearance.mobileclip_checkpoint", "")
+        self.declare_parameter("appearance.image_size", 224)
+        self.declare_parameter("appearance.max_cosine_distance", 0.35)
+        self.declare_parameter("appearance.cost_weight", 0.5)
+        self.declare_parameter("appearance.embedding_decay", 0.90)
+        self.declare_parameter("distance_weighting.reference_distance_m", 1.0)
+        self.declare_parameter("distance_weighting.minimum_class_evidence_weight", 0.25)
         self.declare_parameter("depth.scale_16uc1", 0.001)
         self.declare_parameter("depth.inner_bbox_fraction", 0.5)
         self.declare_parameter("depth.minimum_valid_pixels", 20)
         self.declare_parameter("depth.minimum_m", 0.05)
         self.declare_parameter("depth.maximum_m", 5.0)
         self.declare_parameter("association.mahalanobis_threshold", 11.345)
+        self.declare_parameter("association.duplicate_merge_enabled", True)
+        self.declare_parameter("association.duplicate_merge_interval_frames", 25)
         self.declare_parameter("filter.confirmation_hits", 3)
         self.declare_parameter("filter.confirmation_window_sec", 3.0)
         self.declare_parameter("filter.stale_after_sec", 300.0)
         self.declare_parameter("class.confirmation_probability", 0.70)
+        self.declare_parameter("class.conditional_reliability_floor", 0.60)
         self.declare_parameter("class.max_explicit_classes", 4)
         self.declare_parameter("class.evidence_decay", 0.95)
         self.declare_parameter("uncertainty.pixel_stddev_px", 2.0)
+        self.declare_parameter("uncertainty.bbox_diagonal_fraction", 0.10)
         self.declare_parameter("uncertainty.extrinsic_stddev_m", 0.005)
         self.declare_parameter("uncertainty.world_stddev_m", 0.005)
         self.declare_parameter("uncertainty.process_noise_stddev_m", 0.002)
@@ -213,6 +286,7 @@ class SemanticPerceptionNode(Node):
         self.declare_parameter("search.default_timeout_sec", 30.0)
         self.declare_parameter("debug.publish_annotated", False)
         self.declare_parameter("debug.annotated_topic", "/semantic/debug/yolo")
+        self.declare_parameter("diagnostics.publish", True)
 
     def _validate_parameters(self) -> None:
         positive_parameters = (
@@ -222,9 +296,12 @@ class SemanticPerceptionNode(Node):
             "tf_timeout_sec",
             "detector.image_size",
             "detector.max_detections",
+            "appearance.image_size",
+            "distance_weighting.reference_distance_m",
             "depth.minimum_valid_pixels",
             "depth.maximum_m",
             "association.mahalanobis_threshold",
+            "association.duplicate_merge_interval_frames",
             "filter.confirmation_hits",
             "filter.confirmation_window_sec",
             "filter.stale_after_sec",
@@ -240,8 +317,15 @@ class SemanticPerceptionNode(Node):
         unit_parameters = (
             "detector.confidence_threshold",
             "detector.max_bbox_area_fraction",
+            "detector.border_margin_fraction",
+            "appearance.max_cosine_distance",
+            "appearance.cost_weight",
+            "appearance.embedding_decay",
+            "uncertainty.bbox_diagonal_fraction",
+            "distance_weighting.minimum_class_evidence_weight",
             "depth.inner_bbox_fraction",
             "class.confirmation_probability",
+            "class.conditional_reliability_floor",
             "class.evidence_decay",
         )
         for name in unit_parameters:
@@ -279,15 +363,33 @@ class SemanticPerceptionNode(Node):
         self._depth_messages_received += 1
 
     def _log_input_health(self) -> None:
+        now_monotonic = time.monotonic()
+        elapsed_sec = max(now_monotonic - self._last_health_monotonic, 1e-6)
+        processed_hz = (
+            self._processed_sequence - self._last_health_processed
+        ) / elapsed_sec
+        confirmation_window_sec = float(
+            self.get_parameter("filter.confirmation_window_sec").value
+        )
+        confirmation_hits = int(self.get_parameter("filter.confirmation_hits").value)
+        available_observations = processed_hz * confirmation_window_sec
+        confirmation_ratio = confirmation_hits / max(available_observations, 1e-6)
         self.get_logger().info(
-            "RGB-D input health: color=%d depth=%d synchronized=%d processed=%d"
+            "RGB-D input health: color=%d depth=%d synchronized=%d processed=%d "
+            "processed_hz=%.2f confirmation=%d/%.1f(%.0f%%)"
             % (
                 self._color_messages_received,
                 self._depth_messages_received,
                 self._synchronized_packets_received,
                 self._processed_sequence,
+                processed_hz,
+                confirmation_hits,
+                available_observations,
+                confirmation_ratio * 100.0,
             )
         )
+        self._last_health_processed = self._processed_sequence
+        self._last_health_monotonic = now_monotonic
 
     def _process_latest(self) -> None:
         with self._packet_lock:
@@ -296,22 +398,56 @@ class SemanticPerceptionNode(Node):
                 return
             self._processed_sequence = packet.sequence
         try:
-            localized = self._localize_packet(packet)
+            localized, rejected_depth, tf_mode, selected_tf_stamp = self._localize_packet(packet)
         except Exception as exc:
             self.get_logger().warning(f"Dropped RGB-D packet: {exc}")
             return
         self._publish_observations(localized, packet.color)
+        association_results: list[AssociationResult] = []
         changed_tracks: list[ObjectTrack] = []
+        merged_duplicates: list[tuple[str, str]] = []
+        expired_candidates: list[str] = []
         with self._registry_changed:
-            changed_tracks = self._registry.update_frame(localized)
-            if changed_tracks:
+            expired_candidates = self._registry.expire_candidates(
+                packet.color.header.stamp.sec + packet.color.header.stamp.nanosec / 1e9
+            )
+            association_results = self._registry.update_frame_with_diagnostics(localized)
+            changed_tracks = [result.track for result in association_results]
+            merge_interval = int(
+                self.get_parameter("association.duplicate_merge_interval_frames").value
+            )
+            if (
+                bool(self.get_parameter("association.duplicate_merge_enabled").value)
+                and merge_interval > 0
+                and self._processed_sequence % merge_interval == 0
+            ):
+                merged_duplicates = self._registry.merge_confirmed_duplicates()
+            if changed_tracks or expired_candidates:
                 self._registry_dirty = True
                 self._registry_changed.notify_all()
-        if changed_tracks:
+            if merged_duplicates:
+                self._registry_dirty = True
+                self._registry_changed.notify_all()
+        if changed_tracks or merged_duplicates or expired_candidates:
             self._publish_registry()
+        if expired_candidates:
+            self.get_logger().debug("Expired candidate tracks: %s" % expired_candidates)
+        if merged_duplicates:
+            self.get_logger().info("Merged duplicate tracks: %s" % merged_duplicates)
+        if bool(self.get_parameter("diagnostics.publish").value):
+            self._publish_association_diagnostics(
+                packet.color,
+                localized,
+                association_results,
+                rejected_depth,
+                tf_mode,
+                selected_tf_stamp,
+            )
         self._persist_if_due()
 
-    def _localize_packet(self, packet: SensorPacket) -> list[LocalizedDetection]:
+    def _localize_packet(
+        self, packet: SensorPacket
+    ) -> tuple[list[LocalizedDetection], list[RejectedDepthDetection], str, Time]:
         color = _decode_color_image(packet.color)
         depth = _decode_depth_image(packet.depth)
         if packet.depth.encoding.upper() in ("16UC1", "MONO16"):
@@ -344,6 +480,7 @@ class SemanticPerceptionNode(Node):
                     seconds=float(self.get_parameter("tf_timeout_sec").value)
                 ),
             )
+            tf_mode = "exact"
         except TransformException as exc:
             if not bool(self.get_parameter("tf.fallback_to_latest").value):
                 raise
@@ -355,17 +492,24 @@ class SemanticPerceptionNode(Node):
             transform = self._tf_buffer.lookup_transform(
                 self._reference_frame(), source_frame, Time()
             )
+            tf_mode = "latest_fallback"
         stamp_ns = stamp.nanoseconds
-        raw_detections = self._filter_large_detections(
+        raw_detections, rejected_image_detections = self._filter_image_detections(
             self._detector.detect(color), color.shape[:2]
         )
-        if bool(self.get_parameter("debug.publish_annotated").value):
-            self._publish_annotated_detections(color, raw_detections, packet.color)
+        try:
+            raw_detections = self._appearance_provider.attach(color, raw_detections)
+        except RuntimeError as exc:
+            self.get_logger().warning(
+                f"Appearance embeddings unavailable; using spatial association only: {exc}",
+                throttle_duration_sec=5.0,
+            )
         localized: list[LocalizedDetection] = []
-        rejected_depth = 0
-        for detection in raw_detections:
+        depth_diagnostics: dict[int, DepthSamplingDiagnostics] = {}
+        rejected_depth: list[RejectedDepthDetection] = []
+        for detection_index, detection in enumerate(raw_detections):
             try:
-                depth_m, depth_stddev, pixel = robust_depth_at_detection(
+                diagnostics = depth_sampling_diagnostics(
                     depth,
                     detection.bbox_xyxy,
                     inner_fraction=float(
@@ -377,17 +521,28 @@ class SemanticPerceptionNode(Node):
                     minimum_depth_m=float(self.get_parameter("depth.minimum_m").value),
                     maximum_depth_m=float(self.get_parameter("depth.maximum_m").value),
                 )
+                depth_diagnostics[detection_index] = diagnostics
+                depth_m = diagnostics.median_m
+                depth_stddev = diagnostics.stddev_m
+                pixel = diagnostics.centre_pixel
                 camera_point = deproject_pixel(
                     pixel, depth_m, self._camera_calibration.camera_matrix
+                )
+                box_width_px = max(0.0, detection.bbox_xyxy[2] - detection.bbox_xyxy[0])
+                box_height_px = max(0.0, detection.bbox_xyxy[3] - detection.bbox_xyxy[1])
+                base_pixel_stddev_px = float(self.get_parameter("uncertainty.pixel_stddev_px").value)
+                bbox_pixel_stddev_px = float(
+                    self.get_parameter("uncertainty.bbox_diagonal_fraction").value
+                ) * float(np.hypot(box_width_px, box_height_px))
+                combined_pixel_stddev_px = float(
+                    np.hypot(base_pixel_stddev_px, bbox_pixel_stddev_px)
                 )
                 camera_covariance = deprojection_covariance(
                     pixel,
                     depth_m,
                     depth_stddev,
                     self._camera_calibration.camera_matrix,
-                    pixel_stddev_px=float(
-                        self.get_parameter("uncertainty.pixel_stddev_px").value
-                    ),
+                    pixel_stddev_px=combined_pixel_stddev_px,
                 )
                 world_point = transform_point(camera_point, transform.transform)
                 world_covariance = transform_covariance(
@@ -400,8 +555,18 @@ class SemanticPerceptionNode(Node):
                         self.get_parameter("uncertainty.world_stddev_m").value
                     ),
                 )
+                range_m = float(np.linalg.norm(camera_point))
+                reference_distance_m = float(
+                    self.get_parameter("distance_weighting.reference_distance_m").value
+                )
+                covariance_scale = max(1.0, (range_m / reference_distance_m) ** 2)
+                world_covariance *= covariance_scale
             except ValueError as exc:
-                rejected_depth += 1
+                rejected_depth.append(
+                    RejectedDepthDetection(
+                        detection.class_name, detection.confidence, detection.bbox_xyxy, str(exc)
+                    )
+                )
                 self.get_logger().debug(
                     f"Rejected {detection.class_name} detection: {exc}"
                 )
@@ -411,50 +576,176 @@ class SemanticPerceptionNode(Node):
                     class_name=detection.class_name,
                     confidence=detection.confidence,
                     class_likelihoods=detection.class_likelihoods,
+                    class_evidence_strength=detection.class_evidence_strength,
                     position=tuple(float(value) for value in world_point),
                     position_covariance=world_covariance,
                     stamp_ns=stamp_ns,
                     frame_id=self._reference_frame(),
                     bbox_xyxy=detection.bbox_xyxy,
+                    range_m=range_m,
+                    appearance_embedding=detection.appearance_embedding,
+                    appearance_provider_id=detection.appearance_provider_id,
+                    depth_median_m=depth_m,
+                    depth_stddev_m=depth_stddev,
+                    depth_valid_pixel_count=int(diagnostics.valid_mask.sum()),
+                    depth_inlier_pixel_count=int(diagnostics.inlier_mask.sum()),
+                    base_pixel_stddev_px=base_pixel_stddev_px,
+                    bbox_pixel_stddev_px=bbox_pixel_stddev_px,
+                    combined_pixel_stddev_px=combined_pixel_stddev_px,
                 )
+            )
+        if bool(self.get_parameter("debug.publish_annotated").value):
+            self._publish_annotated_detections(
+                color,
+                raw_detections,
+                packet.color,
+                depth_diagnostics,
+                rejected_image_detections,
             )
         self.get_logger().debug(
             "YOLO=%d, localized=%d, depth-rejected=%d, frame=%s, stamp=%d"
             % (
                 len(raw_detections),
                 len(localized),
-                rejected_depth,
+                len(rejected_depth),
                 source_frame,
                 stamp_ns,
             )
         )
-        return localized
+        return localized, rejected_depth, tf_mode, Time.from_msg(transform.header.stamp)
 
-    def _filter_large_detections(self, detections: list, image_shape: tuple[int, int]) -> list:
-        """Reject boxes that cover implausibly large portions of the image."""
+    def _publish_association_diagnostics(
+        self,
+        source_image: Image,
+        detections: list[LocalizedDetection],
+        results: list[AssociationResult],
+        rejected: list[RejectedDepthDetection],
+        tf_mode: str,
+        selected_tf_stamp: Time,
+    ) -> None:
+        message = AssociationDiagnosticArray()
+        message.header = source_image.header
+        message.header.frame_id = self._reference_frame()
+        requested_stamp = Time.from_msg(source_image.header.stamp)
+        selected_stamp_msg = selected_tf_stamp.to_msg()
+        stamp_offset_sec = (
+            selected_tf_stamp.nanoseconds - requested_stamp.nanoseconds
+        ) / 1e9
+        for detection, result in zip(detections, results):
+            item = AssociationDiagnostic()
+            item.header = message.header
+            item.class_name = detection.class_name
+            item.detector_confidence = float(detection.confidence)
+            item.bbox_xyxy = [float(value) for value in detection.bbox_xyxy]
+            item.range_m = float(detection.range_m)
+            item.depth_median_m = float(detection.depth_median_m)
+            item.depth_stddev_m = float(detection.depth_stddev_m)
+            item.depth_valid_pixel_count = int(detection.depth_valid_pixel_count)
+            item.depth_inlier_pixel_count = int(detection.depth_inlier_pixel_count)
+            item.base_pixel_stddev_px = float(detection.base_pixel_stddev_px)
+            item.bbox_pixel_stddev_px = float(detection.bbox_pixel_stddev_px)
+            item.combined_pixel_stddev_px = float(detection.combined_pixel_stddev_px)
+            item.position_covariance_diagonal = [
+                float(value) for value in np.diag(detection.position_covariance)
+            ]
+            item.tf_mode = tf_mode
+            item.requested_tf_stamp = source_image.header.stamp
+            item.selected_tf_stamp = selected_stamp_msg
+            item.tf_stamp_offset_sec = stamp_offset_sec
+            item.eligible_track_count = int(result.eligible_track_count)
+            item.best_mahalanobis_d2 = _diagnostic_value(result.best_mahalanobis_d2)
+            item.selected_mahalanobis_d2 = _diagnostic_value(
+                result.selected_mahalanobis_d2
+            )
+            item.selected_cost = _diagnostic_value(result.selected_cost)
+            item.association_decision = result.decision
+            item.track_id = result.track.object_id
+            message.diagnostics.append(item)
+        for rejection in rejected:
+            item = AssociationDiagnostic()
+            item.header = message.header
+            item.class_name = rejection.class_name
+            item.detector_confidence = float(rejection.confidence)
+            item.bbox_xyxy = [float(value) for value in rejection.bbox_xyxy]
+            item.tf_mode = tf_mode
+            item.requested_tf_stamp = source_image.header.stamp
+            item.selected_tf_stamp = selected_stamp_msg
+            item.tf_stamp_offset_sec = stamp_offset_sec
+            item.best_mahalanobis_d2 = float("nan")
+            item.selected_mahalanobis_d2 = float("nan")
+            item.selected_cost = float("nan")
+            item.association_decision = "depth_rejected"
+            item.rejection_reason = rejection.reason
+            message.diagnostics.append(item)
+        self._association_diagnostics_publisher.publish(message)
+
+    def _filter_image_detections(
+        self, detections: list, image_shape: tuple[int, int]
+    ) -> tuple[list, list[RejectedImageDetection]]:
+        """Reject implausibly large boxes and boxes clipped by camera edges."""
         image_height, image_width = image_shape
         max_fraction = float(self.get_parameter("detector.max_bbox_area_fraction").value)
+        margin_fraction = float(
+            self.get_parameter("detector.border_margin_fraction").value
+        )
+        margin_x = image_width * margin_fraction
+        margin_y = image_height * margin_fraction
         accepted = []
+        rejected = []
         for detection in detections:
             x1, y1, x2, y2 = detection.bbox_xyxy
             width = max(0.0, min(float(image_width), x2) - max(0.0, x1))
             height = max(0.0, min(float(image_height), y2) - max(0.0, y1))
             fraction = width * height / float(image_width * image_height)
             if fraction > max_fraction:
+                reason = f"area={fraction:.1%}>limit={max_fraction:.1%}"
                 self.get_logger().debug(
-                    f"Rejected {detection.class_name} detection: box covers "
-                    f"{fraction:.1%} of the image (limit {max_fraction:.1%})"
+                    f"Rejected {detection.class_name} detection: {reason}"
+                )
+                rejected.append(
+                    RejectedImageDetection(
+                        detection.class_name, detection.confidence, detection.bbox_xyxy, reason
+                    )
+                )
+                continue
+            if x1 < margin_x or y1 < margin_y or x2 > image_width - margin_x or y2 > image_height - margin_y:
+                reason = f"touches_border_margin={margin_fraction:.1%}"
+                self.get_logger().debug(
+                    f"Rejected {detection.class_name} detection: {reason}"
+                )
+                rejected.append(
+                    RejectedImageDetection(
+                        detection.class_name, detection.confidence, detection.bbox_xyxy, reason
+                    )
                 )
                 continue
             accepted.append(detection)
-        return accepted
+        return accepted, rejected
 
     def _publish_annotated_detections(
-        self, color: np.ndarray, detections: list, source_image: Image
+        self,
+        color: np.ndarray,
+        detections: list,
+        source_image: Image,
+        depth_diagnostics: dict[int, DepthSamplingDiagnostics],
+        rejected_image_detections: list[RejectedImageDetection],
     ) -> None:
         """Publish raw detector boxes from this node's exact inference frame."""
         annotated = color.copy()
-        for detection in detections:
+        height, width = annotated.shape[:2]
+        margin_fraction = float(
+            self.get_parameter("detector.border_margin_fraction").value
+        )
+        margin_x = round(width * margin_fraction)
+        margin_y = round(height * margin_fraction)
+        cv2.rectangle(
+            annotated,
+            (margin_x, margin_y),
+            (width - margin_x, height - margin_y),
+            (255, 0, 255),
+            1,
+        )
+        for index, detection in enumerate(detections):
             left, top, right, bottom = (round(value) for value in detection.bbox_xyxy)
             cv2.rectangle(annotated, (left, top), (right, bottom), (0, 255, 0), 2)
             cv2.putText(
@@ -465,6 +756,39 @@ class SemanticPerceptionNode(Node):
                 0.65,
                 (0, 255, 0),
                 2,
+                cv2.LINE_AA,
+            )
+            diagnostics = depth_diagnostics.get(index)
+            if diagnostics is not None:
+                left, top, right, bottom = diagnostics.bounds_xyxy
+                cv2.rectangle(annotated, (left, top), (right, bottom), (0, 255, 255), 1)
+                ys, xs = np.where(diagnostics.valid_mask)
+                for y, x in zip(ys, xs):
+                    color_value = (
+                        (255, 255, 0)
+                        if diagnostics.inlier_mask[y, x]
+                        else (0, 0, 255)
+                    )
+                    cv2.circle(annotated, (left + int(x), top + int(y)), 1, color_value, -1)
+                cv2.drawMarker(
+                    annotated,
+                    diagnostics.centre_pixel,
+                    (255, 255, 255),
+                    cv2.MARKER_CROSS,
+                    9,
+                    1,
+                )
+        for rejection in rejected_image_detections:
+            left, top, right, bottom = (round(value) for value in rejection.bbox_xyxy)
+            cv2.rectangle(annotated, (left, top), (right, bottom), (0, 0, 255), 2)
+            cv2.putText(
+                annotated,
+                f"REJECTED:{rejection.reason}",
+                (left, max(20, top - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                (0, 0, 255),
+                1,
                 cv2.LINE_AA,
             )
         cv2.putText(
@@ -691,6 +1015,10 @@ def _distribution_messages(distribution: dict[str, float]) -> list[ClassProbabil
         item.probability = max(0.0, float(value)) / total
         messages.append(item)
     return messages
+
+
+def _diagnostic_value(value: float | None) -> float:
+    return float(value) if value is not None else float("nan")
 
 
 def _decode_color_image(message: Image) -> np.ndarray:

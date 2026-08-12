@@ -16,6 +16,17 @@ class LocalizedDetection:
     stamp_ns: int
     frame_id: str
     bbox_xyxy: tuple[float, float, float, float]
+    class_evidence_strength: float = 1.0
+    range_m: float = 1.0
+    appearance_embedding: np.ndarray | None = None
+    appearance_provider_id: str | None = None
+    depth_median_m: float = 0.0
+    depth_stddev_m: float = 0.0
+    depth_valid_pixel_count: int = 0
+    depth_inlier_pixel_count: int = 0
+    base_pixel_stddev_px: float = 0.0
+    bbox_pixel_stddev_px: float = 0.0
+    combined_pixel_stddev_px: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -54,6 +65,16 @@ class FixedCameraCalibration:
         ]
 
 
+@dataclass(frozen=True)
+class DepthSamplingDiagnostics:
+    bounds_xyxy: tuple[int, int, int, int]
+    valid_mask: np.ndarray
+    inlier_mask: np.ndarray
+    median_m: float
+    stddev_m: float
+    centre_pixel: tuple[int, int]
+
+
 def robust_depth_at_detection(
     depth_m: np.ndarray,
     bbox_xyxy: tuple[float, float, float, float],
@@ -62,6 +83,26 @@ def robust_depth_at_detection(
     minimum_depth_m: float,
     maximum_depth_m: float,
 ) -> tuple[float, float, tuple[int, int]]:
+    diagnostics = depth_sampling_diagnostics(
+        depth_m,
+        bbox_xyxy,
+        inner_fraction,
+        minimum_valid_pixels,
+        minimum_depth_m,
+        maximum_depth_m,
+    )
+    return diagnostics.median_m, diagnostics.stddev_m, diagnostics.centre_pixel
+
+
+def depth_sampling_diagnostics(
+    depth_m: np.ndarray,
+    bbox_xyxy: tuple[float, float, float, float],
+    inner_fraction: float,
+    minimum_valid_pixels: int,
+    minimum_depth_m: float,
+    maximum_depth_m: float,
+) -> DepthSamplingDiagnostics:
+    """Return the exact central ROI and MAD inliers used for depth estimation."""
     if depth_m.ndim != 2:
         raise ValueError("Depth image must be single-channel")
     height, width = depth_m.shape
@@ -77,12 +118,13 @@ def robust_depth_at_detection(
     right = max(left + 1, min(width, int(math.ceil(centre_x + half_width))))
     top = max(0, min(height - 1, int(math.floor(centre_y - half_height))))
     bottom = max(top + 1, min(height, int(math.ceil(centre_y + half_height))))
-    values = depth_m[top:bottom, left:right].reshape(-1)
-    valid = values[
-        np.isfinite(values)
-        & (values >= minimum_depth_m)
-        & (values <= maximum_depth_m)
-    ]
+    roi = depth_m[top:bottom, left:right]
+    valid_mask = (
+        np.isfinite(roi)
+        & (roi >= minimum_depth_m)
+        & (roi <= maximum_depth_m)
+    )
+    valid = roi[valid_mask]
     if valid.size < minimum_valid_pixels:
         raise ValueError(
             f"Only {valid.size} valid depth pixels; need {minimum_valid_pixels}"
@@ -90,8 +132,11 @@ def robust_depth_at_detection(
     median = float(np.median(valid))
     absolute_deviation = np.abs(valid - median)
     mad = float(np.median(absolute_deviation))
+    inlier_mask = valid_mask.copy()
     if mad > 0.0:
-        inliers = valid[absolute_deviation <= 3.5 * 1.4826 * mad]
+        valid_inliers = absolute_deviation <= 3.5 * 1.4826 * mad
+        inlier_mask[valid_mask] = valid_inliers
+        inliers = valid[valid_inliers]
         if inliers.size >= minimum_valid_pixels:
             median = float(np.median(inliers))
             mad = float(np.median(np.abs(inliers - median)))
@@ -100,7 +145,14 @@ def robust_depth_at_detection(
         max(0, min(width - 1, int(round(centre_x)))),
         max(0, min(height - 1, int(round(centre_y)))),
     )
-    return median, stddev, pixel
+    return DepthSamplingDiagnostics(
+        bounds_xyxy=(left, top, right, bottom),
+        valid_mask=valid_mask,
+        inlier_mask=inlier_mask,
+        median_m=median,
+        stddev_m=stddev,
+        centre_pixel=pixel,
+    )
 
 
 def deproject_pixel(

@@ -13,6 +13,9 @@ class RawDetection:
     confidence: float
     class_likelihoods: dict[str, float]
     bbox_xyxy: tuple[float, float, float, float]
+    class_evidence_strength: float = 1.0
+    appearance_embedding: np.ndarray | None = None
+    appearance_provider_id: str | None = None
 
 
 class ObjectDetector(Protocol):
@@ -32,6 +35,7 @@ class UltralyticsDetector:
         image_size: int,
         confidence_threshold: float,
         max_detections: int,
+        class_reliability_floor: float,
     ) -> None:
         path = Path(model_path).expanduser().resolve()
         if not path.is_file():
@@ -46,6 +50,7 @@ class UltralyticsDetector:
         self._image_size = image_size
         self._confidence_threshold = confidence_threshold
         self._max_detections = max_detections
+        self._class_reliability_floor = class_reliability_floor
 
     @property
     def model_id(self) -> str:
@@ -82,10 +87,10 @@ class UltralyticsDetector:
                 RawDetection(
                     class_name=label.strip().lower().replace(" ", "_"),
                     confidence=float(confidence),
-                    class_likelihoods={
-                        label.strip().lower().replace(" ", "_"): float(confidence),
-                        "other": 1.0 - float(confidence),
-                    },
+                    class_likelihoods=conditional_class_likelihoods(
+                        label, float(confidence), self._class_reliability_floor
+                    ),
+                    class_evidence_strength=float(confidence),
                     bbox_xyxy=tuple(float(value) for value in coordinates),
                 )
             )
@@ -99,6 +104,7 @@ def create_detector(
     image_size: int,
     confidence_threshold: float,
     max_detections: int,
+    class_reliability_floor: float = 0.60,
 ) -> ObjectDetector:
     if backend == "ultralytics":
         return UltralyticsDetector(
@@ -107,5 +113,17 @@ def create_detector(
             image_size=image_size,
             confidence_threshold=confidence_threshold,
             max_detections=max_detections,
+            class_reliability_floor=class_reliability_floor,
         )
     raise RuntimeError(f"Unsupported detector backend: {backend!r}")
+
+
+def conditional_class_likelihoods(
+    label: str, confidence: float, reliability_floor: float
+) -> dict[str, float]:
+    """Map accepted YOLO confidence to conditional class evidence, not P(other)."""
+    confidence = min(1.0, max(0.0, float(confidence)))
+    reliability_floor = min(1.0, max(0.0, float(reliability_floor)))
+    reliability = reliability_floor + (1.0 - reliability_floor) * confidence
+    normalized_label = label.strip().lower().replace(" ", "_")
+    return {normalized_label: reliability, "other": 1.0 - reliability}

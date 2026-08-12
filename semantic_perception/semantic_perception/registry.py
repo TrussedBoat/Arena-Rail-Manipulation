@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from .localization import LocalizedDetection
 
@@ -25,8 +26,13 @@ class RegistryConfig:
     class_confirmation_probability: float = 0.70
     max_explicit_classes: int = 4
     stale_after_sec: float = 300.0
-    evidence_decay: float = 0.98
+    evidence_decay: float = 0.95
     process_noise_stddev_m: float = 0.002
+    appearance_max_cosine_distance: float = 0.35
+    appearance_cost_weight: float = 0.5
+    appearance_embedding_decay: float = 0.90
+    distance_evidence_reference_m: float = 1.0
+    distance_evidence_min_weight: float = 0.25
 
 
 @dataclass
@@ -38,11 +44,14 @@ class ObjectTrack:
     first_seen_sec: float
     last_seen_sec: float
     model_id: str
+    appearance_embedding: np.ndarray | None = None
+    appearance_provider_id: str | None = None
     class_scores: dict[str, float] = field(default_factory=dict)
     recent_observations: deque[tuple[float, dict[str, float]]] = field(
         default_factory=lambda: deque(maxlen=100)
     )
     state: str = "candidate"
+    confirmation_locked: bool = False
 
     @property
     def class_distribution(self) -> dict[str, float]:
@@ -80,6 +89,17 @@ class ObjectTrack:
         return float(np.sqrt(np.max(np.diag(self.position_covariance))))
 
 
+@dataclass(frozen=True)
+class AssociationResult:
+    detection_index: int
+    track: ObjectTrack
+    decision: str
+    eligible_track_count: int
+    best_mahalanobis_d2: float | None
+    selected_mahalanobis_d2: float | None
+    selected_cost: float | None
+
+
 class ObjectRegistry:
     def __init__(self, config: RegistryConfig, model_id: str) -> None:
         self.config = config
@@ -94,6 +114,20 @@ class ObjectRegistry:
                     track.state = "stale"
         return sorted(self._tracks.values(), key=lambda track: track.object_id)
 
+    def expire_candidates(self, now_sec: float) -> list[str]:
+        """Remove candidates that failed to confirm within their hit window."""
+        expired = [
+            track.object_id
+            for track in self._tracks.values()
+            if (
+                track.state == "candidate"
+                and now_sec - track.last_seen_sec > self.config.confirmation_window_sec
+            )
+        ]
+        for object_id in expired:
+            del self._tracks[object_id]
+        return expired
+
     def update(self, detection: LocalizedDetection) -> ObjectTrack:
         """Compatibility helper for a frame containing one detection."""
         return self.update_frame([detection])[0]
@@ -102,39 +136,180 @@ class ObjectRegistry:
         self, detections: list[LocalizedDetection]
     ) -> list[ObjectTrack]:
         """Associate one RGB-D frame one-to-one, then update/create tracks."""
+        return [result.track for result in self.update_frame_with_diagnostics(detections)]
+
+    def update_frame_with_diagnostics(
+        self, detections: list[LocalizedDetection]
+    ) -> list[AssociationResult]:
+        """Associate a frame and retain costs needed for telemetry."""
         if not detections:
             return []
         for detection in detections:
             self._validate_detection(detection)
 
         tracks = list(self._tracks.values())
-        candidates: list[tuple[float, int, int]] = []
+        costs = np.full((len(tracks), len(detections)), np.inf, dtype=np.float64)
+        distances = np.full((len(tracks), len(detections)), np.nan, dtype=np.float64)
         for track_index, track in enumerate(tracks):
             for detection_index, detection in enumerate(detections):
                 distance = self._mahalanobis_distance_squared(track, detection)
-                if distance is not None and distance <= self.config.mahalanobis_threshold:
-                    candidates.append((distance, track_index, detection_index))
+                if distance is not None:
+                    distances[track_index, detection_index] = distance
+                cost = self._association_cost(track, detection)
+                if cost is not None:
+                    costs[track_index, detection_index] = cost
 
         matched_tracks: set[int] = set()
         matched_detections: set[int] = set()
-        result_by_detection: dict[int, ObjectTrack] = {}
-        for _, track_index, detection_index in sorted(candidates):
-            if track_index in matched_tracks or detection_index in matched_detections:
-                continue
+        result_by_detection: dict[int, AssociationResult] = {}
+        for track_index, detection_index in self._hungarian_matches(costs):
             track = tracks[track_index]
             self._update_track(track, detections[detection_index])
             matched_tracks.add(track_index)
             matched_detections.add(detection_index)
-            result_by_detection[detection_index] = track
+            result_by_detection[detection_index] = AssociationResult(
+                detection_index=detection_index,
+                track=track,
+                decision="matched",
+                eligible_track_count=int(np.isfinite(costs[:, detection_index]).sum()),
+                best_mahalanobis_d2=_finite_min(distances[:, detection_index]),
+                selected_mahalanobis_d2=float(distances[track_index, detection_index]),
+                selected_cost=float(costs[track_index, detection_index]),
+            )
 
         for detection_index, detection in enumerate(detections):
             if detection_index in matched_detections:
                 continue
             track = self._new_track(detection)
             self._tracks[track.object_id] = track
-            result_by_detection[detection_index] = track
+            result_by_detection[detection_index] = AssociationResult(
+                detection_index=detection_index,
+                track=track,
+                decision="new_track",
+                eligible_track_count=int(np.isfinite(costs[:, detection_index]).sum()),
+                best_mahalanobis_d2=_finite_min(distances[:, detection_index]),
+                selected_mahalanobis_d2=None,
+                selected_cost=None,
+            )
 
         return [result_by_detection[index] for index in range(len(detections))]
+
+    def merge_confirmed_duplicates(self) -> list[tuple[str, str]]:
+        """Conservatively merge spatially and visually matching confirmed tracks."""
+        merged: list[tuple[str, str]] = []
+        while True:
+            tracks = sorted(self._tracks.values(), key=lambda track: track.object_id)
+            pair: tuple[ObjectTrack, ObjectTrack] | None = None
+            for index, left in enumerate(tracks):
+                if left.state != "confirmed" or left.class_name == UNKNOWN_CLASS:
+                    continue
+                for right in tracks[index + 1 :]:
+                    if (
+                        right.state == "confirmed"
+                        and right.class_name == left.class_name
+                        and self._confirmed_tracks_match(left, right)
+                    ):
+                        pair = left, right
+                        break
+                if pair is not None:
+                    break
+            if pair is None:
+                return merged
+            survivor, duplicate = pair
+            self._merge_tracks(survivor, duplicate)
+            del self._tracks[duplicate.object_id]
+            merged.append((survivor.object_id, duplicate.object_id))
+
+    def _confirmed_tracks_match(self, left: ObjectTrack, right: ObjectTrack) -> bool:
+        innovation = right.position - left.position
+        covariance = left.position_covariance + right.position_covariance
+        try:
+            distance_squared = float(innovation.T @ np.linalg.solve(covariance, innovation))
+        except np.linalg.LinAlgError:
+            return False
+        if not np.isfinite(distance_squared) or distance_squared > self.config.mahalanobis_threshold:
+            return False
+        appearance_distance = self._track_appearance_distance(left, right)
+        return (
+            appearance_distance is not None
+            and appearance_distance <= self.config.appearance_max_cosine_distance
+        )
+
+    @staticmethod
+    def _track_appearance_distance(left: ObjectTrack, right: ObjectTrack) -> float | None:
+        if (
+            left.appearance_embedding is None
+            or right.appearance_embedding is None
+            or not left.appearance_provider_id
+            or left.appearance_provider_id != right.appearance_provider_id
+            or left.appearance_embedding.shape != right.appearance_embedding.shape
+        ):
+            return None
+        distance = 1.0 - float(np.dot(left.appearance_embedding, right.appearance_embedding))
+        return float(np.clip(distance, 0.0, 2.0)) if np.isfinite(distance) else None
+
+    def _merge_tracks(self, survivor: ObjectTrack, duplicate: ObjectTrack) -> None:
+        """Fuse correlated estimates using equal-weight covariance intersection."""
+        inverse_survivor = np.linalg.inv(survivor.position_covariance)
+        inverse_duplicate = np.linalg.inv(duplicate.position_covariance)
+        covariance = np.linalg.inv(0.5 * inverse_survivor + 0.5 * inverse_duplicate)
+        survivor.position = covariance @ (
+            0.5 * inverse_survivor @ survivor.position
+            + 0.5 * inverse_duplicate @ duplicate.position
+        )
+        survivor.position_covariance = (covariance + covariance.T) / 2.0
+        survivor.observation_count += duplicate.observation_count
+        survivor.first_seen_sec = min(survivor.first_seen_sec, duplicate.first_seen_sec)
+        survivor.last_seen_sec = max(survivor.last_seen_sec, duplicate.last_seen_sec)
+        for label, score in duplicate.class_scores.items():
+            survivor.class_scores[label] = survivor.class_scores.get(label, 0.0) + score
+        self._prune_class_scores(survivor)
+        survivor.recent_observations = deque(
+            sorted(
+                (*survivor.recent_observations, *duplicate.recent_observations),
+                key=lambda observation: observation[0],
+            )[-100:],
+            maxlen=100,
+        )
+        if self._track_appearance_distance(survivor, duplicate) is not None:
+            survivor_weight = max(1, survivor.observation_count - duplicate.observation_count)
+            duplicate_weight = max(1, duplicate.observation_count)
+            survivor.appearance_embedding = _normalized_embedding(
+                survivor_weight * survivor.appearance_embedding
+                + duplicate_weight * duplicate.appearance_embedding
+            )
+        survivor.confirmation_locked = True
+        self._update_state(survivor, survivor.last_seen_sec)
+
+    @staticmethod
+    def _hungarian_matches(costs: np.ndarray) -> list[tuple[int, int]]:
+        """Globally minimize eligible matching costs while allowing unmatched rows."""
+        track_count, detection_count = costs.shape
+        if track_count == 0 or detection_count == 0:
+            return []
+        # Every eligible association cost is normalized to <= 1. Give each
+        # unmatched item cost 1, so any eligible edge beats leaving both ends
+        # unmatched. Invalid edges are always more expensive than that choice.
+        unmatched_cost = 1.0
+        invalid_cost = 4.0
+        matrix_size = track_count + detection_count
+        matrix = np.full((matrix_size, matrix_size), invalid_cost, dtype=np.float64)
+        matrix[:track_count, :detection_count] = np.where(
+            np.isfinite(costs), costs, invalid_cost
+        )
+        for track_index in range(track_count):
+            matrix[track_index, detection_count + track_index] = unmatched_cost
+        for detection_index in range(detection_count):
+            matrix[track_count + detection_index, detection_index] = unmatched_cost
+        matrix[track_count:, detection_count:] = 0.0
+        rows, columns = linear_sum_assignment(matrix)
+        return [
+            (int(track_index), int(detection_index))
+            for track_index, detection_index in zip(rows, columns)
+            if track_index < track_count
+            and detection_index < detection_count
+            and np.isfinite(costs[track_index, detection_index])
+        ]
 
     def best_confirmed(
         self,
@@ -204,7 +379,7 @@ class ObjectRegistry:
 
     def persist(self, path: Path, reference_frame: str) -> None:
         payload = {
-            "schema_version": 2,
+            "schema_version": 4,
             "reference_frame": reference_frame,
             "updated_at": _iso_time(datetime.now(tz=timezone.utc).timestamp()),
             "objects": [self._serialize_track(track) for track in self.tracks()],
@@ -246,6 +421,42 @@ class ObjectRegistry:
         distance = float(innovation.T @ solution)
         return distance if np.isfinite(distance) and distance >= 0.0 else None
 
+    def _association_cost(
+        self, track: ObjectTrack, detection: LocalizedDetection
+    ) -> float | None:
+        distance_squared = self._mahalanobis_distance_squared(track, detection)
+        if (
+            distance_squared is None
+            or distance_squared > self.config.mahalanobis_threshold
+        ):
+            return None
+        spatial_cost = distance_squared / self.config.mahalanobis_threshold
+        appearance_distance = self._appearance_distance(track, detection)
+        if appearance_distance is None:
+            return spatial_cost
+        if appearance_distance > self.config.appearance_max_cosine_distance:
+            return None
+        weight = self.config.appearance_cost_weight
+        return (1.0 - weight) * spatial_cost + weight * appearance_distance
+
+    @staticmethod
+    def _appearance_distance(
+        track: ObjectTrack, detection: LocalizedDetection
+    ) -> float | None:
+        if (
+            track.appearance_embedding is None
+            or detection.appearance_embedding is None
+            or not track.appearance_provider_id
+            or track.appearance_provider_id != detection.appearance_provider_id
+        ):
+            return None
+        if track.appearance_embedding.shape != detection.appearance_embedding.shape:
+            return None
+        distance = 1.0 - float(
+            np.dot(track.appearance_embedding, detection.appearance_embedding)
+        )
+        return float(np.clip(distance, 0.0, 2.0)) if np.isfinite(distance) else None
+
     def _update_track(
         self, track: ObjectTrack, detection: LocalizedDetection
     ) -> None:
@@ -271,7 +482,8 @@ class ObjectRegistry:
         track.first_seen_sec = min(track.first_seen_sec, now_sec)
         track.last_seen_sec = now_sec
         track.model_id = self.model_id
-        self._add_class_observation(track, detection.class_likelihoods, now_sec)
+        self._update_appearance(track, detection)
+        self._add_class_observation(track, detection, now_sec)
         self._update_state(track, now_sec)
 
     def _new_track(self, detection: LocalizedDetection) -> ObjectTrack:
@@ -285,22 +497,53 @@ class ObjectRegistry:
             first_seen_sec=now_sec,
             last_seen_sec=now_sec,
             model_id=self.model_id,
+            appearance_embedding=_normalized_embedding(detection.appearance_embedding),
+            appearance_provider_id=detection.appearance_provider_id,
         )
-        self._add_class_observation(track, detection.class_likelihoods, now_sec)
+        self._add_class_observation(track, detection, now_sec)
         self._update_state(track, now_sec)
         return track
+
+    def _update_appearance(
+        self, track: ObjectTrack, detection: LocalizedDetection) -> None:
+        embedding = _normalized_embedding(detection.appearance_embedding)
+        if embedding is None or not detection.appearance_provider_id:
+            return
+        if (
+            track.appearance_embedding is None
+            or track.appearance_provider_id != detection.appearance_provider_id
+            or track.appearance_embedding.shape != embedding.shape
+        ):
+            track.appearance_embedding = embedding
+            track.appearance_provider_id = detection.appearance_provider_id
+            return
+        decay = self.config.appearance_embedding_decay
+        track.appearance_embedding = _normalized_embedding(
+            decay * track.appearance_embedding + (1.0 - decay) * embedding
+        )
 
     def _add_class_observation(
         self,
         track: ObjectTrack,
-        likelihoods: dict[str, float],
+        detection: LocalizedDetection,
         now_sec: float,
     ) -> None:
-        normalized = _normalize_distribution(likelihoods)
+        normalized = _normalize_distribution(detection.class_likelihoods)
+        range_m = max(float(detection.range_m), 1e-6)
+        evidence_weight = min(
+            1.0,
+            max(
+                self.config.distance_evidence_min_weight,
+                self.config.distance_evidence_reference_m / range_m,
+            ),
+        )
+        evidence_weight *= min(1.0, max(0.0, detection.class_evidence_strength))
         for label in list(track.class_scores):
             track.class_scores[label] *= self.config.evidence_decay
         for label, probability in normalized.items():
-            track.class_scores[label] = track.class_scores.get(label, 0.0) + probability
+            track.class_scores[label] = (
+                track.class_scores.get(label, 0.0) + probability * evidence_weight
+            )
         track.class_scores.setdefault(OTHER_CLASS, 0.0)
         self._prune_class_scores(track)
         track.recent_observations.append((now_sec, normalized))
@@ -317,7 +560,7 @@ class ObjectRegistry:
         recent_count = sum(
             stamp >= cutoff for stamp, _ in track.recent_observations
         )
-        if recent_count < self.config.confirmation_hits:
+        if recent_count < self.config.confirmation_hits and not track.confirmation_locked:
             track.state = "candidate"
         elif (
             track.class_name == UNKNOWN_CLASS
@@ -326,6 +569,7 @@ class ObjectRegistry:
             track.state = "class_ambiguous"
         else:
             track.state = "confirmed"
+            track.confirmation_locked = True
 
     def _validate_detection(self, detection: LocalizedDetection) -> None:
         position = np.asarray(detection.position, dtype=np.float64)
@@ -339,6 +583,13 @@ class ObjectRegistry:
         if float(np.min(np.linalg.eigvalsh(covariance))) <= 0.0:
             raise ValueError("Object covariance must be positive definite")
         _normalize_distribution(detection.class_likelihoods)
+        embedding = _normalized_embedding(detection.appearance_embedding)
+        if detection.appearance_embedding is not None and embedding is None:
+            raise ValueError("Appearance embedding must be finite and non-zero")
+        if embedding is not None and not detection.appearance_provider_id:
+            raise ValueError("Appearance embedding requires a provider ID")
+        if not np.isfinite(detection.range_m) or detection.range_m <= 0.0:
+            raise ValueError("Detection range must be finite and positive")
 
     def _load_legacy_coordinates(self, payload: dict[str, object]) -> None:
         now_sec = datetime.now(tz=timezone.utc).timestamp()
@@ -368,6 +619,7 @@ class ObjectRegistry:
                 model_id="legacy_json",
                 class_scores={label: float(self.config.confirmation_hits)},
                 state="confirmed",
+                confirmation_locked=True,
             )
             self._tracks[track.object_id] = track
 
@@ -389,6 +641,10 @@ class ObjectRegistry:
             return
         if not np.all(np.isfinite(position)):
             return
+        try:
+            appearance_embedding = self._load_appearance_embedding(item, schema_version)
+        except (TypeError, ValueError):
+            appearance_embedding = None
         track = ObjectTrack(
             object_id=object_id,
             position=position,
@@ -397,8 +653,17 @@ class ObjectRegistry:
             first_seen_sec=first_seen,
             last_seen_sec=last_seen,
             model_id=str(item.get("model_id", "unknown")),
+            appearance_embedding=appearance_embedding,
+            appearance_provider_id=(
+                str(item["appearance_provider_id"])
+                if schema_version >= 3 and item.get("appearance_provider_id")
+                else None
+            ),
             class_scores=class_scores,
             state=str(item.get("state", "stale")),
+            confirmation_locked=bool(
+                item.get("confirmation_locked", item.get("state") == "confirmed")
+            ),
         )
         self._prune_class_scores(track)
         self._tracks[track.object_id] = track
@@ -444,6 +709,17 @@ class ObjectRegistry:
         scores.setdefault(OTHER_CLASS, 0.0)
         return scores
 
+    @staticmethod
+    def _load_appearance_embedding(
+        item: dict[str, object], schema_version: int
+    ) -> np.ndarray | None:
+        if schema_version < 3 or "appearance_embedding" not in item:
+            return None
+        raw_embedding = item.get("appearance_embedding")
+        if not isinstance(raw_embedding, list):
+            return None
+        return _normalized_embedding(np.asarray(raw_embedding, dtype=np.float64))
+
     def _record_loaded_id(self, object_id: str) -> None:
         if not object_id.startswith("object_"):
             return
@@ -477,16 +753,46 @@ class ObjectRegistry:
             "position_stddev_m": round(float(track.position_stddev_m), 6),
             "confidence": round(float(track.class_probability), 6),
             "state": track.state,
+            "confirmation_locked": track.confirmation_locked,
             "observation_count": track.observation_count,
             "first_seen": _iso_time(track.first_seen_sec),
             "last_seen": _iso_time(track.last_seen_sec),
             "model_id": track.model_id,
+            **(
+                {
+                    "appearance_provider_id": track.appearance_provider_id,
+                    "appearance_embedding": [
+                        round(float(value), 8)
+                        for value in track.appearance_embedding.tolist()
+                    ],
+                }
+                if track.appearance_embedding is not None
+                and track.appearance_provider_id
+                else {}
+            ),
         }
 
 
 def _normalize_label(label: str) -> str:
     normalized = str(label).strip().lower().replace(" ", "_")
     return normalized or UNKNOWN_CLASS
+
+
+def _normalized_embedding(value: np.ndarray | None) -> np.ndarray | None:
+    if value is None:
+        return None
+    embedding = np.asarray(value, dtype=np.float64).reshape(-1)
+    if embedding.size == 0 or not np.all(np.isfinite(embedding)):
+        return None
+    norm = float(np.linalg.norm(embedding))
+    if norm <= 0.0:
+        return None
+    return embedding / norm
+
+
+def _finite_min(values: np.ndarray) -> float | None:
+    finite = values[np.isfinite(values)]
+    return float(np.min(finite)) if finite.size else None
 
 
 def _normalize_distribution(values: dict[str, float]) -> dict[str, float]:
