@@ -30,6 +30,7 @@ from ros_interface import (
     wait_for_place,
 )
 from targeted_scan_geometry import (
+    ScanPose,
     close_view_tilt_poses,
     generate_desk_arc,
     generate_desk_targets,
@@ -44,9 +45,9 @@ SEARCH_TELEMETRY_TIMEOUT_SEC = 10.0
 JOINT_MOTION_TIMEOUT_SEC = 50.0
 HOME_MOTION_TIMEOUT_SEC = 120.0
 JOINT_POLL_INTERVAL_SEC = 0.05
+MAX_MANIPULATION_RAIL_OFFSET_M = 0.15
 STARTUP_RAIL_POSITION_M = -1.1
 STARTUP_ARM_JOINTS = (0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854)
-STARTUP_GRIPPER_OPEN_COMMAND = 100.0
 _yolo_detector = None
 
 
@@ -491,16 +492,39 @@ def start_joint_controller() -> str:
         node = get_shared_node()
         if not _wait_for_startup_pose_telemetry(node):
             return "Error starting controller: timed out waiting for rail and arm joint telemetry."
+        # Startup must take over cleanly even when the previous task stopped
+        # after an RRT command and this process has no matching local status.
+        if not node.cancel_eef_motion(config.search.targeted_cancel_timeout_sec):
+            print(
+                "[STARTUP] No RRT cancellation acknowledgement; continuing with "
+                "the direct safe-posture takeover."
+            )
+        node.cartesian_control_active = False
 
         _command_rail_and_wait(
             node, STARTUP_RAIL_POSITION_M, config, timeout_sec=HOME_MOTION_TIMEOUT_SEC
         )
         _command_default_standing_posture_and_wait(node, config)
 
-        node.open_gripper(STARTUP_GRIPPER_OPEN_COMMAND)
+        node.cartesian_control_active = False
+        gripper_feedback_confirmed = True
+        try:
+            _command_gripper_and_wait(
+                node,
+                config.manipulation.gripper_open_command,
+                config.manipulation.gripper_open_state_m,
+                config,
+            )
+        except RuntimeConfigurationError as exc:
+            # The command has already been published.  Startup remains usable
+            # when gripper telemetry starts late; pick/place retain strict
+            # feedback checks before performing a manipulation.
+            gripper_feedback_confirmed = False
+            print(f"[STARTUP] Open-gripper feedback not confirmed: {exc}")
         return (
             "Success: controller is ready at startup pose "
-            f"(rail_j1={STARTUP_RAIL_POSITION_M:.1f}m) with gripper open."
+            f"(rail_j1={STARTUP_RAIL_POSITION_M:.1f}m) with open-gripper command issued"
+            + ("." if gripper_feedback_confirmed else "; feedback is pending.")
         )
     except Exception as e:
         return f"Error starting controller: {e}"
@@ -607,6 +631,13 @@ def _command_rail_and_wait(
     if not config.search.rail_min_position <= target <= config.search.rail_max_position:
         raise RuntimeConfigurationError(
             f"Refusing rail target {target:.4f}m outside configured bounds"
+        )
+    ensure_rrt_idle = getattr(node, "ensure_rrt_idle", None)
+    if callable(ensure_rrt_idle) and not ensure_rrt_idle(
+        config.search.targeted_cancel_timeout_sec
+    ):
+        raise RuntimeConfigurationError(
+            "Could not stop active RRT trajectory before rail motion"
         )
     starting_position = getattr(node, "current_rail_position", None)
     current_position = (
@@ -974,7 +1005,233 @@ def _persist_dynamic_coordinate_3d(path: Path, target: str, x: float, y: float, 
         ) from exc
 
 
-def general_mapping(target_object: str) -> dict[str, object]:
+def _semantic_registry_objects(config: RuntimeConfig) -> list[dict[str, object]]:
+    """Read the durable semantic-perception registry without changing it."""
+    path = config.paths.semantic_objects
+    if not path.is_file():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeConfigurationError(
+            f"Could not read semantic registry {path}: {exc}"
+        ) from exc
+    objects = payload.get("objects", []) if isinstance(payload, dict) else []
+    if not isinstance(objects, list):
+        raise RuntimeConfigurationError("semantic_objects.json has an invalid objects list")
+    return [item for item in objects if isinstance(item, dict)]
+
+
+def _confirmed_semantic_object(
+    config: RuntimeConfig, target: str
+) -> dict[str, object] | None:
+    """Return the most reliable current registry entry for one canonical class."""
+    canonical = _normalize_label(target)
+    matches: list[dict[str, object]] = []
+    for item in _semantic_registry_objects(config):
+        position = item.get("position")
+        if (
+            _normalize_label(item.get("class_name", "")) != canonical
+            or item.get("state") != "confirmed"
+            or not isinstance(position, dict)
+        ):
+            continue
+        try:
+            xyz = tuple(float(position[axis]) for axis in ("x", "y", "z"))
+            confidence = float(item.get("confidence", 0.0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in (*xyz, confidence)):
+            continue
+        matches.append(item)
+    return max(
+        matches,
+        key=lambda item: (float(item.get("confidence", 0.0)), str(item.get("last_seen", ""))),
+        default=None,
+    )
+
+
+def _confirmed_semantic_object_by_id(
+    config: RuntimeConfig, object_id: str
+) -> dict[str, object] | None:
+    """Resolve one exact, usable semantic object instance."""
+    requested_id = str(object_id).strip()
+    if not requested_id:
+        return None
+    for item in _semantic_registry_objects(config):
+        if str(item.get("id", "")) != requested_id or item.get("state") != "confirmed":
+            continue
+        position = item.get("position")
+        if not isinstance(position, dict):
+            continue
+        try:
+            values = tuple(float(position[axis]) for axis in ("x", "y", "z"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if all(math.isfinite(value) for value in values):
+            return item
+    return None
+
+
+def get_semantic_objects(class_names: Sequence[str] | None = None) -> dict[str, object]:
+    """Return only confirmed requested classes from the durable semantic map.
+
+    An omitted or empty class list is intentionally rejected so an accidental
+    full-map response cannot consume the VLM context window.
+    """
+    try:
+        config = get_runtime_config()
+        raw_classes = [class_names] if isinstance(class_names, str) else (class_names or [])
+        requested = sorted(
+            {_normalize_label(name) for name in raw_classes if _normalize_label(name)}
+        )
+        if not requested:
+            return {
+                "status": "error",
+                "reason": "class_names must contain at least one requested class.",
+                "objects": [],
+            }
+        requested_set = set(requested)
+        objects = _semantic_registry_objects(config)
+        summary = []
+        for item in objects:
+            if (
+                _normalize_label(item.get("class_name", "")) not in requested_set
+                or item.get("state") != "confirmed"
+            ):
+                continue
+            position = item.get("position", {})
+            if not isinstance(position, dict):
+                continue
+            summary.append(
+                {
+                    "object_id": item.get("id"),
+                    "class_name": item.get("class_name"),
+                    "state": item.get("state"),
+                    "confidence": item.get("confidence"),
+                    "x": position.get("x"),
+                    "y": position.get("y"),
+                    "z": position.get("z"),
+                    "last_seen": item.get("last_seen"),
+                }
+            )
+        return {
+            "status": "success",
+            "path": str(config.paths.semantic_objects),
+            "requested_classes": requested,
+            "classes_without_match": sorted(
+                requested_set
+                - {_normalize_label(item["class_name"]) for item in summary}
+            ),
+            "objects": summary,
+        }
+    except RuntimeConfigurationError as exc:
+        return {"status": "error", "reason": str(exc), "objects": []}
+
+
+def _execute_mapping_pose(node: object, pose: object, config: RuntimeConfig) -> None:
+    """Execute one mapping viewpoint without target-specific inference or cancellation."""
+    node.begin_eef_pose(
+        pose.x,
+        pose.y,
+        pose.z,
+        pose.roll,
+        pose.pitch,
+        pose.yaw,
+        readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+        tf_timeout_sec=config.cartesian.tf_timeout_sec,
+        base_frame=config.cartesian.base_frame,
+        eef_frame=config.cartesian.eef_frame,
+    )
+    if not node.wait_for_eef_motion(config.cartesian.command_timeout_sec):
+        raise RuntimeConfigurationError("RRT mapping viewpoint did not complete successfully")
+
+
+def _scan_mapping_desk_sides(
+    node: object, config: RuntimeConfig, station: float
+) -> int:
+    """Scan both desk sides from one rail station with semantic perception running."""
+    completed = 0
+    viewpoints = config.search.mapping_scan_viewpoints
+    for side, label in ((1, "left"), (-1, "right")):
+        if completed:
+            _command_default_standing_posture_and_wait(node, config)
+        arc_poses = generate_desk_arc(
+            current_rail=station,
+            rail_min=config.search.rail_min_position,
+            rail_max=config.search.rail_max_position,
+            side=side,
+            desk_width=config.search.targeted_desk_width,
+            radius=config.search.targeted_arc_radius,
+            height=config.search.targeted_scan_height,
+            roll=config.search.targeted_scan_roll,
+            pitch=config.search.targeted_scan_pitch,
+            viewpoints=viewpoints,
+        )
+        targets = generate_desk_targets(
+            current_rail=station,
+            rail_min=config.search.rail_min_position,
+            rail_max=config.search.rail_max_position,
+            side=side,
+            table_scan_y=config.search.targeted_table_scan_y,
+            surface_z=config.search.targeted_desk_surface_z,
+            viewpoints=viewpoints,
+        )
+        print(f"[MAPPING][{label.upper()}] {viewpoints} RRT viewpoints at rail={station:.3f}m")
+        for index, (arc_pose, target_point) in enumerate(zip(arc_poses, targets, strict=True), 1):
+            pose = _camera_look_at_scan_pose(node, arc_pose, target_point, config)
+            print(f"[MAPPING][{label.upper()}] viewpoint {index}/{viewpoints}")
+            _execute_mapping_pose(node, pose, config)
+            completed += 1
+    return completed
+
+
+def general_mapping() -> dict[str, object]:
+    """Build a full semantic map from min, centre, and max rail stations."""
+    completed_viewpoints = 0
+    started = time.monotonic()
+    node = None
+    config = None
+    try:
+        config = get_runtime_config()
+        node = get_shared_node()
+        if not _wait_for_search_telemetry(node):
+            return _failure_result("", "Timed out waiting for rail and arm telemetry.", state="initialize")
+        stations = (
+            config.search.rail_min_position,
+            rail_centre(config.search.rail_min_position, config.search.rail_max_position),
+            config.search.rail_max_position,
+        )
+        for index, station in enumerate(stations, 1):
+            print(f"[MAPPING][STATION] {index}/3: moving rail to {station:.3f}m")
+            _command_default_standing_posture_and_wait(node, config)
+            _command_rail_and_wait(node, station, config)
+            completed_viewpoints += _scan_mapping_desk_sides(node, config, station)
+        _return_targeted_search_to_home(node, config)
+        return {
+            "status": "success",
+            "success": True,
+            "state": "complete",
+            "stations": list(stations),
+            "viewpoints_completed": completed_viewpoints,
+            "viewpoints_planned": 6 * config.search.mapping_scan_viewpoints,
+            "elapsed_sec": round(time.monotonic() - started, 2),
+        }
+    except Exception as exc:
+        recovery_error = None
+        if node is not None and config is not None:
+            try:
+                _return_targeted_search_to_home(node, config)
+            except Exception as home_exc:
+                recovery_error = str(home_exc)
+        reason = f"Mapping aborted safely: {exc}"
+        if recovery_error:
+            reason += f"; home recovery failed: {recovery_error}"
+        return _failure_result("", reason, state="failure", observations=completed_viewpoints)
+
+
+def _legacy_general_mapping(target_object: str) -> dict[str, object]:
     """General mapping tool: full rail sweep with YOLO to locate and persist target coordinates."""
     target = _normalize_label(target_object or "")
     if not target:
@@ -1397,7 +1654,7 @@ def _scan_both_desk_sides(
     return None, None, observations
 
 
-def targeted_search(target_object: str) -> dict[str, object]:
+def _targeted_search_legacy_local_yolo(target_object: str) -> dict[str, object]:
     """Search both desk rows with RRT wrist arcs and confirm candidates up close."""
     target = _normalize_label(target_object or "")
     if not target:
@@ -1672,6 +1929,231 @@ def targeted_search(target_object: str) -> dict[str, object]:
         )
 
 
+def _semantic_target_matches(item: object, target: str, minimum: float) -> bool:
+    return bool(
+        item is not None
+        and _normalize_label(getattr(item, "class_name", "")) == target
+        and float(getattr(item, "confidence", 0.0)) >= minimum
+    )
+
+
+def _semantic_result_object(node: object, target: str, minimum: float) -> object | None:
+    status = node.semantic_find_status()
+    if status["error"]:
+        raise RuntimeConfigurationError(f"Semantic FindObject failed: {status['error']}")
+    result = status["result"]
+    if result is not None and bool(result.found):
+        item = result.object
+        if _semantic_target_matches(item, target, minimum):
+            return item
+    return None
+
+
+def _hold_semantic_candidate(
+    node: object, candidate: object, target: str, config: RuntimeConfig
+) -> object | None:
+    """Aim at one candidate until semantic perception confirms or expires it."""
+    global_x = float(candidate.position.x)
+    global_y = float(candidate.position.y)
+    global_z = float(candidate.position.z)
+    rail = float(node.current_rail_position)
+    side = -1 if global_y >= 0.0 else 1
+    pose = ScanPose(
+        x=0.0,
+        y=side * config.search.targeted_close_standoff,
+        z=config.search.targeted_scan_height,
+        roll=config.search.targeted_scan_roll,
+        pitch=config.search.targeted_scan_pitch,
+        yaw=0.0,
+    )
+    base_target = type("SemanticTarget", (), {
+        "x": rail - global_x, "y": -global_y, "z": global_z
+    })()
+    aimed_pose = _camera_look_at_scan_pose(node, pose, base_target, config)
+    print(f"[TARGETED][CANDIDATE] Holding view of {candidate.object_id}.")
+    # Cancellation already leaves the robot at the camera pose that detected
+    # this candidate.  A closer re-aim is useful when feasible, but it must not
+    # turn an unconfirmed candidate into a terminal search failure.
+    try:
+        hold_completed = node.send_eef_pose(
+            aimed_pose.x, aimed_pose.y, aimed_pose.z,
+            aimed_pose.roll, aimed_pose.pitch, aimed_pose.yaw,
+            timeout_sec=config.cartesian.command_timeout_sec,
+            readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+            tf_timeout_sec=config.cartesian.tf_timeout_sec,
+            base_frame=config.cartesian.base_frame, eef_frame=config.cartesian.eef_frame,
+        )
+        if not hold_completed:
+            print(
+                "[TARGETED][CANDIDATE] Re-aim pose did not complete; "
+                "holding the cancelled detection view instead."
+            )
+    except (RuntimeError, TimeoutError, ValueError) as exc:
+        print(
+            "[TARGETED][CANDIDATE] Re-aim pose was unavailable; "
+            f"holding the cancelled detection view instead: {exc}"
+        )
+
+    candidate_id = candidate.object_id
+    while True:
+        confirmed = _semantic_result_object(
+            node, target, config.search.targeted_confirmation_confidence
+        )
+        if confirmed is not None:
+            return confirmed
+        current = node.semantic_object(candidate_id)
+        if current is None and node.semantic_find_status()["objects_received"]:
+            print("[TARGETED][CANDIDATE] Candidate expired; resuming scan.")
+            return None
+        if current is not None and str(current.state) != "candidate":
+            print(
+                "[TARGETED][CANDIDATE] Candidate did not confirm "
+                f"(state={current.state}); resuming scan."
+            )
+            return None
+        if _semantic_target_matches(
+            current, target, config.search.targeted_confirmation_confidence
+        ) and str(current.state) == "confirmed":
+            return current
+        status = node.semantic_find_status()
+        if status["result"] is not None:
+            print("[TARGETED][CANDIDATE] Semantic action completed without confirmation; resuming scan.")
+            return None
+        time.sleep(0.05)
+
+
+def _scan_pose_with_semantic(
+    node: object, target: str, pose: ScanPose, config: RuntimeConfig
+) -> object | None:
+    """Run one RRT scan pose and interrupt it only for a semantic candidate."""
+    node.begin_eef_pose(
+        pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw,
+        readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+        tf_timeout_sec=config.cartesian.tf_timeout_sec,
+        base_frame=config.cartesian.base_frame, eef_frame=config.cartesian.eef_frame,
+    )
+    while not node.eef_motion_done():
+        confirmed = _semantic_result_object(
+            node, target, config.search.targeted_confirmation_confidence
+        )
+        if confirmed is not None:
+            node.cancel_eef_motion(config.search.targeted_cancel_timeout_sec)
+            return confirmed
+        semantic_status = node.semantic_find_status()
+        candidate = semantic_status["candidate"]
+        if _semantic_target_matches(
+            candidate, target, config.search.targeted_candidate_confidence
+        ) and (
+            not semantic_status["objects_received"]
+            or node.semantic_object(candidate.object_id) is not None
+        ):
+            if not node.cancel_eef_motion(config.search.targeted_cancel_timeout_sec):
+                raise RuntimeConfigurationError("Timed out cancelling RRT for semantic candidate")
+            return _hold_semantic_candidate(node, candidate, target, config)
+        time.sleep(0.05)
+    if not node.wait_for_eef_motion(0.0):
+        raise RuntimeConfigurationError("RRT scan pose did not complete successfully")
+    return _semantic_result_object(node, target, config.search.targeted_confirmation_confidence)
+
+
+def _scan_semantic_both_desk_sides(node: object, target: str, config: RuntimeConfig) -> object | None:
+    current_rail = float(node.current_rail_position)
+    for side, label in ((1, "left"), (-1, "right")):
+        arc_poses = generate_desk_arc(
+            current_rail=current_rail, rail_min=config.search.rail_min_position,
+            rail_max=config.search.rail_max_position, side=side,
+            desk_width=config.search.targeted_desk_width,
+            radius=config.search.targeted_arc_radius, height=config.search.targeted_scan_height,
+            roll=config.search.targeted_scan_roll, pitch=config.search.targeted_scan_pitch,
+            viewpoints=config.search.targeted_scan_viewpoints,
+        )
+        targets = generate_desk_targets(
+            current_rail=current_rail, rail_min=config.search.rail_min_position,
+            rail_max=config.search.rail_max_position, side=side,
+            table_scan_y=config.search.targeted_table_scan_y,
+            surface_z=config.search.targeted_desk_surface_z,
+            viewpoints=config.search.targeted_scan_viewpoints,
+        )
+        print(f"[TARGETED][{label.upper()}] Scanning {len(arc_poses)} RRT viewpoints using semantic perception.")
+        for arc_pose, target_point in zip(arc_poses, targets, strict=True):
+            confirmed = _scan_pose_with_semantic(
+                node, target, _camera_look_at_scan_pose(node, arc_pose, target_point, config), config
+            )
+            if confirmed is not None:
+                return confirmed
+        if side == 1:
+            _command_default_standing_posture_and_wait(node, config)
+    return None
+
+
+def targeted_search(target_object: str) -> dict[str, object]:
+    """Search RRT scan paths while semantic perception owns all detection and depth work."""
+    target = _normalize_label(target_object or "")
+    if not target:
+        return _failure_result(target, "A non-empty target label is required.", state="initialize")
+    try:
+        config = get_runtime_config()
+        node = get_shared_node()
+        if not _wait_for_search_telemetry(node):
+            return _failure_result(target, "Timed out waiting for rail and arm telemetry.", state="initialize")
+        node.start_semantic_find_object(
+            target, config.search.targeted_confirmation_confidence,
+            config.search.targeted_semantic_action_timeout_sec,
+        )
+        centre = rail_centre(config.search.rail_min_position, config.search.rail_max_position)
+        stations = [float(node.current_rail_position)]
+        if not math.isclose(stations[0], centre, abs_tol=config.search.rail_joint_tolerance):
+            stations.append(centre)
+        confirmed = None
+        for index, station in enumerate(stations):
+            if index:
+                _command_default_standing_posture_and_wait(node, config)
+                _command_rail_and_wait(node, station, config)
+            confirmed = _scan_semantic_both_desk_sides(node, target, config)
+            if confirmed is not None:
+                break
+        if confirmed is None:
+            node.cancel_semantic_find_object()
+            _return_targeted_search_to_home(node, config)
+            return _failure_result(target, "Couldn't find target after scanning both desk sides and rail centre.", state="couldnt_find")
+
+        # Confirmation is semantic.  Move to its global X, then leave the camera
+        # near and aimed at its published global position.
+        _command_default_standing_posture_and_wait(node, config)
+        final_rail = max(config.search.rail_min_position, min(config.search.rail_max_position, float(confirmed.position.x)))
+        _command_rail_and_wait(node, final_rail, config)
+        side = -1 if float(confirmed.position.y) >= 0.0 else 1
+        pose = ScanPose(0.0, side * config.search.targeted_close_standoff,
+                        config.search.targeted_scan_height, config.search.targeted_scan_roll,
+                        config.search.targeted_scan_pitch, 0.0)
+        base_target = type("SemanticTarget", (), {
+            "x": final_rail - float(confirmed.position.x),
+            "y": -float(confirmed.position.y), "z": float(confirmed.position.z)
+        })()
+        pose = _camera_look_at_scan_pose(node, pose, base_target, config)
+        if not node.send_eef_pose(pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw,
+                                  timeout_sec=config.cartesian.command_timeout_sec,
+                                  readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+                                  tf_timeout_sec=config.cartesian.tf_timeout_sec,
+                                  base_frame=config.cartesian.base_frame, eef_frame=config.cartesian.eef_frame):
+            raise RuntimeConfigurationError("Final semantic look-at pose did not complete")
+        return {
+            "status": "success", "success": True, "state": "semantic_confirmed",
+            "reason": None, "target": target, "object_id": confirmed.object_id,
+            "confidence": float(confirmed.confidence), "x": float(confirmed.position.x),
+            "y": float(confirmed.position.y), "z": float(confirmed.position.z),
+            "position_stddev_m": float(confirmed.position_stddev_m),
+            "rail_position": float(node.current_rail_position),
+            "coordinate_path": str(config.paths.semantic_objects),
+        }
+    except Exception as exc:
+        try:
+            get_shared_node().cancel_semantic_find_object()
+        except Exception:
+            pass
+        return _failure_result(target, f"Targeted semantic search aborted safely: {exc}", state="failure")
+
+
 def get_latest_ros_image(timeout_sec=10.0) -> str:
     node = get_shared_node()
     start = time.time()
@@ -1692,6 +2174,37 @@ def get_latest_vlm_image(timeout_sec=10.0) -> str:
         if (time.time() - start) > timeout_sec:
             raise TimeoutError("Timed out waiting for ROS 2 VLM image message.")
     return node.latest_vlm_b64_image
+
+
+def get_settled_vlm_image(
+    timeout_sec: float = 10.0, settle_sec: float = 2.0, frame_count: int = 2
+) -> str:
+    """Return the last of distinct post-settle ROS wrist-camera frames."""
+    if settle_sec < 0.0 or frame_count < 1:
+        raise ValueError("settle_sec must be non-negative and frame_count must be positive")
+    node = get_shared_node()
+    sequence_before_settle = int(getattr(node, "latest_vlm_image_sequence", 0))
+    if settle_sec:
+        time.sleep(settle_sec)
+
+    deadline = time.monotonic() + timeout_sec
+    sequence = max(sequence_before_settle, int(getattr(node, "latest_vlm_image_sequence", 0)))
+    captured = 0
+    selected_image = None
+    while time.monotonic() < deadline:
+        current_sequence = int(getattr(node, "latest_vlm_image_sequence", 0))
+        current_image = node.latest_vlm_b64_image
+        if current_image is not None and current_sequence > sequence:
+            selected_image = current_image
+            sequence = current_sequence
+            captured += 1
+            if captured >= frame_count:
+                return selected_image
+        time.sleep(0.02)
+    raise TimeoutError(
+        f"Timed out waiting for {frame_count} post-settle ROS camera frames "
+        f"(captured {captured})."
+    )
 
 def get_current_joint_states() -> dict:
     node = get_shared_node()
@@ -1799,38 +2312,29 @@ def move_rail_relative(relative_distance_m: float) -> str:
     
     return f"Success: Moved to {absolute_target:.4f}m." if success else "Warning: Timeout during move."
 
-def move_rail_to_object(target_object: str) -> str:
-    """Move the rail to a rail-zero global X coordinate."""
+def _move_rail_to_object_legacy_class(target_object: str) -> str:
+    """Move to a currently confirmed object in semantic_objects.json."""
     try:
         config = get_runtime_config()
-        distances: dict[str, dict[str, float]] = {}
-        if config.paths.static_semantic_coordinates.is_file():
-            try:
-                with config.paths.static_semantic_coordinates.open("r", encoding="utf-8") as f:
-                    distances.update(json.load(f))
-            except (OSError, json.JSONDecodeError):
-                pass
-        if config.paths.dynamic_semantic_coordinates.is_file():
-            try:
-                with config.paths.dynamic_semantic_coordinates.open("r", encoding="utf-8") as f:
-                    distances.update(json.load(f))
-            except (OSError, json.JSONDecodeError):
-                pass
-            
         clean_target = target_object.lower().strip()
-        
-        # 1. Get Semantic Offsets
         if clean_target in ['laptop', 'home', 'start']:
             target_offset_x = 0.0
-        elif clean_target in distances:
-            target_offset_x = distances[clean_target]["x"]
+            target_info: dict[str, object] = {}
         else:
-            return (
-                f"Success: The location of {clean_target!r} is not in the semantic "
-                "coordinates JSON. No rail movement was performed."
-            )
+            target_info = _confirmed_semantic_object(config, clean_target)
+            if target_info is None:
+                return (
+                    f"Error: {clean_target!r} has no confirmed current entry in "
+                    f"{config.paths.semantic_objects.name}. Use targeted_search when this "
+                    "single class is sufficient to continue, or general_mapping when "
+                    "relational context or multiple classes are missing."
+                )
+            target_offset_x = float(target_info["position"]["x"])
             
         node = get_shared_node()
+
+        if not node.ensure_rrt_idle(config.search.targeted_cancel_timeout_sec):
+            return "Error: Could not stop active RRT trajectory before navigation."
         
         # rail_j1 itself is the rail-zero global X coordinate.
         start_wait = time.time()
@@ -1874,9 +2378,9 @@ def move_rail_to_object(target_object: str) -> str:
                 )
             return f"{move_result} Successfully returned to {clean_target}. The arm is safely at 0.0 rad."
             
-        target_info = distances.get(clean_target, {})
-        obj_global_y = target_info.get("y")
-        obj_global_z = target_info.get("z")
+        position = target_info.get("position", {})
+        obj_global_y = position.get("y") if isinstance(position, dict) else None
+        obj_global_z = position.get("z") if isinstance(position, dict) else None
 
         if obj_global_y is not None and obj_global_z is not None:
             from targeted_scan_geometry import ScanPose, DeskTarget
@@ -2048,20 +2552,26 @@ def _execute_hardware_script(
 
 # ── AGENTIC TOOLS ──
 
-def execute_pick_script(target_object: str) -> str:
-    """Agentic Tool: Executes classical pick script."""
+def _execute_pick_script_legacy(target_object: str) -> str:
+    """Execute pick only for a target still confirmed by semantic perception."""
     config = get_runtime_config()
+    target = _normalize_label(target_object)
+    if _confirmed_semantic_object(config, target) is None:
+        return (
+            f"Error: Refusing pick for {target!r}; it is not currently confirmed in "
+            f"{config.paths.semantic_objects.name}. Run targeted_search and verify first."
+        )
     return _execute_hardware_script(
         action="pick",
         script_path=config.paths.pick_script,
         tmux_session="rail_demo_pick",
         flag_attr="is_grasped",
         wait_func=wait_for_grasp,
-        target_object=target_object,
+        target_object=target,
         allow_mock=config.allow_mock_hardware_scripts,
     )
 
-def execute_place_script(target_object: str) -> str:
+def _execute_place_script_legacy(target_object: str) -> str:
     """Agentic Tool: Executes classical place script."""
     config = get_runtime_config()
     return _execute_hardware_script(
@@ -2073,3 +2583,257 @@ def execute_place_script(target_object: str) -> str:
         target_object=target_object,
         allow_mock=config.allow_mock_hardware_scripts,
     )
+
+
+_held_object_id: str | None = None
+
+
+def _manipulation_base_position(
+    node: object, item: dict[str, object], config: RuntimeConfig
+) -> tuple[float, float, float]:
+    position = item["position"]
+    if not isinstance(position, dict) or node.current_rail_position is None:
+        raise RuntimeConfigurationError("Missing semantic position or rail telemetry")
+    global_x = float(position["x"])
+    global_y = float(position["y"])
+    global_z = float(position["z"])
+    rail_offset = float(node.current_rail_position) - global_x
+    if abs(rail_offset) > MAX_MANIPULATION_RAIL_OFFSET_M:
+        raise RuntimeConfigurationError(
+            "Object is too far from the rail-aligned manipulation workspace; "
+            "call move_rail_to_object(object_id) again"
+        )
+    return (
+        rail_offset,
+        -global_y + config.manipulation.lateral_offset_m + config.manipulation.y_offset_m,
+        global_z,
+    )
+
+
+def _manipulation_yaw(item: dict[str, object]) -> float:
+    """Orient the EEF along the active table's Y side in global coordinates."""
+    position = item["position"]
+    if not isinstance(position, dict):
+        raise RuntimeConfigurationError("Missing semantic position for EEF yaw")
+    return 1.56 if float(position["y"]) < 0.0 else -1.56
+
+
+def _run_manipulation_pose(
+    node: object, label: str, x: float, y: float, z: float, config: RuntimeConfig,
+    *, roll: float | None = None, pitch: float | None = None, yaw: float | None = None,
+) -> None:
+    print(f"[MANIPULATION][{label}] xyz=({x:.3f}, {y:.3f}, {z:.3f})")
+    completed = node.send_eef_pose(
+        x, y, z,
+        config.manipulation.roll if roll is None else roll,
+        config.manipulation.pitch if pitch is None else pitch,
+        config.manipulation.yaw if yaw is None else yaw,
+        timeout_sec=config.cartesian.command_timeout_sec,
+        readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+        tf_timeout_sec=config.cartesian.tf_timeout_sec,
+        base_frame=config.cartesian.base_frame,
+        eef_frame=config.cartesian.eef_frame,
+    )
+    if not completed:
+        raise RuntimeConfigurationError(f"RRT {label.lower()} pose did not complete")
+
+
+def _command_gripper_and_wait(
+    node: object,
+    command: float,
+    target_state: float,
+    config: RuntimeConfig,
+    *,
+    close_acceptance_m: float | None = None,
+) -> None:
+    deadline = time.monotonic() + config.manipulation.gripper_timeout_sec
+    while node.cartesian_control_active and time.monotonic() < deadline:
+        time.sleep(0.02)
+    # The terminal RRT status is delivered independently to the orchestrator
+    # and bridge.  Give the bridge a short handoff interval to release its
+    # Cartesian gate before publishing a direct gripper command.
+    time.sleep(min(config.manipulation.gripper_handoff_delay_sec, max(0.0, deadline - time.monotonic())))
+    node.set_gripper_command(command)
+    remaining = deadline - time.monotonic()
+    if close_acceptance_m is not None:
+        while remaining > 0.0:
+            current = node.current_gripper_state
+            if current is not None and float(current) <= close_acceptance_m:
+                return
+            time.sleep(0.02)
+            remaining = deadline - time.monotonic()
+        raise RuntimeConfigurationError(
+            "Gripper did not close to an object-compatible opening "
+            f"of {close_acceptance_m:.4f}m"
+        )
+    first_wait_sec = max(0.0, remaining / 2.0)
+    if first_wait_sec > 0.0 and node.wait_for_gripper_target(
+        target_state,
+        tolerance=config.manipulation.gripper_tolerance_m,
+        timeout_sec=first_wait_sec,
+    ):
+        return
+
+    # The bridge receives RRT completion and gripper messages on independent
+    # callbacks. Retry once after the initial handoff in case that first open
+    # command arrived before the bridge released Cartesian ownership.
+    remaining = deadline - time.monotonic()
+    if remaining > 0.0:
+        node.set_gripper_command(command)
+        if node.wait_for_gripper_target(
+            target_state,
+            tolerance=config.manipulation.gripper_tolerance_m,
+            timeout_sec=remaining,
+        ):
+            return
+    current = node.current_gripper_state
+    current_text = "unavailable" if current is None else f"{float(current):.4f}m"
+    raise RuntimeConfigurationError(
+        f"Gripper did not reach feedback target {target_state:.4f}m "
+        f"after retry (last feedback: {current_text})"
+    )
+
+
+def _recover_manipulation(node: object, config: RuntimeConfig) -> None:
+    """Best-effort stop and safe arm posture after a failed manipulation phase."""
+    try:
+        node.ensure_rrt_idle(config.search.targeted_cancel_timeout_sec)
+        _command_default_standing_posture_and_wait(node, config)
+    except Exception as exc:
+        print(f"[MANIPULATION][RECOVERY] Safe-posture recovery failed: {exc}")
+
+
+def move_rail_to_object(object_id: str) -> str:
+    """Rail-align and look at one exact confirmed semantic object instance."""
+    try:
+        config = get_runtime_config()
+        requested_id = str(object_id or "").strip()
+        if requested_id in {"home", "start"}:
+            target_x, item = 0.0, None
+        else:
+            item = _confirmed_semantic_object_by_id(config, requested_id)
+            if item is None:
+                return (
+                    f"Error: {requested_id!r} is not a confirmed current object ID in "
+                    f"{config.paths.semantic_objects.name}. Re-query get_semantic_objects."
+                )
+            target_x = float(item["position"]["x"])
+        node = get_shared_node()
+        if not _wait_for_search_telemetry(node):
+            return "Error: Timed out waiting for rail and arm telemetry."
+        if not node.ensure_rrt_idle(config.search.targeted_cancel_timeout_sec):
+            return "Error: Could not stop active RRT trajectory before navigation."
+        _command_default_standing_posture_and_wait(node, config)
+        _command_rail_and_wait(node, target_x, config)
+        if item is None:
+            return f"Success: moved rail to {requested_id}."
+
+        # Let direct rail/posture ownership settle before asking RRT to take
+        # the arm for the final camera look-at motion.
+        time.sleep(0.25)
+
+        position = item["position"]
+        target = type("SemanticTarget", (), {
+            "x": 0.0,
+            "y": -float(position["y"]),
+            "z": float(position["z"]),
+        })()
+        side = -1 if float(position["y"]) >= 0.0 else 1
+        pose = ScanPose(
+            0.0, side * config.search.targeted_close_standoff,
+            config.search.targeted_scan_height, config.search.targeted_scan_roll,
+            config.search.targeted_scan_pitch, 0.0,
+        )
+        pose = _camera_look_at_scan_pose(node, pose, target, config)
+        _run_manipulation_pose(
+            node, "LOOK_AT", pose.x, pose.y, pose.z, config,
+            roll=pose.roll, pitch=pose.pitch, yaw=pose.yaw,
+        )
+        return (
+            f"Success: aligned and looking at {requested_id} ({item['class_name']}) "
+            f"at rail_j1={float(node.current_rail_position):.4f}m."
+        )
+    except Exception as exc:
+        return f"Error navigating to semantic object: {exc}"
+
+
+def execute_pick_script(object_id: str) -> dict[str, object]:
+    """Pick one rail-aligned confirmed semantic object with staged RRT motion."""
+    global _held_object_id
+    config = get_runtime_config()
+    requested_id = str(object_id or "").strip()
+    if _held_object_id is not None:
+        return {"status": "failure", "success": False, "reason": f"Already holding {_held_object_id}"}
+    node = get_shared_node()
+    try:
+        item = _confirmed_semantic_object_by_id(config, requested_id)
+        if item is None:
+            raise RuntimeConfigurationError("Object ID is not currently confirmed")
+        x, y, z = _manipulation_base_position(node, item, config)
+        yaw = _manipulation_yaw(item)
+        _command_gripper_and_wait(node, config.manipulation.gripper_open_command,
+                                  config.manipulation.gripper_open_state_m, config)
+        hover_z = z + config.manipulation.hover_height_m
+        _run_manipulation_pose(node, "PICK_HOVER", x, y, hover_z, config, yaw=yaw)
+        descend_z = max(
+            z + config.manipulation.grasp_z_offset_m,
+            config.manipulation.min_pick_descend_z_m,
+        )
+        _run_manipulation_pose(node, "PICK_DESCEND", x, y, descend_z, config, yaw=yaw)
+        _command_gripper_and_wait(node, config.manipulation.gripper_close_command,
+                                  config.manipulation.gripper_close_state_m, config,
+                                  close_acceptance_m=config.manipulation.gripper_close_acceptance_m)
+        _run_manipulation_pose(node, "PICK_RETREAT", x, y, hover_z, config, yaw=yaw)
+        _run_manipulation_pose(
+            node,
+            "PICK_CLEARANCE_LIFT",
+            x,
+            y,
+            hover_z + config.manipulation.post_action_lift_m,
+            config,
+            yaw=yaw,
+        )
+        _held_object_id = requested_id
+        return {"status": "success", "success": True, "object_id": requested_id, "class_name": item["class_name"]}
+    except Exception as exc:
+        _recover_manipulation(node, config)
+        return {"status": "failure", "success": False, "reason": f"Pick failed: {exc}"}
+
+
+def execute_place_script(destination_object_id: str) -> dict[str, object]:
+    """Place the currently held item above one rail-aligned confirmed destination."""
+    global _held_object_id
+    config = get_runtime_config()
+    destination_id = str(destination_object_id or "").strip()
+    if _held_object_id is None:
+        return {"status": "failure", "success": False, "reason": "No held object to place"}
+    node = get_shared_node()
+    try:
+        destination = _confirmed_semantic_object_by_id(config, destination_id)
+        if destination is None:
+            raise RuntimeConfigurationError("Destination ID is not currently confirmed")
+        x, y, z = _manipulation_base_position(node, destination, config)
+        yaw = _manipulation_yaw(destination)
+        hover_z = z + config.manipulation.hover_height_m
+        _run_manipulation_pose(node, "PLACE_HOVER", x, y, hover_z, config, yaw=yaw)
+        _run_manipulation_pose(node, "PLACE_DESCEND", x, y, z + config.manipulation.place_drop_offset_m, config, yaw=yaw)
+        _command_gripper_and_wait(node, config.manipulation.gripper_open_command,
+                                  config.manipulation.gripper_open_state_m, config)
+        print("[MANIPULATION][PLACE_LIFT] Replaying the descend trajectory in reverse.")
+        if not node.reverse_last_eef_motion(config.cartesian.command_timeout_sec):
+            raise RuntimeConfigurationError("RRT reverse place-lift trajectory did not complete")
+        _run_manipulation_pose(
+            node,
+            "PLACE_CLEARANCE_LIFT",
+            x,
+            y,
+            hover_z + config.manipulation.post_action_lift_m,
+            config,
+            yaw=yaw,
+        )
+        held_id = _held_object_id
+        _held_object_id = None
+        return {"status": "success", "success": True, "object_id": held_id, "destination_object_id": destination_id}
+    except Exception as exc:
+        _recover_manipulation(node, config)
+        return {"status": "failure", "success": False, "reason": f"Place failed: {exc}"}

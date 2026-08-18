@@ -25,7 +25,8 @@ class RegistryConfig:
     confirmation_window_sec: float = 3.0
     class_confirmation_probability: float = 0.70
     max_explicit_classes: int = 4
-    stale_after_sec: float = 300.0
+    stale_after_sec: float = 120.0
+    stale_retention_sec: float = 120.0
     evidence_decay: float = 0.95
     process_noise_stddev_m: float = 0.002
     appearance_max_cosine_distance: float = 0.35
@@ -52,6 +53,7 @@ class ObjectTrack:
     )
     state: str = "candidate"
     confirmation_locked: bool = False
+    stale_since_sec: float | None = None
 
     @property
     def class_distribution(self) -> dict[str, float]:
@@ -108,11 +110,31 @@ class ObjectRegistry:
         self._next_object_id = 0
 
     def tracks(self, now_sec: float | None = None) -> list[ObjectTrack]:
-        if now_sec is not None:
-            for track in self._tracks.values():
-                if now_sec - track.last_seen_sec > self.config.stale_after_sec:
-                    track.state = "stale"
         return sorted(self._tracks.values(), key=lambda track: track.object_id)
+
+    def maintain(self, now_sec: float) -> tuple[list[str], list[str], list[str]]:
+        """Advance lifecycle state; return candidates expired, tracks marked stale, tracks deleted."""
+        expired_candidates = self.expire_candidates(now_sec)
+        marked_stale: list[str] = []
+        deleted_stale: list[str] = []
+        for track in self._tracks.values():
+            unseen_sec = now_sec - track.last_seen_sec
+            if track.state != "stale" and unseen_sec > self.config.stale_after_sec:
+                track.state = "stale"
+                track.stale_since_sec = now_sec
+                marked_stale.append(track.object_id)
+            elif track.state == "stale" and track.stale_since_sec is None:
+                # Older registries have no transition time. Start their
+                # retention period now instead of deleting them immediately.
+                track.stale_since_sec = now_sec
+                marked_stale.append(track.object_id)
+            if track.state == "stale" and track.stale_since_sec is not None and (
+                now_sec - track.stale_since_sec > self.config.stale_retention_sec
+            ):
+                deleted_stale.append(track.object_id)
+        for object_id in deleted_stale:
+            del self._tracks[object_id]
+        return expired_candidates, marked_stale, deleted_stale
 
     def expire_candidates(self, now_sec: float) -> list[str]:
         """Remove candidates that failed to confirm within their hit window."""
@@ -261,6 +283,7 @@ class ObjectRegistry:
         survivor.observation_count += duplicate.observation_count
         survivor.first_seen_sec = min(survivor.first_seen_sec, duplicate.first_seen_sec)
         survivor.last_seen_sec = max(survivor.last_seen_sec, duplicate.last_seen_sec)
+        survivor.stale_since_sec = None
         for label, score in duplicate.class_scores.items():
             survivor.class_scores[label] = survivor.class_scores.get(label, 0.0) + score
         self._prune_class_scores(survivor)
@@ -346,11 +369,20 @@ class ObjectRegistry:
         )
 
     def best_candidate(self, class_name: str) -> ObjectTrack | None:
+        """Return a still-unconfirmed candidate for FindObject feedback.
+
+        ``class_ambiguous`` tracks may retain weak probability for a class, but
+        they are not short-lived candidate observations and must not pause a
+        targeted scan indefinitely.
+        """
         target = _normalize_label(class_name)
         matches = [
             track
             for track in self._tracks.values()
-            if track.class_distribution.get(target, 0.0) > 0.0
+            if (
+                track.state == "candidate"
+                and track.class_distribution.get(target, 0.0) > 0.0
+            )
         ]
         if not matches:
             return None
@@ -481,6 +513,7 @@ class ObjectRegistry:
         track.observation_count += 1
         track.first_seen_sec = min(track.first_seen_sec, now_sec)
         track.last_seen_sec = now_sec
+        track.stale_since_sec = None
         track.model_id = self.model_id
         self._update_appearance(track, detection)
         self._add_class_observation(track, detection, now_sec)
@@ -664,6 +697,11 @@ class ObjectRegistry:
             confirmation_locked=bool(
                 item.get("confirmation_locked", item.get("state") == "confirmed")
             ),
+            stale_since_sec=(
+                _parse_time(str(item["stale_since"]))
+                if item.get("stale_since")
+                else None
+            ),
         )
         self._prune_class_scores(track)
         self._tracks[track.object_id] = track
@@ -757,6 +795,11 @@ class ObjectRegistry:
             "observation_count": track.observation_count,
             "first_seen": _iso_time(track.first_seen_sec),
             "last_seen": _iso_time(track.last_seen_sec),
+            **(
+                {"stale_since": _iso_time(track.stale_since_sec)}
+                if track.stale_since_sec is not None
+                else {}
+            ),
             "model_id": track.model_id,
             **(
                 {

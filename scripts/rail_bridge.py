@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import sys
+import json
 
 import rclpy
 import numpy as np
@@ -8,7 +9,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import Pose
-from std_msgs.msg import Bool, Float64
+from std_msgs.msg import Bool, Empty, Float64, String
 import copy
 
 # This script is launched directly, so expose the orchestrator source directory
@@ -92,6 +93,8 @@ class RailUnifiedBridge(Node):
         self.create_subscription(JointState, '/rrt/hold_command', self.cb_sys1_direct_relay, 10)
         self.create_subscription(Float64, '/gripper/command', self.cb_sys1_direct_relay, 10)
         self.create_subscription(Pose, '/rrt/pose_command', self.cb_cartesian_pose, 10)
+        self.create_subscription(Empty, '/rrt/reverse_last_trajectory', self.cb_reverse_trajectory, 10)
+        self.create_subscription(String, '/rrt/status', self.cb_rrt_status, 10)
         self.create_subscription(JointState, '/sim/rail2/joint_command', self.cb_sys2_relay, 10)
         self.create_subscription(JointState, '/sim/franka2_rail/joint_command', self.cb_sys2_relay, 10)
 
@@ -116,6 +119,28 @@ class RailUnifiedBridge(Node):
             self.get_logger().info(
                 "Cartesian arm ownership enabled; direct Panda/gripper commands are now blocked."
             )
+
+    def cb_rrt_status(self, msg):
+        """Release bridge ownership only when the planner ends a trajectory."""
+        try:
+            state = str(json.loads(msg.data).get('state', ''))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if state not in {'success', 'cancelled'} or not self.cartesian_control_active:
+            return
+        self.cartesian_control_active = False
+        self.get_logger().info(
+            f"RRT trajectory {state}; Cartesian ownership released for direct gripper commands."
+        )
+
+    def cb_reverse_trajectory(self, _msg):
+        if self.direct_joint_control_active:
+            self.get_logger().warning(
+                "Ignoring reverse RRT trajectory: direct Panda joint control has priority."
+            )
+            return
+        self.cartesian_control_active = True
+        self.get_logger().info("Cartesian ownership enabled for reverse RRT trajectory replay.")
 
     @staticmethod
     def _is_panda_joint(name):

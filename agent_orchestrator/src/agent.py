@@ -18,7 +18,8 @@ from tools import (
     turn_panda_arm,
     home_panda_arm,
     move_rail_relative,
-    get_latest_vlm_image,
+    get_settled_vlm_image,
+    get_semantic_objects,
 )
 
 runtime_config = get_runtime_config()
@@ -46,10 +47,9 @@ tool_definitions = [
         "function": {
             "name": "targeted_search",
             "description": (
-                "RRT wrist-camera search over both desk rows. Use this as the primary fallback "
-                "when 'move_rail_to_object' fails (object unknown) OR when 'get_camera_frame' "
-                "visual verification fails. If this tool fails, the object is missing and you MUST abort. "
-                "Pass one normalized canonical label such as 'apple'."
+                "Find one canonical class and refresh its semantic location with an RRT scan. "
+                "Choose it when exactly one missing, stale, candidate, or ambiguous class is "
+                "enough to continue the task. Pass a base detector class such as 'apple'."
             ),
             "parameters": {
                 "type": "object",
@@ -69,19 +69,16 @@ tool_definitions = [
         "function": {
             "name": "general_mapping",
             "description": (
-                "Full rail sweep search: moves the robot along the entire rail while scanning "
-                "with YOLO to map object locations. Use this as a fallback if targeted_search "
-                "fails. Pass one normalized canonical label such as 'apple'."
+                "Build a full semantic map: moves to the minimum, centre, and maximum rail "
+                "stations and uses RRT wrist-camera arcs to scan both desk rows. Semantic "
+                "perception records all objects during the complete route. Choose it for a "
+                "spatial/relational task whose needed context is missing, or when two or more "
+                "relevant classes are absent or not confirmed."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "target_object": {
-                        "type": "string",
-                        "description": "Normalized target label, for example 'apple'.",
-                    }
-                },
-                "required": ["target_object"],
+                "properties": {},
+                "required": [],
                 "additionalProperties": False,
             },
         },
@@ -90,16 +87,36 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "execute_pick_script",
-            "description": "Execute the physical picking motion. You MUST be looking at the object and have successfully verified its presence via 'get_camera_frame' before calling this.",
+            "description": "Pick one exact confirmed semantic object after move_rail_to_object(object_id) and camera verification. Uses staged RRT hover, descend, close, and retreat motion.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target_object": {
+                    "object_id": {
                         "type": "string",
-                        "description": "The normalized target label.",
+                        "description": "Exact object_id returned by get_semantic_objects.",
                     }
                 },
-                "required": ["target_object"],
+                "required": ["object_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_semantic_objects",
+            "description": "Semantic planning lookup. Query every relevant canonical base class before choosing search or navigation. Returns only confirmed matching objects with IDs, confidence, global XYZ, and last_seen; classes_without_match means no usable map entry. It is map evidence, not visual proof.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "class_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "description": "Relevant canonical base detector classes, for example [\"apple\", \"bowl\"]. Do not include visual qualifiers such as color.",
+                    }
+                },
+                "required": ["class_names"],
                 "additionalProperties": False,
             },
         },
@@ -108,16 +125,16 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "move_rail_to_object",
-            "description": "Move the robot's base rail to the known location of an object. If it succeeds, you MUST next call 'get_camera_frame' to verify. If it errors (unknown object), you MUST fallback to 'targeted_search'.",
+            "description": "Rail-align and point at one selected confirmed semantic object ID. Use the exact ID returned by get_semantic_objects; duplicate classes must be disambiguated by ID.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target_object": {
+                    "object_id": {
                         "type": "string",
-                        "description": "Destination label, such as 'apple', 'purple bowl' or 'home'.",
+                        "description": "Exact confirmed object_id, or home/start.",
                     }
                 },
-                "required": ["target_object"],
+                "required": ["object_id"],
                 "additionalProperties": False,
             },
         },
@@ -144,16 +161,16 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "execute_place_script",
-            "description": "Execute the physical placing motion to drop a held object. You MUST have already verified the location of the placement destination before beginning the task.",
+            "description": "Place the currently held item above one exact confirmed destination object after move_rail_to_object(destination_object_id) and camera verification. Uses staged RRT hover, descend, open, and retreat motion.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target_object": {
+                    "destination_object_id": {
                         "type": "string",
-                        "description": "The placement destination label.",
+                        "description": "Exact confirmed destination object_id returned by get_semantic_objects.",
                     }
                 },
-                "required": ["target_object"],
+                "required": ["destination_object_id"],
                 "additionalProperties": False,
             },
         },
@@ -193,7 +210,7 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "get_camera_frame",
-            "description": "Get the current camera frame. You MUST use this to visually verify the presence of an object after moving to its suspected location and before manipulating it.",
+            "description": "Wait two seconds for the robot/camera to settle, capture two new ROS wrist-camera frames, and return the later frame. Call this immediately before every execute_pick_script or execute_place_script and visually verify the needed object.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -249,29 +266,30 @@ BOWL_TARGETS = {"bowl", "purple bowl"}
 
 tools_impl = {
     "start_joint_controller": lambda _: start_joint_controller(),
-    "general_mapping": lambda args: general_mapping(
-        args.get("target_object")
-    ),
+    "general_mapping": lambda _: general_mapping(),
     "targeted_search": lambda args: targeted_search(
         args.get("target_object")
     ),
     "execute_pick_script": lambda args: execute_pick_script(
-        args.get("target_object")
+        args.get("object_id")
     ),
     "move_rail_to_object": lambda args: move_rail_to_object(
-        args.get("target_object")
+        args.get("object_id")
     ),
     "move_rail_relative": lambda args: move_rail_relative(
         args.get("relative_distance_m")
     ),
     "execute_place_script": lambda args: execute_place_script(
-        args.get("target_object")
+        args.get("destination_object_id")
     ),
     "turn_panda_arm": lambda args: turn_panda_arm(
         args.get("target_rad")
     ),
     "home_panda_arm": lambda _: home_panda_arm(),
-    "get_camera_frame": lambda _: get_latest_vlm_image(timeout_sec=10.0),
+    "get_camera_frame": lambda _: get_settled_vlm_image(
+        timeout_sec=10.0, settle_sec=2.0, frame_count=2
+    ),
+    "get_semantic_objects": lambda args: get_semantic_objects(args.get("class_names")),
     "finish_task": lambda args: {
         "status": "success",
         "success": True,
@@ -297,8 +315,15 @@ def _validate_tool_for_stage(
             return "finish_task requires a non-empty summary."
 
     target = _normalized_argument(arguments, "target_object")
-    if tool_name in ("targeted_search", "general_mapping") and not target:
+    if tool_name == "targeted_search" and not target:
         return "Search requires a non-empty canonical pickup target."
+
+    if tool_name in ("execute_pick_script", "execute_place_script"):
+        if not tools_called or tools_called[-1] != "get_camera_frame":
+            return (
+                "Immediately before every pick or place hardware execution, call "
+                "get_camera_frame and visually verify the required object."
+            )
 
     return None
 
@@ -455,12 +480,18 @@ def execute_tools(state: AgentState) -> dict:
         )
     else:
         result_message = _tool_message(tool_call, _format_tool_result(raw_result))
-    if not _tool_result_succeeded(tool_name, raw_result):
+    recoverable_targeted_search_failure = (
+        tool_name == "targeted_search"
+        and isinstance(raw_result, dict)
+        and raw_result.get("status") == "failure"
+        and raw_result.get("state") == "couldnt_find"
+    )
+    if not _tool_result_succeeded(tool_name, raw_result) and not recoverable_targeted_search_failure:
         reason = f"{tool_name} failed: {_format_tool_result(raw_result)}"
         return _failed_update(state, [result_message], reason)
 
     located_target = ""
-    if tool_name in ("targeted_search", "general_mapping"):
+    if tool_name == "targeted_search":
         requested_target = _normalized_argument(arguments, "target_object")
         located_target = _normalized_argument(raw_result, "target")
         if not located_target or located_target != requested_target:
@@ -472,11 +503,17 @@ def execute_tools(state: AgentState) -> dict:
 
     called_identifier = tool_name
     if tool_name == "move_rail_to_object":
-        target = _normalized_argument(arguments, "target_object")
+        target = _normalized_argument(arguments, "object_id")
         if target == "home":
             called_identifier = "move_rail_to_object_home"
 
     tools_called = state.get("tools_called", []) + [called_identifier]
+
+    if recoverable_targeted_search_failure:
+        print(
+            "[PIPELINE] Targeted search did not find the target; "
+            "returning result to the VLM for replanning."
+        )
 
     update = {
         "messages": state["messages"] + [

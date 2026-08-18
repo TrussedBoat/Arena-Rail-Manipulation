@@ -73,7 +73,8 @@ rrt_supervisor() {
             -p planning_time_sec:=8.0 \
             -p goal_position_tolerance_m:=0.005 \
             -p goal_orientation_tolerance_rad:=0.05 \
-            -p eef_min_z_m:=0.15 \
+            -p singularity_stop:="${ARENA_RRT_SINGULARITY_STOP:-0.045}" \
+            -p eef_min_z_m:="${ARENA_RRT_EEF_MIN_Z_M:-0.08}" \
             -p model_root:="$RRT_MODEL_ROOT" \
             -p pose_cmd_topic:=/rrt/pose_command \
             -p joint_states_topic:=/joint_states \

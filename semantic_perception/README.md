@@ -95,9 +95,10 @@ RViz until the registry changes.
 
 `ARENA_DETECTOR_MODEL`, `ARENA_OBJECT_REGISTRY`,
 `ARENA_DYNAMIC_COORDINATES`, and `ARENA_WRITE_LEGACY_COORDINATES` override the
-script defaults. The script uses wall time by default; set
-`ARENA_USE_SIM_TIME=true` only when the simulator's `/clock` topic is available
-and advancing. A built package may instead be started through
+script defaults. The script uses wall time by default. `run_sim.sh` creates an
+Isaac `/clock` publisher and configures ROS camera helpers to use simulation
+timestamps. After restarting the simulator, use `ARENA_USE_SIM_TIME=true` and
+`-p tf.fallback_to_latest:=false`. A built package may instead be started through
 `semantic_perception.launch.py`.
 
 The default `semantic_perception.yaml` uncertainty values are tuned for the

@@ -102,6 +102,7 @@ class RRTPlannerNode(Node):
         # normal VLM joint command to diagnostics and ROS tooling.
         self.declare_parameter("hold_topic", "/rrt/hold_command")
         self.declare_parameter("cancel_topic", "/rrt/cancel")
+        self.declare_parameter("reverse_topic", "/rrt/reverse_last_trajectory")
         self.declare_parameter("model_root", str(default_model_root))
         self.declare_parameter("move_group", "eef")
         self.declare_parameter("planning_time_sec", 5.0)
@@ -111,10 +112,10 @@ class RRTPlannerNode(Node):
         self.declare_parameter("edge_resolution_rad", 0.04)
         self.declare_parameter("joint_limit_margin_rad", 0.01)
         self.declare_parameter("singularity_warn", 0.10)
-        self.declare_parameter("singularity_stop", 0.05)
+        self.declare_parameter("singularity_stop", 0.045)
         self.declare_parameter("goal_position_tolerance_m", 0.005)
         self.declare_parameter("goal_orientation_tolerance_rad", 0.01)
-        self.declare_parameter("eef_min_z_m", 0.15)
+        self.declare_parameter("eef_min_z_m", 0.08)
 
         self.planning_time_sec = float(self.get_parameter("planning_time_sec").value)
         self.planning_attempts = int(self.get_parameter("planning_attempts").value)
@@ -152,6 +153,8 @@ class RRTPlannerNode(Node):
 
         self.current_positions: dict[str, float] = {}
         self.active_trajectory: np.ndarray | None = None
+        self.active_trajectory_message: JointTrajectory | None = None
+        self.last_successful_trajectory: JointTrajectory | None = None
         self.executing = False
         self.safety_stop_sent = False
         self._last_runtime_warning = 0.0
@@ -193,6 +196,12 @@ class RRTPlannerNode(Node):
             Empty,
             str(self.get_parameter("cancel_topic").value),
             self._cancel_callback,
+            10,
+        )
+        self.create_subscription(
+            Empty,
+            str(self.get_parameter("reverse_topic").value),
+            self._reverse_last_trajectory_callback,
             10,
         )
         self.ready_timer = self.create_timer(
@@ -277,6 +286,8 @@ class RRTPlannerNode(Node):
         if message.data and self.executing and not self.safety_stop_sent:
             self.executing = False
             self.active_trajectory = None
+            self.last_successful_trajectory = self.active_trajectory_message
+            self.active_trajectory_message = None
             self._publish_status("success", "RRT trajectory completed")
 
     def _cancel_callback(self, _message: Empty) -> None:
@@ -292,8 +303,56 @@ class RRTPlannerNode(Node):
         self._publish_hold(q)
         self.executing = False
         self.active_trajectory = None
+        self.active_trajectory_message = None
         self.safety_stop_sent = False
         self._publish_status("cancelled", "RRT trajectory cancelled with joint hold")
+
+    def _reverse_last_trajectory_callback(self, _message: Empty) -> None:
+        """Replay the latest completed RRT path backwards without replanning."""
+        if self.executing:
+            self._publish_status("failure", "Planner is busy executing another trajectory")
+            return
+        trajectory = self.last_successful_trajectory
+        if trajectory is None or len(trajectory.points) < 2:
+            self._publish_status("failure", "No completed RRT trajectory is available to reverse")
+            return
+        try:
+            reversed_trajectory = self._reverse_trajectory(trajectory)
+            self.active_trajectory = np.asarray(
+                [point.positions for point in reversed_trajectory.points], dtype=float
+            )
+            self.active_trajectory_message = reversed_trajectory
+            self.safety_stop_sent = False
+            self.executing = True
+            self.trajectory_pub.publish(reversed_trajectory)
+            self._publish_status(
+                "executing",
+                "Replaying completed RRT trajectory in reverse",
+                points=len(reversed_trajectory.points),
+            )
+        except Exception as exc:
+            self.get_logger().error(f"Could not reverse RRT trajectory: {exc}")
+            self._publish_status("failure", f"Could not reverse RRT trajectory: {exc}")
+
+    @staticmethod
+    def _reverse_trajectory(trajectory: JointTrajectory) -> JointTrajectory:
+        total_sec = (
+            float(trajectory.points[-1].time_from_start.sec)
+            + float(trajectory.points[-1].time_from_start.nanosec) * 1e-9
+        )
+        reversed_trajectory = JointTrajectory()
+        reversed_trajectory.joint_names = list(trajectory.joint_names)
+        for point in reversed(trajectory.points):
+            point_sec = float(point.time_from_start.sec) + float(point.time_from_start.nanosec) * 1e-9
+            reversed_point = JointTrajectoryPoint()
+            reversed_point.positions = list(point.positions)
+            if point.velocities:
+                reversed_point.velocities = [-float(value) for value in point.velocities]
+            if point.accelerations:
+                reversed_point.accelerations = list(point.accelerations)
+            reversed_point.time_from_start = _duration(total_sec - point_sec)
+            reversed_trajectory.points.append(reversed_point)
+        return reversed_trajectory
 
     def _current_arm_q(self, *, raise_if_missing: bool = True) -> np.ndarray | None:
         missing = [name for name in PANDA_JOINT_NAMES if name not in self.current_positions]
@@ -338,6 +397,7 @@ class RRTPlannerNode(Node):
         self.active_trajectory = np.asarray(
             [point.positions for point in trajectory.points], dtype=float
         )
+        self.active_trajectory_message = trajectory
         self.safety_stop_sent = False
         self.executing = True
         self.trajectory_pub.publish(trajectory)
@@ -526,6 +586,7 @@ class RRTPlannerNode(Node):
         self.safety_stop_sent = True
         self.executing = False
         self.active_trajectory = None
+        self.active_trajectory_message = None
         self._publish_status("failure", f"Runtime safety stop: {reason}")
 
     def _publish_hold(self, q: np.ndarray) -> None:

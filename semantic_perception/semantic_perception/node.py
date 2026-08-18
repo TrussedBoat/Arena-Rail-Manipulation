@@ -90,6 +90,7 @@ class SemanticPerceptionNode(Node):
         self._synchronized_packets_received = 0
         self._last_health_processed = 0
         self._last_health_monotonic = time.monotonic()
+        self._last_timing_monotonic = time.monotonic()
         self._last_persist_monotonic = 0.0
         self._registry_dirty = False
         self._camera_calibration = self._camera_calibration_from_parameters()
@@ -133,6 +134,9 @@ class SemanticPerceptionNode(Node):
                     self.get_parameter("class.max_explicit_classes").value
                 ),
                 stale_after_sec=float(self.get_parameter("filter.stale_after_sec").value),
+                stale_retention_sec=float(
+                    self.get_parameter("filter.stale_retention_sec").value
+                ),
                 evidence_decay=float(self.get_parameter("class.evidence_decay").value),
                 process_noise_stddev_m=float(
                     self.get_parameter("uncertainty.process_noise_stddev_m").value
@@ -205,6 +209,7 @@ class SemanticPerceptionNode(Node):
         rate_hz = float(self.get_parameter("processing_rate_hz").value)
         self._processing_timer = self.create_timer(1.0 / rate_hz, self._process_latest)
         self._persistence_timer = self.create_timer(1.0, self._persist_if_due)
+        self._lifecycle_timer = self.create_timer(1.0, self._maintain_registry_lifecycle)
         self._input_health_timer = self.create_timer(1.0, self._log_input_health)
         self._action_server = ActionServer(
             self,
@@ -267,7 +272,8 @@ class SemanticPerceptionNode(Node):
         self.declare_parameter("association.duplicate_merge_interval_frames", 25)
         self.declare_parameter("filter.confirmation_hits", 3)
         self.declare_parameter("filter.confirmation_window_sec", 3.0)
-        self.declare_parameter("filter.stale_after_sec", 300.0)
+        self.declare_parameter("filter.stale_after_sec", 120.0)
+        self.declare_parameter("filter.stale_retention_sec", 120.0)
         self.declare_parameter("class.confirmation_probability", 0.70)
         self.declare_parameter("class.conditional_reliability_floor", 0.60)
         self.declare_parameter("class.max_explicit_classes", 4)
@@ -285,6 +291,8 @@ class SemanticPerceptionNode(Node):
         self.declare_parameter("registry.persistence_interval_sec", 1.0)
         self.declare_parameter("search.default_timeout_sec", 30.0)
         self.declare_parameter("debug.publish_annotated", False)
+        self.declare_parameter("debug.timing", False)
+        self.declare_parameter("debug.timing_log_interval_sec", 1.0)
         self.declare_parameter("debug.annotated_topic", "/semantic/debug/yolo")
         self.declare_parameter("diagnostics.publish", True)
 
@@ -305,6 +313,7 @@ class SemanticPerceptionNode(Node):
             "filter.confirmation_hits",
             "filter.confirmation_window_sec",
             "filter.stale_after_sec",
+            "filter.stale_retention_sec",
             "class.max_explicit_classes",
             "uncertainty.pixel_stddev_px",
             "uncertainty.process_noise_stddev_m",
@@ -391,25 +400,45 @@ class SemanticPerceptionNode(Node):
         self._last_health_processed = self._processed_sequence
         self._last_health_monotonic = now_monotonic
 
+    def _maintain_registry_lifecycle(self) -> None:
+        """Publish/persist stale transitions even while no new camera packet arrives."""
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        with self._registry_changed:
+            expired_candidates, marked_stale, deleted_stale = self._registry.maintain(now_sec)
+            if not expired_candidates and not marked_stale and not deleted_stale:
+                return
+            self._registry_dirty = True
+            self._registry_changed.notify_all()
+        self._publish_registry()
+        if expired_candidates:
+            self.get_logger().debug("Expired candidate tracks: %s" % expired_candidates)
+        if marked_stale:
+            self.get_logger().info("Marked stale tracks: %s" % marked_stale)
+        if deleted_stale:
+            self.get_logger().info("Deleted stale tracks: %s" % deleted_stale)
+
     def _process_latest(self) -> None:
         with self._packet_lock:
             packet = self._latest_packet
             if packet is None or packet.sequence == self._processed_sequence:
                 return
             self._processed_sequence = packet.sequence
+        frame_started = time.perf_counter()
         try:
-            localized, rejected_depth, tf_mode, selected_tf_stamp = self._localize_packet(packet)
+            localized, rejected_depth, tf_mode, selected_tf_stamp, timing = self._localize_packet(packet)
         except Exception as exc:
             self.get_logger().warning(f"Dropped RGB-D packet: {exc}")
             return
+        association_started = time.perf_counter()
         self._publish_observations(localized, packet.color)
         association_results: list[AssociationResult] = []
         changed_tracks: list[ObjectTrack] = []
         merged_duplicates: list[tuple[str, str]] = []
         expired_candidates: list[str] = []
+        deleted_stale: list[str] = []
         with self._registry_changed:
-            expired_candidates = self._registry.expire_candidates(
-                packet.color.header.stamp.sec + packet.color.header.stamp.nanosec / 1e9
+            expired_candidates, marked_stale, deleted_stale = self._registry.maintain(
+                self.get_clock().now().nanoseconds / 1e9
             )
             association_results = self._registry.update_frame_with_diagnostics(localized)
             changed_tracks = [result.track for result in association_results]
@@ -422,18 +451,24 @@ class SemanticPerceptionNode(Node):
                 and self._processed_sequence % merge_interval == 0
             ):
                 merged_duplicates = self._registry.merge_confirmed_duplicates()
-            if changed_tracks or expired_candidates:
+            if changed_tracks or expired_candidates or marked_stale or deleted_stale:
                 self._registry_dirty = True
                 self._registry_changed.notify_all()
             if merged_duplicates:
                 self._registry_dirty = True
                 self._registry_changed.notify_all()
-        if changed_tracks or merged_duplicates or expired_candidates:
+        if changed_tracks or merged_duplicates or expired_candidates or marked_stale or deleted_stale:
             self._publish_registry()
         if expired_candidates:
             self.get_logger().debug("Expired candidate tracks: %s" % expired_candidates)
+        if marked_stale:
+            self.get_logger().info("Marked stale tracks: %s" % marked_stale)
+        if deleted_stale:
+            self.get_logger().info("Deleted stale tracks: %s" % deleted_stale)
         if merged_duplicates:
             self.get_logger().info("Merged duplicate tracks: %s" % merged_duplicates)
+        timing["association"] = time.perf_counter() - association_started
+        diagnostics_started = time.perf_counter()
         if bool(self.get_parameter("diagnostics.publish").value):
             self._publish_association_diagnostics(
                 packet.color,
@@ -443,11 +478,36 @@ class SemanticPerceptionNode(Node):
                 tf_mode,
                 selected_tf_stamp,
             )
+        timing["diagnostics"] = time.perf_counter() - diagnostics_started
+        persistence_started = time.perf_counter()
         self._persist_if_due()
+        timing["persistence"] = time.perf_counter() - persistence_started
+        timing["total"] = time.perf_counter() - frame_started
+        now_monotonic = time.monotonic()
+        if (
+            bool(self.get_parameter("debug.timing").value)
+            and now_monotonic - self._last_timing_monotonic
+            >= float(self.get_parameter("debug.timing_log_interval_sec").value)
+        ):
+            self._last_timing_monotonic = now_monotonic
+            self.get_logger().debug(
+                "Timing ms: total={total:.1f} decode={decode:.1f} tf={tf:.1f} "
+                "yolo={yolo:.1f} filter={filter:.1f} appearance={appearance:.1f} "
+                "depth={depth:.1f} debug_image={debug_image:.1f} association={association:.1f} diagnostics={diagnostics:.1f} "
+                "persist={persistence:.1f} detections={detections} localized={localized}".format(
+                    **{
+                        **{name: seconds * 1000.0 for name, seconds in timing.items()},
+                        "detections": timing["detections"],
+                        "localized": len(localized),
+                    }
+                )
+            )
 
     def _localize_packet(
         self, packet: SensorPacket
-    ) -> tuple[list[LocalizedDetection], list[RejectedDepthDetection], str, Time]:
+    ) -> tuple[list[LocalizedDetection], list[RejectedDepthDetection], str, Time, dict[str, float | int]]:
+        timing: dict[str, float | int] = {}
+        stage_started = time.perf_counter()
         color = _decode_color_image(packet.color)
         depth = _decode_depth_image(packet.depth)
         if packet.depth.encoding.upper() in ("16UC1", "MONO16"):
@@ -465,12 +525,14 @@ class SemanticPerceptionNode(Node):
                 f"RGB dimensions {color.shape[:2]} do not match fixed calibration "
                 f"{expected_shape}"
             )
+        timing["decode"] = time.perf_counter() - stage_started
         source_frame = str(self.get_parameter("camera.tf_frame_override").value).strip()
         if not source_frame:
             source_frame = packet.color.header.frame_id.strip()
         if not source_frame:
             raise ValueError("RGB image has no frame_id")
         stamp = Time.from_msg(packet.color.header.stamp)
+        stage_started = time.perf_counter()
         try:
             transform = self._tf_buffer.lookup_transform(
                 self._reference_frame(),
@@ -493,10 +555,33 @@ class SemanticPerceptionNode(Node):
                 self._reference_frame(), source_frame, Time()
             )
             tf_mode = "latest_fallback"
-        stamp_ns = stamp.nanoseconds
+        timing["tf"] = time.perf_counter() - stage_started
+        # Registry time must use one clock domain.  Image header stamps are
+        # retained for TF lookup, but simulators may stamp images with wall
+        # time while this node runs from /clock.  Mixing those domains makes a
+        # new track appear immediately old (or infinitely fresh).
+        registry_stamp_ns = self.get_clock().now().nanoseconds
+        if bool(self.get_parameter("use_sim_time").value) and abs(
+            stamp.nanoseconds - registry_stamp_ns
+        ) > 5_000_000_000:
+            self.get_logger().warning(
+                "Camera and registry clock domains differ: image=%d registry=%d; "
+                "using registry clock for track lifecycle." % (
+                    stamp.nanoseconds,
+                    registry_stamp_ns,
+                ),
+                throttle_duration_sec=5.0,
+            )
+        stage_started = time.perf_counter()
+        detector_output = self._detector.detect(color)
+        timing["yolo"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         raw_detections, rejected_image_detections = self._filter_image_detections(
-            self._detector.detect(color), color.shape[:2]
+            detector_output, color.shape[:2]
         )
+        timing["filter"] = time.perf_counter() - stage_started
+        timing["detections"] = len(raw_detections)
+        stage_started = time.perf_counter()
         try:
             raw_detections = self._appearance_provider.attach(color, raw_detections)
         except RuntimeError as exc:
@@ -504,6 +589,8 @@ class SemanticPerceptionNode(Node):
                 f"Appearance embeddings unavailable; using spatial association only: {exc}",
                 throttle_duration_sec=5.0,
             )
+        timing["appearance"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         localized: list[LocalizedDetection] = []
         depth_diagnostics: dict[int, DepthSamplingDiagnostics] = {}
         rejected_depth: list[RejectedDepthDetection] = []
@@ -579,7 +666,7 @@ class SemanticPerceptionNode(Node):
                     class_evidence_strength=detection.class_evidence_strength,
                     position=tuple(float(value) for value in world_point),
                     position_covariance=world_covariance,
-                    stamp_ns=stamp_ns,
+                    stamp_ns=registry_stamp_ns,
                     frame_id=self._reference_frame(),
                     bbox_xyxy=detection.bbox_xyxy,
                     range_m=range_m,
@@ -594,6 +681,8 @@ class SemanticPerceptionNode(Node):
                     combined_pixel_stddev_px=combined_pixel_stddev_px,
                 )
             )
+        timing["depth"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         if bool(self.get_parameter("debug.publish_annotated").value):
             self._publish_annotated_detections(
                 color,
@@ -602,6 +691,7 @@ class SemanticPerceptionNode(Node):
                 depth_diagnostics,
                 rejected_image_detections,
             )
+        timing["debug_image"] = time.perf_counter() - stage_started
         self.get_logger().debug(
             "YOLO=%d, localized=%d, depth-rejected=%d, frame=%s, stamp=%d"
             % (
@@ -609,10 +699,10 @@ class SemanticPerceptionNode(Node):
                 len(localized),
                 len(rejected_depth),
                 source_frame,
-                stamp_ns,
+                registry_stamp_ns,
             )
         )
-        return localized, rejected_depth, tf_mode, Time.from_msg(transform.header.stamp)
+        return localized, rejected_depth, tf_mode, Time.from_msg(transform.header.stamp), timing
 
     def _publish_association_diagnostics(
         self,

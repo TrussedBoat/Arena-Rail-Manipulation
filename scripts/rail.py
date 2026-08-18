@@ -20,6 +20,7 @@ simulation_app = SimulationApp(launch_config=launch_config)
 from omni.isaac.core import World
 from omni.isaac.core.utils.stage import open_stage
 from pxr import Usd
+from arena.sim_time import configure_ros2_sim_time
 
 # 4. Load the Stage and World
 current_scene = args.scene
@@ -30,6 +31,8 @@ print("="*60)
 open_stage(current_scene)
 stage = Usd.Stage.Open(current_scene)
 world = World(stage_units_in_meters=1.0)
+camera_nodes = configure_ros2_sim_time(stage)
+print(f"ROS 2 simulation clock enabled; camera helpers switched to sim time: {camera_nodes}")
 
 print("="*60)
 print("Scene loaded. Starting simulation...")

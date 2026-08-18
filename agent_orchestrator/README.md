@@ -19,7 +19,7 @@ A hybrid ROS 2 manipulation pipeline in which a compact local VLM plans high-lev
 
 - **Compact local planner**: Runs `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` with the matching Q8_0 multimodal projector through `llama-server`.
 - **Deterministic visual search**: Uses the configured local `yolo11s.pt` checkpoint; camera frames are processed locally and are not sent to the VLM during active search.
-- **RRT desk scanning**: Sweeps the wrist camera through configurable inward arcs over both desk rows while YOLO runs at a deadline-checked frame rate.
+- **RRT desk scanning**: Targeted search sweeps configurable inward arcs over both desk rows while YOLO runs at a deadline-checked frame rate. Full mapping visits the minimum, centre, and maximum rail stations and executes 11 semantic-mapping viewpoints per desk side.
 - **Close confirmation**: Holds RRT motion on a candidate, depth-localizes it, approaches its rail X, and persists only a strict closer-look detection.
 - **Dynamic coordinates**: Saves rail-zero global XYZ pickup coordinates to `semantic_distances_dynamic.json` without overwriting unrelated labels.
 - **Fail-closed orchestration**: A LangGraph stage gate permits only one expected high-level tool at a time and terminates immediately after search, pick, navigation, or place failure.
@@ -37,8 +37,13 @@ waits for `/panda/controller_state` and receives failures immediately from
 `/rrt/status`.
 
 The planner rejects any target or interpolated path state whose EEF height in
-`panda_link0` would be below `0.15 m`. This table-clearance floor is the
-`eef_min_z_m` ROS parameter, set by `run_orchestrator.sh`.
+`panda_link0` would be below `0.08 m`. This calibrated EEF floor is the
+`eef_min_z_m` ROS parameter, set by `run_orchestrator.sh`; override it with
+`ARENA_RRT_EEF_MIN_Z_M` when recalibrating the gripper geometry.
+
+The planner warns below a singularity metric of `0.10` and stops below `0.045`.
+Override the stop limit with `ARENA_RRT_SINGULARITY_STOP` only when calibrating
+reachable manipulation poses.
 
 The low-level controller does not consume `/rrt/pose_command` directly. Runtime safety
 monitoring issues a zero-velocity joint hold if actual feedback enters an unsafe

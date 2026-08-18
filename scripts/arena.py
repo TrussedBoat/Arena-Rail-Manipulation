@@ -23,6 +23,7 @@ from pxr import Usd
 import rclpy
 
 from arena.streamer import TVStreamerNode
+from arena.sim_time import configure_ros2_sim_time
 
 # 3. Initialize ROS 2 and Node
 if not rclpy.ok():
@@ -38,6 +39,8 @@ print("="*60)
 open_stage(current_scene)
 stage = Usd.Stage.Open(current_scene)
 world = World(stage_units_in_meters=1.0)
+camera_nodes = configure_ros2_sim_time(stage)
+print(f"ROS 2 simulation clock enabled; camera helpers switched to sim time: {camera_nodes}")
 
 print("="*60)
 print("Scene loaded. Starting simulation...")

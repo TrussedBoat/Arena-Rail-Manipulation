@@ -28,7 +28,9 @@ MOBILECLIP_CHECKPOINT="${ARENA_MOBILECLIP_CHECKPOINT:-$SCRIPT_DIR/agent_orchestr
 REGISTRY_PATH="${ARENA_OBJECT_REGISTRY:-$SCRIPT_DIR/semantic_objects.json}"
 LEGACY_PATH="${ARENA_DYNAMIC_COORDINATES:-$SCRIPT_DIR/semantic_distances_dynamic.json}"
 WRITE_LEGACY="${ARENA_WRITE_LEGACY_COORDINATES:-false}"
-USE_SIM_TIME="${ARENA_USE_SIM_TIME:-false}"
+# Arena publishes /clock, so simulation time is the safe default. Override
+# with ARENA_USE_SIM_TIME=false when consuming a real wall-time camera setup.
+USE_SIM_TIME="${ARENA_USE_SIM_TIME:-true}"
 PUBLISH_ANNOTATED_DEBUG="${ARENA_PUBLISH_ANNOTATED_DEBUG:-false}"
 CONFIRMATION_HITS="${ARENA_CONFIRMATION_HITS:-8}"
 START_RVIZ_VISUALIZER=false

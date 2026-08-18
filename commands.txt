@@ -4,7 +4,6 @@ to run the VLM in the think mode:
 to run the semantic node:
 ./run_semantic_perception.sh
 
-
 agent_env enviroment activation:
 source ~/workspace//Arena-RealSim/agent_orchestrator/agent_env/bin/activate
 
@@ -53,10 +52,11 @@ my current vision for the tool calling for the task of:
 
 
   ./run_semantic_perception.sh --rviz-confirmed-only --publish-debug \
+    -p tf.fallback_to_latest:=false \
     -p appearance.max_cosine_distance:=0.50 \
     -p detector.confidence_threshold:=0.45 \
     -p detector.max_bbox_area_fraction:=0.40 \
-    -p depth.maximum_m:=2.0 \
+    -p depth.maximum_m:=2.5 \
     -p filter.confirmation_hits:=3 \
     -p filter.confirmation_window_sec:=5.0 \
     -p class.confirmation_probability:=0.55 \
@@ -64,6 +64,8 @@ my current vision for the tool calling for the task of:
     -p uncertainty.extrinsic_stddev_m:=0.03 \
     -p uncertainty.world_stddev_m:=0.05 \
     -p uncertainty.process_noise_stddev_m:=0.01 \
-    -p detector.image_size:=512 \
-    -p processing_rate_hz:=5.0
+    -p detector.image_size:=384 \
+    -p processing_rate_hz:=60.0 \
+    -p diagnostics.publish:=false
+
 

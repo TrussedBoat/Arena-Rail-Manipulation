@@ -1,4 +1,5 @@
 import base64
+import copy
 import json
 import math
 import threading
@@ -8,6 +9,7 @@ import numpy as np
 from cv_bridge import CvBridge
 
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, JointState
@@ -15,10 +17,15 @@ from std_srvs.srv import Trigger
 from std_msgs.msg import Bool, Empty, Float64, String
 import tf2_ros
 from geometry_msgs.msg import Pose
+from interface.action import FindObject
+from interface.msg import DetectedObjectArray
 from scipy.spatial.transform import Rotation
 
 _shared_node = None
 VLM_CAMERA_MAX_SIDE_PX = 256
+GRIPPER_COMMAND_CLOSED = 0.0
+GRIPPER_COMMAND_OPEN = 0.04
+GRIPPER_COMMAND_MAX = 0.08
 
 def get_shared_node():
     global _shared_node
@@ -37,8 +44,12 @@ class RobotHardwareInterface(Node):
         self.rail_subscriber = self.create_subscription(JointState, '/sim/rail_franka1/joint_states', self.rail_state_callback, 10)
         self.rail_publisher = self.create_publisher(JointState, '/direct_joint_command', 10)
         self.gripper_publisher = self.create_publisher(Float64, '/gripper/command', 10)
+        self.gripper_state_sub = self.create_subscription(
+            Float64, '/gripper_state', self.gripper_state_callback, 10
+        )
         self.pose_publisher = self.create_publisher(Pose, '/rrt/pose_command', 10)
         self.rrt_cancel_publisher = self.create_publisher(Empty, '/rrt/cancel', 10)
+        self.rrt_reverse_publisher = self.create_publisher(Empty, '/rrt/reverse_last_trajectory', 10)
         self.controller_state_sub = self.create_subscription(
             Bool, '/panda/controller_state', self.controller_state_callback, 10
         )
@@ -62,6 +73,15 @@ class RobotHardwareInterface(Node):
         self.rrt_ready_sub = self.create_subscription(
             Bool, '/rrt/ready', self.rrt_ready_callback, 10
         )
+        semantic_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.semantic_objects_sub = self.create_subscription(
+            DetectedObjectArray, '/semantic/objects', self.semantic_objects_callback, semantic_qos
+        )
+        self.semantic_find_client = ActionClient(self, FindObject, '/semantic/find_object')
 
         self.grasp_srv = self.create_service(Trigger, '/vlm_grasp_completed', self.grasp_callback)
         self.place_srv = self.create_service(Trigger, '/vlm_place_completed', self.place_callback)
@@ -71,11 +91,13 @@ class RobotHardwareInterface(Node):
         self.bridge = CvBridge()
         self.latest_b64_image = None
         self.latest_vlm_b64_image = None
+        self.latest_vlm_image_sequence = 0
         self.latest_depth_image = None  # raw numpy float32 depth frame (metres)
         self.current_rail_position = None
         self.current_panda_joint1 = None
         self.current_panda_joint6 = None
         self.current_joint_positions = {}
+        self.current_gripper_state = None
         self.cartesian_controller_ready = False
         self.cartesian_control_active = False
         self.direct_joint_control_active = False
@@ -85,6 +107,13 @@ class RobotHardwareInterface(Node):
         self._rrt_status_state = None
         self._rrt_status_message = None
         self._rrt_ready_at = None
+        self._semantic_lock = threading.RLock()
+        self._semantic_objects = {}
+        self._semantic_objects_received = False
+        self._semantic_candidate = None
+        self._semantic_goal_handle = None
+        self._semantic_result = None
+        self._semantic_error = None
 
         # TF listener for camera→base transforms
         self.tf_buffer = tf2_ros.Buffer()
@@ -94,7 +123,15 @@ class RobotHardwareInterface(Node):
         self.cartesian_controller_ready = bool(msg.data)
 
     def controller_state_callback(self, msg):
-        self.cartesian_control_active = self.cartesian_control_active or bool(msg.data)
+        # This is a one-shot completion notification from the Panda controller,
+        # not an ownership state.  Ownership is tracked from /rrt/status so a
+        # delayed completion pulse cannot re-lock the gripper after success.
+        del msg
+
+    def gripper_state_callback(self, msg):
+        value = float(msg.data)
+        if math.isfinite(value):
+            self.current_gripper_state = value
 
     def direct_joint_control_callback(self, msg):
         self.direct_joint_control_active = bool(msg.data)
@@ -108,6 +145,11 @@ class RobotHardwareInterface(Node):
         self._rrt_status_state = state
         self._rrt_status_message = str(status.get('message', ''))
         self._rrt_status_event.set()
+        if state in {'success', 'cancelled'}:
+            # /panda/controller_state is a completion pulse, not a persistent
+            # ownership signal.  RRT's terminal status is the authoritative
+            # indication that its Cartesian command stream is no longer active.
+            self.cartesian_control_active = False
         if state == 'failure':
             self._cartesian_failure = str(status.get('message', 'RRT planning failed'))
             self._cartesian_completion.set()
@@ -119,6 +161,76 @@ class RobotHardwareInterface(Node):
     def rrt_ready_callback(self, msg):
         if msg.data:
             self._rrt_ready_at = time.monotonic()
+
+    def semantic_objects_callback(self, message):
+        with self._semantic_lock:
+            self._semantic_objects_received = True
+            self._semantic_objects = {
+                item.object_id: copy.deepcopy(item) for item in message.objects
+            }
+
+    def start_semantic_find_object(self, target_class, min_confidence, timeout_sec):
+        """Start one semantic FindObject action; callbacks run on the spin thread."""
+        if not self.semantic_find_client.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError("Semantic perception action /semantic/find_object is unavailable")
+        goal = FindObject.Goal()
+        goal.target_class = str(target_class)
+        goal.min_confidence = float(min_confidence)
+        goal.timeout_sec = float(timeout_sec)
+        with self._semantic_lock:
+            self._semantic_candidate = None
+            self._semantic_goal_handle = None
+            self._semantic_result = None
+            self._semantic_error = None
+        future = self.semantic_find_client.send_goal_async(goal, feedback_callback=self._semantic_feedback)
+        future.add_done_callback(self._semantic_goal_response)
+
+    def _semantic_feedback(self, feedback_message):
+        candidate = feedback_message.feedback.candidate
+        with self._semantic_lock:
+            self._semantic_candidate = copy.deepcopy(candidate) if candidate.object_id else None
+
+    def _semantic_goal_response(self, future):
+        try:
+            handle = future.result()
+            if not handle.accepted:
+                raise RuntimeError("Semantic FindObject goal was rejected")
+            with self._semantic_lock:
+                self._semantic_goal_handle = handle
+            result_future = handle.get_result_async()
+            result_future.add_done_callback(self._semantic_result_callback)
+        except Exception as exc:
+            with self._semantic_lock:
+                self._semantic_error = str(exc)
+
+    def _semantic_result_callback(self, future):
+        try:
+            response = future.result().result
+            with self._semantic_lock:
+                self._semantic_result = copy.deepcopy(response)
+        except Exception as exc:
+            with self._semantic_lock:
+                self._semantic_error = str(exc)
+
+    def semantic_find_status(self):
+        with self._semantic_lock:
+            return {
+                "candidate": copy.deepcopy(self._semantic_candidate),
+                "result": copy.deepcopy(self._semantic_result),
+                "error": self._semantic_error,
+                "objects_received": self._semantic_objects_received,
+            }
+
+    def semantic_object(self, object_id):
+        with self._semantic_lock:
+            item = self._semantic_objects.get(str(object_id))
+            return copy.deepcopy(item) if item is not None else None
+
+    def cancel_semantic_find_object(self):
+        with self._semantic_lock:
+            handle = self._semantic_goal_handle
+        if handle is not None:
+            handle.cancel_goal_async()
 
     def wait_for_cartesian_controller(self, timeout_sec: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout_sec
@@ -238,6 +350,29 @@ class RobotHardwareInterface(Node):
                 self._rrt_status_event.clear()
         return False
 
+    def reverse_last_eef_motion(self, timeout_sec: float) -> bool:
+        """Replay the most recently completed RRT trajectory in reverse."""
+        if not self.wait_for_cartesian_controller(timeout_sec=min(5.0, timeout_sec)):
+            raise RuntimeError("RRT planner is not ready for reverse trajectory replay")
+        self._cartesian_completion.clear()
+        self._cartesian_failure = None
+        self._rrt_status_event.clear()
+        self._rrt_status_state = None
+        self._rrt_status_message = None
+        self.cartesian_control_active = True
+        self.rrt_reverse_publisher.publish(Empty())
+        return self.wait_for_eef_motion(timeout_sec)
+
+    def rrt_motion_active(self) -> bool:
+        """Whether the latest planner status still owns a Cartesian trajectory."""
+        return self._rrt_status_state in {"planning", "executing"}
+
+    def ensure_rrt_idle(self, timeout_sec: float = 3.0) -> bool:
+        """Cancel a previous Cartesian trajectory before direct motion/new RRT work."""
+        if not self.rrt_motion_active():
+            return True
+        return self.cancel_eef_motion(timeout_sec=timeout_sec)
+
     def _ensure_direct_arm_control_allowed(self):
         if self.cartesian_control_active:
             self.get_logger().warning(
@@ -287,6 +422,7 @@ class RobotHardwareInterface(Node):
             if not encoded:
                 raise RuntimeError("OpenCV could not JPEG-encode the VLM camera frame")
             self.latest_vlm_b64_image = base64.b64encode(buffer).decode('utf-8')
+            self.latest_vlm_image_sequence += 1
         except Exception as e:
             self.get_logger().error(f"Image processing exception: {e}")
 
@@ -398,11 +534,49 @@ class RobotHardwareInterface(Node):
         self.rail_publisher.publish(msg)
         self.get_logger().info("Published JointState for full arm search posture.")
 
-    def open_gripper(self, opening_command: float = 100.0):
+    def set_gripper_command(self, opening_command: float) -> None:
+        """Command the gripper opening through the independent direct interface.
+
+        The Arena bridge forwards this value to ``panda_finger_joint1`` in
+        metres: 0 is closed and 0.04 is normally fully open.  The bridge rejects direct gripper commands
+        while an RRT Cartesian trajectory owns the Panda joints.
+        """
+        command = float(opening_command)
+        if not math.isfinite(command):
+            raise ValueError("Gripper command must be finite")
+        if not GRIPPER_COMMAND_CLOSED <= command <= GRIPPER_COMMAND_MAX:
+            raise ValueError(
+                "Gripper command must be within "
+                f"[{GRIPPER_COMMAND_CLOSED:g}, {GRIPPER_COMMAND_MAX:g}] metres, got {command:g}"
+            )
+        if self.cartesian_control_active:
+            raise RuntimeError(
+                "Cannot command gripper while an RRT Cartesian trajectory owns the Panda"
+            )
         msg = Float64()
-        msg.data = float(opening_command)
+        msg.data = command
         self.gripper_publisher.publish(msg)
-        self.get_logger().info(f"Published gripper open command: {msg.data:.1f}")
+        self.get_logger().info(f"Published gripper command: opening={msg.data:.1f}")
+
+    def open_gripper(self, opening_command: float = GRIPPER_COMMAND_OPEN) -> None:
+        self.set_gripper_command(opening_command)
+
+    def close_gripper(self, closing_command: float = GRIPPER_COMMAND_CLOSED) -> None:
+        self.set_gripper_command(closing_command)
+
+    def wait_for_gripper_target(
+        self, target_state: float, tolerance: float = 0.005, timeout_sec: float = 5.0
+    ) -> bool:
+        target = float(target_state)
+        if not math.isfinite(target) or tolerance <= 0.0 or timeout_sec <= 0.0:
+            raise ValueError("Gripper target, tolerance, and timeout must be valid")
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            current = self.current_gripper_state
+            if current is not None and abs(float(current) - target) <= tolerance:
+                return True
+            time.sleep(0.02)
+        return False
 
     def send_panda_joint6_command(self, target_rad: float, speed: float = None):
         self._ensure_direct_arm_control_allowed()

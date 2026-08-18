@@ -82,8 +82,13 @@ DEPTH_PATCH_RADIUS          = 2
 
 # --- RRT targeted-search scan ---
 TARGETED_SCAN_VIEWPOINTS        = 7
+MAPPING_SCAN_VIEWPOINTS         = 11
 TARGETED_CAPTURE_FPS            = 0.3 #lower it if the wrist camera is not able to capture fast enough
-TARGETED_CANDIDATE_CONFIDENCE   = 0.50
+# Semantic-perception thresholds used by targeted search.  The candidate
+# threshold only pauses a scan; FindObject still requires confirmation.
+TARGETED_CANDIDATE_CONFIDENCE   = 0.30
+TARGETED_CONFIRMATION_CONFIDENCE = 0.55
+TARGETED_SEMANTIC_ACTION_TIMEOUT_SEC = 300.0
 TARGETED_DESK_WIDTH             = 1.0
 TARGETED_TABLE_SCAN_Y           = 0.60
 TARGETED_ARC_RADIUS             = 0.50
@@ -93,6 +98,26 @@ TARGETED_SCAN_ROLL              = 3.14
 TARGETED_SCAN_PITCH             = -0.3
 TARGETED_CLOSE_STANDOFF         = 0.30
 TARGETED_CANCEL_TIMEOUT_SEC     = 3.0
+
+# --- RRT manipulation defaults (calibrate in this file or with YOLO_VLM_* env) ---
+MANIPULATION_HOVER_HEIGHT_M       = 0.20
+MANIPULATION_GRASP_Z_OFFSET_M     = 0.04
+MANIPULATION_MIN_PICK_DESCEND_Z_M = 0.12
+MANIPULATION_PLACE_DROP_OFFSET_M  = 0.08
+MANIPULATION_LATERAL_OFFSET_M     = -0.03
+MANIPULATION_Y_OFFSET_M           = 0.02
+MANIPULATION_POST_ACTION_LIFT_M   = 0.10
+MANIPULATION_ROLL                 = 3.14
+MANIPULATION_PITCH                = 0.0
+MANIPULATION_YAW                  = 0.0
+MANIPULATION_GRIPPER_OPEN_COMMAND = 0.04
+MANIPULATION_GRIPPER_CLOSE_COMMAND = 0.0
+MANIPULATION_GRIPPER_OPEN_STATE_M = 0.04
+MANIPULATION_GRIPPER_CLOSE_STATE_M = 0.0
+MANIPULATION_GRIPPER_CLOSE_ACCEPTANCE_M = 0.035
+MANIPULATION_GRIPPER_TOLERANCE_M  = 0.005
+MANIPULATION_GRIPPER_TIMEOUT_SEC  = 5.0
+MANIPULATION_GRIPPER_HANDOFF_DELAY_SEC = 0.15
 
 # --- Cartesian EEF settings ---
 CARTESIAN_COMMAND_TIMEOUT_SEC   = 30.0
@@ -105,6 +130,7 @@ CARTESIAN_EEF_FRAME             = "eef"
 ROS_SETUP_SCRIPT               = Path("/opt/ros/humble/setup.bash")
 STATIC_COORDINATES_PATH        = PROJECT_ROOT / "semantic_distances.json"
 DYNAMIC_COORDINATES_PATH       = PROJECT_ROOT / "semantic_distances_dynamic.json"
+SEMANTIC_OBJECTS_PATH          = PROJECT_ROOT / "semantic_objects.json"
 PICK_SCRIPT_RELATIVE_PATH      = Path("src/bringup/rail_demo_pick.sh")
 PLACE_SCRIPT_RELATIVE_PATH     = Path("src/bringup/rail_demo_place.sh")
 ALLOW_MOCK_HARDWARE_SCRIPTS    = True
@@ -184,8 +210,11 @@ class SearchConfig:
     camera_cy: float
     depth_patch_radius: int  # px radius for median depth sampling
     targeted_scan_viewpoints: int
+    mapping_scan_viewpoints: int
     targeted_capture_fps: float
     targeted_candidate_confidence: float
+    targeted_confirmation_confidence: float
+    targeted_semantic_action_timeout_sec: float
     targeted_desk_width: float
     targeted_table_scan_y: float
     targeted_arc_radius: float
@@ -207,9 +236,32 @@ class CartesianConfig:
 
 
 @dataclass(frozen=True)
+class ManipulationConfig:
+    hover_height_m: float
+    grasp_z_offset_m: float
+    min_pick_descend_z_m: float
+    place_drop_offset_m: float
+    lateral_offset_m: float
+    y_offset_m: float
+    post_action_lift_m: float
+    roll: float
+    pitch: float
+    yaw: float
+    gripper_open_command: float
+    gripper_close_command: float
+    gripper_open_state_m: float
+    gripper_close_state_m: float
+    gripper_close_acceptance_m: float
+    gripper_tolerance_m: float
+    gripper_timeout_sec: float
+    gripper_handoff_delay_sec: float
+
+
+@dataclass(frozen=True)
 class PathConfig:
     static_semantic_coordinates: Path
     dynamic_semantic_coordinates: Path
+    semantic_objects: Path
     ros_setup_script: Path
     controller_workspace: Path
     controller_setup_script: Path
@@ -223,6 +275,7 @@ class RuntimeConfig:
     yolo: YOLOConfig
     search: SearchConfig
     cartesian: CartesianConfig
+    manipulation: ManipulationConfig
     paths: PathConfig
     allow_mock_hardware_scripts: bool
 
@@ -415,11 +468,24 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             targeted_scan_viewpoints=_env_int(
                 source, "YOLO_VLM_TARGETED_SCAN_VIEWPOINTS", TARGETED_SCAN_VIEWPOINTS
             ),
+            mapping_scan_viewpoints=_env_int(
+                source, "YOLO_VLM_MAPPING_SCAN_VIEWPOINTS", MAPPING_SCAN_VIEWPOINTS
+            ),
             targeted_capture_fps=_env_float(
                 source, "YOLO_VLM_TARGETED_CAPTURE_FPS", TARGETED_CAPTURE_FPS
             ),
             targeted_candidate_confidence=_env_float(
                 source, "YOLO_VLM_TARGETED_CANDIDATE_CONFIDENCE", TARGETED_CANDIDATE_CONFIDENCE
+            ),
+            targeted_confirmation_confidence=_env_float(
+                source,
+                "YOLO_VLM_TARGETED_CONFIRMATION_CONFIDENCE",
+                TARGETED_CONFIRMATION_CONFIDENCE,
+            ),
+            targeted_semantic_action_timeout_sec=_env_float(
+                source,
+                "YOLO_VLM_TARGETED_SEMANTIC_ACTION_TIMEOUT_SEC",
+                TARGETED_SEMANTIC_ACTION_TIMEOUT_SEC,
             ),
             targeted_desk_width=_env_float(
                 source, "YOLO_VLM_TARGETED_DESK_WIDTH", TARGETED_DESK_WIDTH
@@ -468,6 +534,26 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
                 source, "YOLO_VLM_CARTESIAN_EEF_FRAME", CARTESIAN_EEF_FRAME
             ),
         ),
+        manipulation=ManipulationConfig(
+            hover_height_m=_env_float(source, "YOLO_VLM_MANIPULATION_HOVER_HEIGHT_M", MANIPULATION_HOVER_HEIGHT_M),
+            grasp_z_offset_m=_env_float(source, "YOLO_VLM_MANIPULATION_GRASP_Z_OFFSET_M", MANIPULATION_GRASP_Z_OFFSET_M),
+            min_pick_descend_z_m=_env_float(source, "YOLO_VLM_MANIPULATION_MIN_PICK_DESCEND_Z_M", MANIPULATION_MIN_PICK_DESCEND_Z_M),
+            place_drop_offset_m=_env_float(source, "YOLO_VLM_MANIPULATION_PLACE_DROP_OFFSET_M", MANIPULATION_PLACE_DROP_OFFSET_M),
+            lateral_offset_m=_env_float(source, "YOLO_VLM_MANIPULATION_LATERAL_OFFSET_M", MANIPULATION_LATERAL_OFFSET_M),
+            y_offset_m=_env_float(source, "YOLO_VLM_MANIPULATION_Y_OFFSET_M", MANIPULATION_Y_OFFSET_M),
+            post_action_lift_m=_env_float(source, "YOLO_VLM_MANIPULATION_POST_ACTION_LIFT_M", MANIPULATION_POST_ACTION_LIFT_M),
+            roll=_env_float(source, "YOLO_VLM_MANIPULATION_ROLL", MANIPULATION_ROLL),
+            pitch=_env_float(source, "YOLO_VLM_MANIPULATION_PITCH", MANIPULATION_PITCH),
+            yaw=_env_float(source, "YOLO_VLM_MANIPULATION_YAW", MANIPULATION_YAW),
+            gripper_open_command=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_OPEN_COMMAND", MANIPULATION_GRIPPER_OPEN_COMMAND),
+            gripper_close_command=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_CLOSE_COMMAND", MANIPULATION_GRIPPER_CLOSE_COMMAND),
+            gripper_open_state_m=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_OPEN_STATE_M", MANIPULATION_GRIPPER_OPEN_STATE_M),
+            gripper_close_state_m=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_CLOSE_STATE_M", MANIPULATION_GRIPPER_CLOSE_STATE_M),
+            gripper_close_acceptance_m=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_CLOSE_ACCEPTANCE_M", MANIPULATION_GRIPPER_CLOSE_ACCEPTANCE_M),
+            gripper_tolerance_m=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_TOLERANCE_M", MANIPULATION_GRIPPER_TOLERANCE_M),
+            gripper_timeout_sec=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_TIMEOUT_SEC", MANIPULATION_GRIPPER_TIMEOUT_SEC),
+            gripper_handoff_delay_sec=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_HANDOFF_DELAY_SEC", MANIPULATION_GRIPPER_HANDOFF_DELAY_SEC),
+        ),
         paths=PathConfig(
             static_semantic_coordinates=_env_path(
                 source,
@@ -478,6 +564,9 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
                 source,
                 "YOLO_VLM_DYNAMIC_COORDINATES_PATH",
                 DYNAMIC_COORDINATES_PATH,
+            ),
+            semantic_objects=_env_path(
+                source, "YOLO_VLM_SEMANTIC_OBJECTS_PATH", SEMANTIC_OBJECTS_PATH
             ),
             ros_setup_script=_env_path(
                 source, "YOLO_VLM_ROS_SETUP_SCRIPT", ROS_SETUP_SCRIPT
@@ -659,6 +748,21 @@ def validate_runtime_config(
         except (OSError, json.JSONDecodeError) as exc:
             errors.append(f"dynamic semantic-coordinate JSON is invalid: {exc}")
 
+    semantic_objects_path = config.paths.semantic_objects
+    if semantic_objects_path.suffix.lower() != ".json":
+        errors.append(
+            f"semantic-object registry path must end in .json: {semantic_objects_path}"
+        )
+    if not semantic_objects_path.parent.is_dir():
+        errors.append(
+            "semantic-object registry parent directory does not exist: "
+            f"{semantic_objects_path.parent}"
+        )
+    elif semantic_objects_path.exists() and not semantic_objects_path.is_file():
+        errors.append(
+            f"semantic-object registry path is not a file: {semantic_objects_path}"
+        )
+
     if not config.vlm.host or any(char.isspace() for char in config.vlm.host):
         errors.append(f"server host is invalid: {config.vlm.host!r}")
     if not 1 <= config.vlm.port <= 65535:
@@ -781,6 +885,8 @@ def validate_runtime_config(
         )
     if config.search.targeted_scan_viewpoints < 2:
         errors.append("targeted scan viewpoints must be at least 2")
+    if config.search.mapping_scan_viewpoints < 2:
+        errors.append("mapping scan viewpoints must be at least 2")
     for label, value in (
         ("targeted capture FPS", config.search.targeted_capture_fps),
         ("targeted desk width", config.search.targeted_desk_width),
@@ -789,6 +895,7 @@ def validate_runtime_config(
         ("targeted scan height", config.search.targeted_scan_height),
         ("targeted close stand-off", config.search.targeted_close_standoff),
         ("targeted cancel timeout", config.search.targeted_cancel_timeout_sec),
+        ("targeted semantic action timeout", config.search.targeted_semantic_action_timeout_sec),
     ):
         if not math.isfinite(value) or value <= 0:
             errors.append(f"{label} must be finite and positive, got {value}")
@@ -803,11 +910,15 @@ def validate_runtime_config(
             "targeted desk surface Z must be finite, got "
             f"{config.search.targeted_desk_surface_z}"
         )
-    if not 0 < config.search.targeted_candidate_confidence < config.yolo.confidence_threshold:
+    if not 0 < config.search.targeted_candidate_confidence <= 1.0:
         errors.append(
-            "targeted candidate confidence must be between 0 and the final YOLO "
-            f"threshold ({config.yolo.confidence_threshold}), got "
+            "targeted candidate confidence must be in (0, 1], got "
             f"{config.search.targeted_candidate_confidence}"
+        )
+    if not 0 < config.search.targeted_confirmation_confidence <= 1.0:
+        errors.append(
+            "targeted confirmation confidence must be in (0, 1], got "
+            f"{config.search.targeted_confirmation_confidence}"
         )
     for label, angle in (
         ("targeted scan roll", config.search.targeted_scan_roll),
@@ -831,6 +942,41 @@ def validate_runtime_config(
     ):
         if value <= 0:
             errors.append(f"{label} must be positive, got {value}")
+    for label, value in (
+        ("manipulation hover height", config.manipulation.hover_height_m),
+        ("manipulation place drop offset", config.manipulation.place_drop_offset_m),
+        ("manipulation post-action lift", config.manipulation.post_action_lift_m),
+        ("manipulation gripper tolerance", config.manipulation.gripper_tolerance_m),
+        ("manipulation gripper timeout", config.manipulation.gripper_timeout_sec),
+        ("manipulation gripper handoff delay", config.manipulation.gripper_handoff_delay_sec),
+    ):
+        if not math.isfinite(value) or value <= 0:
+            errors.append(f"{label} must be finite and positive, got {value}")
+    for label, value in (
+        ("manipulation grasp Z offset", config.manipulation.grasp_z_offset_m),
+        ("manipulation minimum pick descend Z", config.manipulation.min_pick_descend_z_m),
+        ("manipulation lateral offset", config.manipulation.lateral_offset_m),
+        ("manipulation Y offset", config.manipulation.y_offset_m),
+        ("manipulation roll", config.manipulation.roll),
+        ("manipulation pitch", config.manipulation.pitch),
+        ("manipulation yaw", config.manipulation.yaw),
+        ("manipulation gripper open command", config.manipulation.gripper_open_command),
+        ("manipulation gripper close command", config.manipulation.gripper_close_command),
+        ("manipulation gripper open state", config.manipulation.gripper_open_state_m),
+        ("manipulation gripper close state", config.manipulation.gripper_close_state_m),
+        ("manipulation gripper close acceptance", config.manipulation.gripper_close_acceptance_m),
+    ):
+        if not math.isfinite(value):
+            errors.append(f"{label} must be finite, got {value}")
+    if config.manipulation.min_pick_descend_z_m < 0.0:
+        errors.append(
+            "manipulation minimum pick descend Z must be non-negative, got "
+            f"{config.manipulation.min_pick_descend_z_m}"
+        )
+    if not 0 <= config.manipulation.gripper_close_command <= config.manipulation.gripper_open_command <= 0.08:
+        errors.append("manipulation gripper commands must be ordered within [0, 0.08] metres")
+    if not 0 <= config.manipulation.gripper_close_state_m <= config.manipulation.gripper_close_acceptance_m <= config.manipulation.gripper_open_state_m:
+        errors.append("gripper close acceptance must be between closed and open feedback states")
 
     if not errors and config.yolo.checkpoint_path.is_file():
         try:
