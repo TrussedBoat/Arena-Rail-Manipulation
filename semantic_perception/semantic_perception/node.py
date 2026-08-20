@@ -495,6 +495,46 @@ class SemanticPerceptionNode(Node):
         persistence_started = time.perf_counter()
         self._persist_if_due()
         timing["persistence"] = time.perf_counter() - persistence_started
+        # Export 3DGS Data
+        import os
+        import json
+        import cv2
+        for result in association_results:
+            if (
+                result.decision != "unmatched" 
+                and result.track is not None 
+                and result.track.state == "confirmed"
+            ):
+                det = localized[result.detection_index]
+                if det.color_crop is not None and det.inlier_mask_crop is not None and det.camera_to_world is not None:
+                    obj_dir = f"/dev/shm/3dgs_cache/{result.track.object_id}"
+                    os.makedirs(obj_dir, exist_ok=True)
+                    
+                    rgb_crop = det.color_crop.copy()
+                    rgb_crop[~det.inlier_mask_crop] = 0
+                    
+                    stamp_ns = det.stamp_ns
+                    img_path = os.path.join(obj_dir, f"{stamp_ns}.png")
+                    cv2.imwrite(img_path, rgb_crop)
+                    
+                    cx = self._camera_calibration.cx - det.crop_offset[0]
+                    cy = self._camera_calibration.cy - det.crop_offset[1]
+                    
+                    meta = {
+                        "camera_to_world": det.camera_to_world.tolist(),
+                        "intrinsics": {
+                            "fx": self._camera_calibration.fx,
+                            "fy": self._camera_calibration.fy,
+                            "cx": cx,
+                            "cy": cy,
+                            "width": int(rgb_crop.shape[1]),
+                            "height": int(rgb_crop.shape[0])
+                        }
+                    }
+                    meta_path = os.path.join(obj_dir, f"{stamp_ns}.json")
+                    with open(meta_path, "w") as f:
+                        json.dump(meta, f)
+
         timing["total"] = time.perf_counter() - frame_started
         now_monotonic = time.monotonic()
         if (
@@ -698,6 +738,34 @@ class SemanticPerceptionNode(Node):
                     f"Rejected {detection.class_name} detection: {exc}"
                 )
                 continue
+            # 3DGS Data Extraction
+            left, top, right, bottom = map(int, detection.bbox_xyxy)
+            left = max(0, left)
+            top = max(0, top)
+            right = min(color.shape[1], right)
+            bottom = min(color.shape[0], bottom)
+            
+            if right > left and bottom > top:
+                import tf_transformations
+                color_crop = color[top:bottom, left:right].copy()
+                inlier_mask_crop = diagnostics.inlier_mask[top:bottom, left:right]
+                tx = transform.transform.translation.x
+                ty = transform.transform.translation.y
+                tz = transform.transform.translation.z
+                qx = transform.transform.rotation.x
+                qy = transform.transform.rotation.y
+                qz = transform.transform.rotation.z
+                qw = transform.transform.rotation.w
+                T_trans = tf_transformations.translation_matrix((tx, ty, tz))
+                T_rot = tf_transformations.quaternion_matrix((qx, qy, qz, qw))
+                camera_to_world = T_trans @ T_rot
+                crop_offset = (left, top)
+            else:
+                color_crop = None
+                inlier_mask_crop = None
+                camera_to_world = None
+                crop_offset = None
+
             localized.append(
                 LocalizedDetection(
                     class_name=detection.class_name,
@@ -720,6 +788,10 @@ class SemanticPerceptionNode(Node):
                     bbox_pixel_stddev_px=bbox_pixel_stddev_px,
                     combined_pixel_stddev_px=combined_pixel_stddev_px,
                     point_cloud=point_cloud_samples,
+                    color_crop=color_crop,
+                    inlier_mask_crop=inlier_mask_crop,
+                    camera_to_world=camera_to_world,
+                    crop_offset=crop_offset,
                 )
             )
         timing["depth"] = time.perf_counter() - stage_started
