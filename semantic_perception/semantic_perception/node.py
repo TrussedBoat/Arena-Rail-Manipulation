@@ -666,7 +666,7 @@ class SemanticPerceptionNode(Node):
                 inlier_ys, inlier_xs = np.where(diagnostics.inlier_mask)
                 num_inliers = len(inlier_ys)
                 if num_inliers > 0:
-                    sample_size = min(15, num_inliers)
+                    sample_size = min(50, num_inliers)
                     sample_indices = np.random.choice(num_inliers, sample_size, replace=False)
                     for idx in sample_indices:
                         roi_y = inlier_ys[idx]
