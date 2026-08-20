@@ -213,6 +213,9 @@ class SemanticPerceptionNode(Node):
         self._persistence_timer = self.create_timer(1.0, self._persist_if_due)
         self._lifecycle_timer = self.create_timer(1.0, self._maintain_registry_lifecycle)
         self._input_health_timer = self.create_timer(1.0, self._log_input_health)
+        # Voxel hash tracking for 3DGS camera poses
+        self._saved_voxels: dict[str, set[tuple[int, int, int, int, int, int]]] = {}
+
         self._action_server = ActionServer(
             self,
             FindObject,
@@ -306,6 +309,10 @@ class SemanticPerceptionNode(Node):
         self.declare_parameter("debug.timing_log_interval_sec", 1.0)
         self.declare_parameter("debug.annotated_topic", "/semantic/debug/yolo")
         self.declare_parameter("diagnostics.publish", True)
+        
+        # 3DGS Parameters
+        self.declare_parameter("3dgs.voxel_size_m", 0.05)
+        self.declare_parameter("3dgs.voxel_size_deg", 5.0)
 
     def _validate_parameters(self) -> None:
         positive_parameters = (
@@ -506,16 +513,67 @@ class SemanticPerceptionNode(Node):
                 and result.track.state == "confirmed"
             ):
                 det = localized[result.detection_index]
-                if det.color_crop is not None and det.inlier_mask_crop is not None and det.camera_to_world is not None:
-                    obj_dir = f"/dev/shm/3dgs_cache/{result.track.object_id}"
+                if det.color_crop is not None and det.camera_to_world is not None:
+                    
+                    # 6D Voxel Hashing Filter
+                    voxel_size_m = float(self.get_parameter("3dgs.voxel_size_m").value)
+                    voxel_size_rad = float(self.get_parameter("3dgs.voxel_size_deg").value) * math.pi / 180.0
+                    
+                    tx, ty, tz = det.camera_to_world[0, 3], det.camera_to_world[1, 3], det.camera_to_world[2, 3]
+                    R = det.camera_to_world[:3, :3]
+                    yaw = np.arctan2(R[1, 0], R[0, 0])
+                    pitch = np.arctan2(-R[2, 0], np.sqrt(R[2, 1]**2 + R[2, 2]**2))
+                    roll = np.arctan2(R[2, 1], R[2, 2])
+                    
+                    voxel_hash = (
+                        int(math.floor(tx / voxel_size_m)),
+                        int(math.floor(ty / voxel_size_m)),
+                        int(math.floor(tz / voxel_size_m)),
+                        int(math.floor(roll / voxel_size_rad)),
+                        int(math.floor(pitch / voxel_size_rad)),
+                        int(math.floor(yaw / voxel_size_rad))
+                    )
+                    
+                    object_id = result.track.object_id
+                    obj_dir = f"/dev/shm/3dgs_cache/{object_id}"
+                    voxels_path = os.path.join(obj_dir, "voxels.json")
+                    
+                    if object_id not in self._saved_voxels:
+                        self._saved_voxels[object_id] = set()
+                        # Attempt to load existing voxels if node restarted
+                        if os.path.isfile(voxels_path):
+                            try:
+                                with open(voxels_path, "r") as f:
+                                    loaded_voxels = json.load(f)
+                                    self._saved_voxels[object_id] = {tuple(v) for v in loaded_voxels}
+                            except Exception as e:
+                                self.get_logger().warning(f"Failed to load voxels for {object_id}: {e}")
+                        
+                    if voxel_hash in self._saved_voxels[object_id]:
+                        continue  # Skip this frame; voxel already filled!
+                        
+                    self._saved_voxels[object_id].add(voxel_hash)
+                    
                     os.makedirs(obj_dir, exist_ok=True)
                     
+                    # Save updated voxels to disk
+                    try:
+                        with open(voxels_path, "w") as f:
+                            json.dump([list(v) for v in self._saved_voxels[object_id]], f)
+                    except Exception as e:
+                        self.get_logger().warning(f"Failed to save voxels for {object_id}: {e}")
+                    
                     rgb_crop = det.color_crop.copy()
-                    rgb_crop[~det.inlier_mask_crop] = 0
                     
                     stamp_ns = det.stamp_ns
                     img_path = os.path.join(obj_dir, f"{stamp_ns}.png")
                     cv2.imwrite(img_path, rgb_crop)
+                    
+                    # Save depth crop as uint16 millimeters
+                    if det.depth_crop is not None:
+                        depth_mm = np.clip(det.depth_crop * 1000.0, 0, 65535).astype(np.uint16)
+                        depth_path = os.path.join(obj_dir, f"{stamp_ns}_depth.png")
+                        cv2.imwrite(depth_path, depth_mm)
                     
                     cx = self._camera_calibration.cx - det.crop_offset[0]
                     cy = self._camera_calibration.cy - det.crop_offset[1]
@@ -529,7 +587,8 @@ class SemanticPerceptionNode(Node):
                             "cy": cy,
                             "width": int(rgb_crop.shape[1]),
                             "height": int(rgb_crop.shape[0])
-                        }
+                        },
+                        "point_cloud": det.point_cloud if det.point_cloud is not None else []
                     }
                     meta_path = os.path.join(obj_dir, f"{stamp_ns}.json")
                     with open(meta_path, "w") as f:
@@ -746,9 +805,18 @@ class SemanticPerceptionNode(Node):
             bottom = min(color.shape[0], bottom)
             
             if right > left and bottom > top:
-                import tf_transformations
                 color_crop = color[top:bottom, left:right].copy()
-                inlier_mask_crop = diagnostics.inlier_mask[top:bottom, left:right]
+                depth_crop = depth[top:bottom, left:right].copy()
+                
+                # Depth-based background removal: zero out pixels
+                # that are further than 0.3m from the object's median depth
+                depth_mask = (
+                    np.isfinite(depth_crop)
+                    & (np.abs(depth_crop - depth_m) < 0.3)
+                )
+                color_crop[~depth_mask] = 0
+                depth_crop[~depth_mask] = 0.0
+                
                 tx = transform.transform.translation.x
                 ty = transform.transform.translation.y
                 tz = transform.transform.translation.z
@@ -756,13 +824,34 @@ class SemanticPerceptionNode(Node):
                 qy = transform.transform.rotation.y
                 qz = transform.transform.rotation.z
                 qw = transform.transform.rotation.w
-                T_trans = tf_transformations.translation_matrix((tx, ty, tz))
-                T_rot = tf_transformations.quaternion_matrix((qx, qy, qz, qw))
-                camera_to_world = T_trans @ T_rot
+                
+                # Manual quaternion to rotation matrix conversion to avoid tf_transformations dependency
+                xx, yy, zz = qx*qx, qy*qy, qz*qz
+                xy, xz, yz = qx*qy, qx*qz, qy*qz
+                xw, yw, zw = qx*qw, qy*qw, qz*qw
+                
+                r11 = 1.0 - 2.0 * (yy + zz)
+                r12 = 2.0 * (xy - zw)
+                r13 = 2.0 * (xz + yw)
+                
+                r21 = 2.0 * (xy + zw)
+                r22 = 1.0 - 2.0 * (xx + zz)
+                r23 = 2.0 * (yz - xw)
+                
+                r31 = 2.0 * (xz - yw)
+                r32 = 2.0 * (yz + xw)
+                r33 = 1.0 - 2.0 * (xx + yy)
+                
+                camera_to_world = np.array([
+                    [r11, r12, r13, tx],
+                    [r21, r22, r23, ty],
+                    [r31, r32, r33, tz],
+                    [0.0, 0.0, 0.0, 1.0]
+                ])
                 crop_offset = (left, top)
             else:
                 color_crop = None
-                inlier_mask_crop = None
+                depth_crop = None
                 camera_to_world = None
                 crop_offset = None
 
@@ -789,7 +878,7 @@ class SemanticPerceptionNode(Node):
                     combined_pixel_stddev_px=combined_pixel_stddev_px,
                     point_cloud=point_cloud_samples,
                     color_crop=color_crop,
-                    inlier_mask_crop=inlier_mask_crop,
+                    depth_crop=depth_crop,
                     camera_to_world=camera_to_world,
                     crop_offset=crop_offset,
                 )

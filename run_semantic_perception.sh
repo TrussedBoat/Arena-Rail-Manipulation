@@ -75,4 +75,6 @@ python3 -m semantic_perception.node --ros-args \
   -p registry.write_legacy_coordinates:="$WRITE_LEGACY" \
   -p debug.publish_annotated:="$PUBLISH_ANNOTATED_DEBUG" \
   -p filter.confirmation_hits:="$CONFIRMATION_HITS" \
+  -p 3dgs.voxel_size_m:=0.05 \
+  -p 3dgs.voxel_size_deg:=5.0 \
   "$@"

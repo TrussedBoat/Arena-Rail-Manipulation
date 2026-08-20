@@ -141,6 +141,8 @@ class GaussianSplattingNode(Node):
         json_files = [f for f in json_files if not f.endswith("transforms.json")]
 
         frames = []
+        all_points = []
+        
         for jf in json_files:
             with open(jf, "r") as fh:
                 data = json.load(fh)
@@ -149,18 +151,27 @@ class GaussianSplattingNode(Node):
             if not os.path.isfile(png_path):
                 continue
 
-            frames.append(
-                {
-                    "file_path": png_path,
-                    "transform_matrix": data["camera_to_world"],
-                    "fl_x": data["intrinsics"]["fx"],
-                    "fl_y": data["intrinsics"]["fy"],
-                    "cx": data["intrinsics"]["cx"],
-                    "cy": data["intrinsics"]["cy"],
-                    "w": data["intrinsics"]["width"],
-                    "h": data["intrinsics"]["height"],
-                }
-            )
+            frame = {
+                "file_path": png_path,
+                "transform_matrix": data["camera_to_world"],
+                "fl_x": data["intrinsics"]["fx"],
+                "fl_y": data["intrinsics"]["fy"],
+                "cx": data["intrinsics"]["cx"],
+                "cy": data["intrinsics"]["cy"],
+                "w": data["intrinsics"]["width"],
+                "h": data["intrinsics"]["height"],
+            }
+
+            # Include depth map if available
+            depth_path = os.path.join(obj_dir, f"{timestamp}_depth.png")
+            if os.path.isfile(depth_path):
+                frame["depth_file_path"] = depth_path
+
+            # Aggregate point cloud samples
+            if "point_cloud" in data and data["point_cloud"]:
+                all_points.extend(data["point_cloud"])
+
+            frames.append(frame)
 
         # Use intrinsics from the first frame as the global default
         first = frames[0] if frames else {}
@@ -174,6 +185,25 @@ class GaussianSplattingNode(Node):
             "camera_model": "PINHOLE",
             "frames": frames,
         }
+
+        # Write PLY file if we have point clouds
+        if all_points:
+            ply_path = os.path.join(obj_dir, "points3D.ply")
+            with open(ply_path, "w") as f:
+                f.write("ply\n")
+                f.write("format ascii 1.0\n")
+                f.write(f"element vertex {len(all_points)}\n")
+                f.write("property float x\n")
+                f.write("property float y\n")
+                f.write("property float z\n")
+                f.write("property uchar red\n")
+                f.write("property uchar green\n")
+                f.write("property uchar blue\n")
+                f.write("end_header\n")
+                for pt in all_points:
+                    f.write(f"{pt['x']} {pt['y']} {pt['z']} {pt['r']} {pt['g']} {pt['b']}\n")
+            
+            transforms["ply_file_path"] = "points3D.ply"
 
         out_path = os.path.join(obj_dir, "transforms.json")
         with open(out_path, "w") as fh:
