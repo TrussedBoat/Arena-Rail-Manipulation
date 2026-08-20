@@ -1,11 +1,15 @@
 """Convert semantic detections into RViz sphere and text markers."""
 
 import rclpy
+import json
+from pathlib import Path
 from builtin_interfaces.msg import Duration
+from geometry_msgs.msg import Point
 from interface.msg import DetectedObjectArray
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -54,6 +58,20 @@ class SemanticRvizVisualizer(Node):
         objects = message.objects
         if bool(self.get_parameter("confirmed_only").value):
             objects = [item for item in objects if item.state == "confirmed"]
+            
+        point_clouds = {}
+        try:
+            json_path = Path("semantic_objects.json")
+            if json_path.exists():
+                with json_path.open() as f:
+                    payload = json.load(f)
+                    if isinstance(payload, dict) and isinstance(payload.get("objects"), list):
+                        for obj in payload["objects"]:
+                            if "id" in obj and "point_cloud" in obj:
+                                point_clouds[obj["id"]] = obj["point_cloud"]
+        except Exception as e:
+            self.get_logger().debug(f"Failed to load point clouds: {e}")
+
         for index, item in enumerate(objects):
             marker_id = index * 2
             radius = max(0.035, min(0.12, float(item.position_stddev_m) * 2.0))
@@ -85,6 +103,28 @@ class SemanticRvizVisualizer(Node):
             label.text = f"{item.class_name}[{item.state}]-{item.confidence:.2f}"
             label.lifetime = self._lifetime
             markers.markers.append(label)
+
+            if item.object_id in point_clouds and point_clouds[item.object_id]:
+                cloud_marker = Marker()
+                cloud_marker.header = sphere.header
+                cloud_marker.ns = "semantic_point_cloud"
+                cloud_marker.id = marker_id + 2
+                cloud_marker.type = Marker.POINTS
+                cloud_marker.action = Marker.ADD
+                cloud_marker.pose.orientation.w = 1.0
+                cloud_marker.scale.x = 0.015
+                cloud_marker.scale.y = 0.015
+                cloud_marker.lifetime = self._lifetime
+                
+                for pt in point_clouds[item.object_id]:
+                    p = Point()
+                    p.x, p.y, p.z = float(pt["x"]), float(pt["y"]), float(pt["z"])
+                    c = ColorRGBA()
+                    c.r, c.g, c.b, c.a = float(pt["r"])/255.0, float(pt["g"])/255.0, float(pt["b"])/255.0, 1.0
+                    cloud_marker.points.append(p)
+                    cloud_marker.colors.append(c)
+                
+                markers.markers.append(cloud_marker)
         self._publisher.publish(markers)
 
 

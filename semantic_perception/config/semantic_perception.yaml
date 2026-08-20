@@ -39,12 +39,16 @@ semantic_perception:
       max_cosine_distance: 0.35
       cost_weight: 0.5
       embedding_decay: 0.90
+    semantic_text:
+      enabled: true
+      minimum_cosine_similarity: 0.25
+      max_results: 5
     distance_weighting:
       reference_distance_m: 1.0
       minimum_class_evidence_weight: 0.25
     depth:
       scale_16uc1: 0.001
-      inner_bbox_fraction: 0.5
+      inner_bbox_fraction: 0.75
       minimum_valid_pixels: 20
       minimum_m: 0.05
       maximum_m: 5.0

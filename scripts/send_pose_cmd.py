@@ -39,7 +39,7 @@ class PoseCommand(Node):
         self.command_failure = None
         self.rrt_ready_at = None
         self.create_subscription(Bool, "/panda/controller_ready", self._ready_callback, 10)
-        self.create_subscription(Bool, "/panda/controller_state", self._state_callback, 10)
+        self.create_subscription(Bool, "/panda/trajectory_complete", self._state_callback, 10)
         self.create_subscription(String, "/rrt/status", self._rrt_status_callback, 10)
         self.create_subscription(Bool, "/rrt/ready", self._rrt_ready_callback, 10)
 
@@ -124,7 +124,7 @@ def main() -> int:
             lambda: node.command_complete or node.command_failure is not None,
             args.completion_timeout,
         ):
-            node.get_logger().error("Timed out waiting for /panda/controller_state=true")
+            node.get_logger().error("Timed out waiting for /panda/trajectory_complete=true")
             return 3
         if node.command_failure is not None:
             node.get_logger().error(node.command_failure)

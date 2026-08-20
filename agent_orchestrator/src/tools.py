@@ -45,7 +45,14 @@ SEARCH_TELEMETRY_TIMEOUT_SEC = 10.0
 JOINT_MOTION_TIMEOUT_SEC = 50.0
 HOME_MOTION_TIMEOUT_SEC = 120.0
 JOINT_POLL_INTERVAL_SEC = 0.05
-MAX_MANIPULATION_RAIL_OFFSET_M = 0.15
+# Keep a quiet ownership handoff interval between a completed direct full-arm
+# posture and the next Cartesian/RRT request.  The bridge reports release
+# before all downstream simulator callbacks have necessarily observed it.
+DIRECT_ARM_POSTURE_HANDOFF_DELAY_SEC = 0.25
+# The rail is positioned from a semantic-map estimate.  Leave enough lateral
+# workspace for normal map/rail feedback error while still rejecting targets
+# that would require a materially different rail alignment.
+MAX_MANIPULATION_RAIL_OFFSET_M = 0.25
 STARTUP_RAIL_POSITION_M = -1.1
 STARTUP_ARM_JOINTS = (0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854)
 _yolo_detector = None
@@ -486,7 +493,7 @@ def stop_vlm_server():
 # ── TOOL EXECUTION WRAPPERS ──
 
 def start_joint_controller() -> str:
-    """Initialize ROS, move to the configured startup pose, and open the gripper."""
+    """Initialize ROS and preserve a previously confirmed held object."""
     try:
         config = get_runtime_config()
         node = get_shared_node()
@@ -501,29 +508,32 @@ def start_joint_controller() -> str:
             )
         node.cartesian_control_active = False
 
-        _command_rail_and_wait(
-            node, STARTUP_RAIL_POSITION_M, config, timeout_sec=HOME_MOTION_TIMEOUT_SEC
-        )
         _command_default_standing_posture_and_wait(node, config)
 
         node.cartesian_control_active = False
         gripper_feedback_confirmed = True
-        try:
-            _command_gripper_and_wait(
-                node,
-                config.manipulation.gripper_open_command,
-                config.manipulation.gripper_open_state_m,
-                config,
-            )
-        except RuntimeConfigurationError as exc:
-            # The command has already been published.  Startup remains usable
-            # when gripper telemetry starts late; pick/place retain strict
-            # feedback checks before performing a manipulation.
-            gripper_feedback_confirmed = False
-            print(f"[STARTUP] Open-gripper feedback not confirmed: {exc}")
+        if _held_object_id is None:
+            try:
+                _command_gripper_and_wait(
+                    node,
+                    config.manipulation.gripper_open_command,
+                    config.manipulation.gripper_open_state_m,
+                    config,
+                )
+            except RuntimeConfigurationError as exc:
+                # The command has already been published.  Startup remains usable
+                # when gripper telemetry starts late; pick/place retain strict
+                # feedback checks before performing a manipulation.
+                gripper_feedback_confirmed = False
+                print(f"[STARTUP] Open-gripper feedback not confirmed: {exc}")
         return (
             "Success: controller is ready at startup pose "
-            f"(rail_j1={STARTUP_RAIL_POSITION_M:.1f}m) with open-gripper command issued"
+            f"(rail_j1 remains at {float(node.current_rail_position):.4f}m) "
+            + (
+                f"while holding {_held_object_id}; gripper remains closed"
+                if _held_object_id is not None
+                else "with open-gripper command issued"
+            )
             + ("." if gripper_feedback_confirmed else "; feedback is pending.")
         )
     except Exception as e:
@@ -551,6 +561,7 @@ def _failure_result(
     state: str,
     detection: Mapping[str, object] | None = None,
     observations: int = 0,
+    recoverable: bool = False,
 ) -> dict[str, object]:
     detection = detection or {}
     return {
@@ -565,6 +576,7 @@ def _failure_result(
         "horizontal_error": detection.get("horizontal_error"),
         "x": None,
         "observations": observations,
+        "recoverable": recoverable,
     }
 
 
@@ -681,25 +693,100 @@ def _command_default_standing_posture_and_wait(
     node: object, config: RuntimeConfig
 ) -> None:
     """Move the arm to the configured default standing posture and confirm it."""
+    _command_full_arm_posture_and_wait(
+        node, STARTUP_ARM_JOINTS, config, label="default standing"
+    )
+
+
+def _command_full_arm_posture_and_wait(
+    node: object,
+    targets: tuple[float, float, float, float, float, float, float],
+    config: RuntimeConfig,
+    *,
+    label: str,
+) -> None:
+    """Retry a full-arm direct target until simulator feedback confirms it."""
     send_posture = getattr(node, "send_panda_search_posture", None)
     if not callable(send_posture):
         raise RuntimeConfigurationError(
-            "Robot interface does not support full-arm default-posture commands"
+            "Robot interface does not support full-arm direct-posture commands"
         )
 
-    send_posture(*STARTUP_ARM_JOINTS)
-    for joint_index, target in enumerate(STARTUP_ARM_JOINTS, start=1):
-        joint_name = f"panda_joint{joint_index}"
-        if not wait_for_joint_target(
-            node,
-            joint_name,
-            target,
-            tolerance=config.search.wrist_joint_tolerance,
-            timeout=HOME_MOTION_TIMEOUT_SEC,
+    ensure_rrt_idle = getattr(node, "ensure_rrt_idle", None)
+    if callable(ensure_rrt_idle) and not ensure_rrt_idle(
+        config.search.targeted_cancel_timeout_sec
+    ):
+        raise RuntimeConfigurationError(
+            f"Refusing {label} posture: active RRT motion could not be stopped"
+        )
+    ownership_deadline = time.monotonic() + config.search.targeted_cancel_timeout_sec
+    while getattr(node, "cartesian_control_active", False) and time.monotonic() < ownership_deadline:
+        time.sleep(JOINT_POLL_INTERVAL_SEC)
+    if getattr(node, "cartesian_control_active", False):
+        raise RuntimeConfigurationError(
+            f"Refusing {label} posture while a Cartesian motion owns the arm"
+        )
+
+    deadline = time.monotonic() + HOME_MOTION_TIMEOUT_SEC
+    next_publish_time = 0.0
+    while time.monotonic() < deadline:
+        positions = getattr(node, "current_joint_positions", {})
+        if all(
+            joint_name in positions
+            and abs(float(positions[joint_name]) - target)
+            <= config.search.wrist_joint_tolerance
+            for joint_index, target in enumerate(targets, start=1)
+            for joint_name in (f"panda_joint{joint_index}",)
         ):
-            raise RuntimeConfigurationError(
-                f"{joint_name} did not reach default standing target {target:.4f}rad"
+            # Simulator joint feedback reaches this node and the bridge on
+            # separate callbacks.  The bridge needs several stable samples
+            # before it releases direct-arm ownership.  Do not publish the
+            # following RRT pose into that short window: the bridge would
+            # correctly reject it as Cartesian-vs-direct contention.
+            release_deadline = (
+                time.monotonic() + config.search.targeted_cancel_timeout_sec
             )
+            while (
+                getattr(node, "direct_joint_control_active", False)
+                and time.monotonic() < release_deadline
+            ):
+                time.sleep(JOINT_POLL_INTERVAL_SEC)
+            if getattr(node, "direct_joint_control_active", False):
+                raise RuntimeConfigurationError(
+                    f"Bridge did not release direct-arm ownership after {label} posture"
+                )
+            time.sleep(DIRECT_ARM_POSTURE_HANDOFF_DELAY_SEC)
+            return
+        if time.monotonic() >= next_publish_time:
+            send_posture(*targets)
+            next_publish_time = time.monotonic() + 0.5
+        time.sleep(JOINT_POLL_INTERVAL_SEC)
+    raise RuntimeConfigurationError(
+        f"Arm did not reach {label} posture before timeout"
+    )
+
+
+def _command_side_manipulation_posture_and_wait(
+    node: object, item: dict[str, object], config: RuntimeConfig
+) -> None:
+    """Set the fixed pre-hover arm posture for the object's table side.
+
+    The two tables lie on opposite global Y sides.  Joint 1 selects the
+    matching approach direction while joints 2..7 remain at their initial
+    standing angles.
+    """
+    position = item.get("position")
+    if not isinstance(position, dict):
+        raise RuntimeConfigurationError("Missing semantic position for side posture")
+    joint1 = 1.56 if float(position["y"]) < 0.0 else -1.56
+    targets = (joint1, *STARTUP_ARM_JOINTS[1:])
+    print(
+        "[MANIPULATION][PRE_HOVER_POSTURE] "
+        f"table_y={float(position['y']):.3f}, panda_joint1={joint1:.2f}rad"
+    )
+    _command_full_arm_posture_and_wait(
+        node, targets, config, label="pre-hover"
+    )
 
 
 def _return_targeted_search_to_home(node: object, config: RuntimeConfig) -> None:
@@ -708,6 +795,20 @@ def _return_targeted_search_to_home(node: object, config: RuntimeConfig) -> None
     _command_rail_and_wait(
         node, STARTUP_RAIL_POSITION_M, config, timeout_sec=HOME_MOTION_TIMEOUT_SEC
     )
+
+
+def _recover_rrt_navigation(node: object, config: RuntimeConfig, *, context: str) -> str | None:
+    """Cancel RRT and return the arm to a safe standing posture."""
+    try:
+        if not node.ensure_rrt_idle(config.search.targeted_cancel_timeout_sec):
+            raise RuntimeConfigurationError("RRT did not acknowledge cancellation")
+        _command_default_standing_posture_and_wait(node, config)
+        print(f"[RECOVERY][{context}] RRT cancelled and arm returned to standing posture.")
+        return None
+    except Exception as exc:
+        message = str(exc)
+        print(f"[RECOVERY][{context}] Safe standing-posture recovery failed: {message}")
+        return message
 
 
 def _wait_for_commanded_joint(
@@ -1130,6 +1231,68 @@ def get_semantic_objects(class_names: Sequence[str] | None = None) -> dict[str, 
         return {"status": "error", "reason": str(exc), "objects": []}
 
 
+def search_semantic_objects(query: str) -> dict[str, object]:
+    """Rank confirmed semantic tracks using a natural-language MobileCLIP query."""
+    cleaned = str(query).strip()
+    if not cleaned:
+        return {
+            "status": "error",
+            "reason": "query must be a non-empty natural-language object description.",
+            "objects": [],
+        }
+    try:
+        response = get_shared_node().search_semantic_objects(
+            cleaned,
+            timeout_sec=5.0,
+            max_results=0,
+            minimum_cosine_similarity=-1.0,
+        )
+    except (RuntimeError, TimeoutError) as exc:
+        return {
+            "status": "unavailable",
+            "reason": str(exc),
+            "query": cleaned,
+            "objects": [],
+        }
+    if not response.success:
+        return {
+            "status": "unavailable",
+            "reason": str(response.reason),
+            "query": cleaned,
+            "appearance_provider_id": str(response.appearance_provider_id),
+            "compatible_track_count": int(response.compatible_track_count),
+            "objects": [],
+        }
+    objects = [
+        {
+            "object_id": match.object_id,
+            "class_name": match.class_name,
+            "state": match.state,
+            "cosine_similarity": round(float(match.cosine_similarity), 6),
+            "confidence": round(float(match.confidence), 6),
+            "x": round(float(match.position.x), 6),
+            "y": round(float(match.position.y), 6),
+            "z": round(float(match.position.z), 6),
+            "position_stddev_m": round(float(match.position_stddev_m), 6),
+            "last_seen": {
+                "sec": int(match.last_seen.sec),
+                "nanosec": int(match.last_seen.nanosec),
+            },
+        }
+        for match in response.matches
+    ]
+    return {
+        "status": "success",
+        "query": cleaned,
+        "appearance_provider_id": str(response.appearance_provider_id),
+        "compatible_track_count": int(response.compatible_track_count),
+        "minimum_cosine_similarity": round(
+            float(response.applied_minimum_cosine_similarity), 6
+        ),
+        "objects": objects,
+    }
+
+
 def _execute_mapping_pose(node: object, pose: object, config: RuntimeConfig) -> None:
     """Execute one mapping viewpoint without target-specific inference or cancellation."""
     node.begin_eef_pose(
@@ -1219,16 +1382,17 @@ def general_mapping() -> dict[str, object]:
             "elapsed_sec": round(time.monotonic() - started, 2),
         }
     except Exception as exc:
+        print(f"[MAPPING][FAILURE] {exc}")
         recovery_error = None
         if node is not None and config is not None:
-            try:
-                _return_targeted_search_to_home(node, config)
-            except Exception as home_exc:
-                recovery_error = str(home_exc)
+            recovery_error = _recover_rrt_navigation(node, config, context="MAPPING")
         reason = f"Mapping aborted safely: {exc}"
         if recovery_error:
-            reason += f"; home recovery failed: {recovery_error}"
-        return _failure_result("", reason, state="failure", observations=completed_viewpoints)
+            reason += f"; standing-posture recovery failed: {recovery_error}"
+        return _failure_result(
+            "", reason, state="failure", observations=completed_viewpoints,
+            recoverable=True,
+        )
 
 
 def _legacy_general_mapping(target_object: str) -> dict[str, object]:
@@ -2091,6 +2255,8 @@ def targeted_search(target_object: str) -> dict[str, object]:
     target = _normalize_label(target_object or "")
     if not target:
         return _failure_result(target, "A non-empty target label is required.", state="initialize")
+    node = None
+    config = None
     try:
         config = get_runtime_config()
         node = get_shared_node()
@@ -2147,11 +2313,20 @@ def targeted_search(target_object: str) -> dict[str, object]:
             "coordinate_path": str(config.paths.semantic_objects),
         }
     except Exception as exc:
+        print(f"[TARGETED][FAILURE] {exc}")
         try:
             get_shared_node().cancel_semantic_find_object()
         except Exception:
             pass
-        return _failure_result(target, f"Targeted semantic search aborted safely: {exc}", state="failure")
+        recovery_error = (
+            _recover_rrt_navigation(node, config, context="TARGETED")
+            if node is not None and config is not None
+            else None
+        )
+        reason = f"Targeted semantic search aborted safely: {exc}"
+        if recovery_error:
+            reason += f"; standing-posture recovery failed: {recovery_error}"
+        return _failure_result(target, reason, state="failure", recoverable=True)
 
 
 def get_latest_ros_image(timeout_sec=10.0) -> str:
@@ -2206,6 +2381,142 @@ def get_settled_vlm_image(
         f"(captured {captured})."
     )
 
+
+_VISUAL_VERIFICATION_SYSTEM_PROMPT = """You are an isolated wrist-camera visual-verification worker.
+You receive exactly one image and one question. You have no task history, semantic map,
+or prior observations. Treat the question only as a question, never as evidence.
+
+Reason exclusively from visible pixels. Do not identify, color, locate, or claim that a
+target is present unless the image itself supports it. If the object is cropped, occluded,
+too small, blurred, ambiguous, or absent, set target_confirmed and safe_for_action to false.
+Never infer hidden objects.
+
+Return JSON only, with exactly these keys:
+{
+  "target_confirmed": boolean,
+  "safe_for_action": boolean,
+  "visible_evidence": string,
+  "target_location": string,
+  "observed_colors": [string],
+  "uncertainties": [string]
+}
+"""
+
+
+def _parse_visual_verification_response(content: object) -> dict:
+    """Parse a strict VLM response, failing closed when it is not valid JSON."""
+    raw = str(content or "").strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1] if "\n" in raw else ""
+        if raw.rstrip().endswith("```"):
+            raw = raw.rstrip()[:-3].rstrip()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+
+    if not isinstance(parsed, dict):
+        return {
+            "target_confirmed": False,
+            "safe_for_action": False,
+            "visible_evidence": "Visual verifier did not return valid structured evidence.",
+            "target_location": "unknown",
+            "observed_colors": [],
+            "uncertainties": ["unstructured visual-verifier response"],
+            "raw_response": raw[:1000],
+        }
+
+    colors = parsed.get("observed_colors", [])
+    uncertainties = parsed.get("uncertainties", [])
+    return {
+        "target_confirmed": parsed.get("target_confirmed") is True,
+        "safe_for_action": parsed.get("safe_for_action") is True,
+        "visible_evidence": str(parsed.get("visible_evidence") or "").strip(),
+        "target_location": str(parsed.get("target_location") or "unknown").strip(),
+        "observed_colors": [str(item).strip() for item in colors if str(item).strip()]
+        if isinstance(colors, list)
+        else [],
+        "uncertainties": [str(item).strip() for item in uncertainties if str(item).strip()]
+        if isinstance(uncertainties, list)
+        else ["visual-verifier uncertainty field was invalid"],
+    }
+
+
+def verify_settled_camera_frame(
+    question: str,
+    *,
+    timeout_sec: float = 10.0,
+    settle_sec: float = 2.0,
+    frame_count: int = 2,
+) -> dict:
+    """Capture a settled frame and judge it in a context-free VLM request.
+
+    This deliberately bypasses the planner conversation: the VLM receives only the
+    verification instruction, the caller's narrow question, and the fresh image.
+    """
+    question = str(question or "").strip()
+    if len(question) < 3:
+        raise ValueError("Visual-verification question must contain at least 3 characters")
+    if len(question) > 300:
+        raise ValueError("Visual-verification question must be at most 300 characters")
+
+    image_b64 = get_settled_vlm_image(
+        timeout_sec=timeout_sec,
+        settle_sec=settle_sec,
+        frame_count=frame_count,
+    )
+    config = get_runtime_config()
+    request_body = json.dumps(
+        {
+            "model": config.vlm.model_alias,
+            "messages": [
+                {"role": "system", "content": _VISUAL_VERIFICATION_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Question: {question}"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}"
+                            },
+                        },
+                    ],
+                },
+            ],
+            "temperature": 0.0,
+            "max_tokens": min(200, int(config.vlm.max_completion_tokens)),
+            "stream": False,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{config.vlm.api_base_url}/chat/completions",
+        data=request_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=config.vlm.request_timeout_sec) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Context-free visual verification request failed: {exc}") from exc
+
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    message = choices[0].get("message") if isinstance(choices, list) and choices else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if content is None:
+        raise RuntimeError("Context-free visual verifier returned no assistant message")
+
+    observation = _parse_visual_verification_response(content)
+    return {
+        "status": "success",
+        "question": question,
+        "frames_after_settle": int(frame_count),
+        "target_confirmed": observation["target_confirmed"],
+        "safe_for_action": observation["safe_for_action"],
+        "observation": observation,
+    }
+
 def get_current_joint_states() -> dict:
     node = get_shared_node()
     start = time.time()
@@ -2256,7 +2567,7 @@ def move_eef_to_pose(
                 "status": "failure",
                 "success": False,
                 "reason": (
-                    "Timed out waiting for /panda/controller_state after "
+                    "Timed out waiting for /panda/trajectory_complete after "
                     f"{config.cartesian.command_timeout_sec:g} seconds."
                 ),
                 "command": command,
@@ -2588,6 +2899,11 @@ def _execute_place_script_legacy(target_object: str) -> str:
 _held_object_id: str | None = None
 
 
+def get_manipulation_state() -> dict[str, object]:
+    """Return durable in-process pick/place state for the next user prompt."""
+    return {"held_object_id": _held_object_id}
+
+
 def _manipulation_base_position(
     node: object, item: dict[str, object], config: RuntimeConfig
 ) -> tuple[float, float, float]:
@@ -2621,9 +2937,11 @@ def _manipulation_yaw(item: dict[str, object]) -> float:
 def _run_manipulation_pose(
     node: object, label: str, x: float, y: float, z: float, config: RuntimeConfig,
     *, roll: float | None = None, pitch: float | None = None, yaw: float | None = None,
+    direct_controller: bool = False,
 ) -> None:
     print(f"[MANIPULATION][{label}] xyz=({x:.3f}, {y:.3f}, {z:.3f})")
-    completed = node.send_eef_pose(
+    send_pose = node.send_direct_cartesian_pose if direct_controller else node.send_eef_pose
+    completed = send_pose(
         x, y, z,
         config.manipulation.roll if roll is None else roll,
         config.manipulation.pitch if pitch is None else pitch,
@@ -2635,7 +2953,8 @@ def _run_manipulation_pose(
         eef_frame=config.cartesian.eef_frame,
     )
     if not completed:
-        raise RuntimeConfigurationError(f"RRT {label.lower()} pose did not complete")
+        controller = "Direct Cartesian controller" if direct_controller else "RRT"
+        raise RuntimeConfigurationError(f"{controller} {label.lower()} pose did not complete")
 
 
 def _command_gripper_and_wait(
@@ -2645,66 +2964,85 @@ def _command_gripper_and_wait(
     config: RuntimeConfig,
     *,
     close_acceptance_m: float | None = None,
+    minimum_grasp_opening_m: float | None = None,
 ) -> None:
-    deadline = time.monotonic() + config.manipulation.gripper_timeout_sec
-    while node.cartesian_control_active and time.monotonic() < deadline:
-        time.sleep(0.02)
-    # The terminal RRT status is delivered independently to the orchestrator
-    # and bridge.  Give the bridge a short handoff interval to release its
-    # Cartesian gate before publishing a direct gripper command.
-    time.sleep(min(config.manipulation.gripper_handoff_delay_sec, max(0.0, deadline - time.monotonic())))
-    node.set_gripper_command(command)
-    remaining = deadline - time.monotonic()
-    if close_acceptance_m is not None:
-        while remaining > 0.0:
-            current = node.current_gripper_state
-            if current is not None and float(current) <= close_acceptance_m:
-                return
-            time.sleep(0.02)
-            remaining = deadline - time.monotonic()
-        raise RuntimeConfigurationError(
-            "Gripper did not close to an object-compatible opening "
-            f"of {close_acceptance_m:.4f}m"
-        )
-    first_wait_sec = max(0.0, remaining / 2.0)
-    if first_wait_sec > 0.0 and node.wait_for_gripper_target(
-        target_state,
-        tolerance=config.manipulation.gripper_tolerance_m,
-        timeout_sec=first_wait_sec,
+    """Execute the bridge's feedbacked gripper action.
+
+    The bridge waits for fresh feedback, five stable samples, and its mandatory
+    minimum dwell itself.  Duplicating a local polling loop used to add another
+    four seconds and could race the following vertical retreat.
+    """
+    if close_acceptance_m is not None and (
+        minimum_grasp_opening_m is None
+        or minimum_grasp_opening_m <= 0.0
+        or minimum_grasp_opening_m > close_acceptance_m
     ):
-        return
-
-    # The bridge receives RRT completion and gripper messages on independent
-    # callbacks. Retry once after the initial handoff in case that first open
-    # command arrived before the bridge released Cartesian ownership.
-    remaining = deadline - time.monotonic()
-    if remaining > 0.0:
+        raise RuntimeConfigurationError("Invalid gripper grasp acceptance range")
+    try:
         node.set_gripper_command(command)
-        if node.wait_for_gripper_target(
-            target_state,
-            tolerance=config.manipulation.gripper_tolerance_m,
-            timeout_sec=remaining,
-        ):
-            return
-    current = node.current_gripper_state
-    current_text = "unavailable" if current is None else f"{float(current):.4f}m"
-    raise RuntimeConfigurationError(
-        f"Gripper did not reach feedback target {target_state:.4f}m "
-        f"after retry (last feedback: {current_text})"
+    except RuntimeError as exc:
+        detail = str(exc)
+        if 'no_object_grasped' in detail:
+            raise RuntimeConfigurationError('Gripper closed fully: no object was retained') from exc
+        raise RuntimeConfigurationError(detail) from exc
+
+
+def _run_gripper_manipulation_state(
+    node: object,
+    label: str,
+    command: float,
+    target_state: float,
+    config: RuntimeConfig,
+    *,
+    close_acceptance_m: float | None = None,
+    minimum_grasp_opening_m: float | None = None,
+) -> None:
+    """Execute one blocking gripper-only manipulation state."""
+    print(
+        f"[MANIPULATION][{label}] command={float(command):.4f}m; "
+        "waiting for measured gripper feedback"
     )
+    _command_gripper_and_wait(
+        node,
+        command,
+        target_state,
+        config,
+        close_acceptance_m=close_acceptance_m,
+        minimum_grasp_opening_m=minimum_grasp_opening_m,
+    )
+    feedback = getattr(node, "current_gripper_state", None)
+    feedback_text = "unavailable" if feedback is None else f"{float(feedback):.4f}m"
+    print(f"[MANIPULATION][{label}_REACHED] measured_opening={feedback_text}")
 
 
-def _recover_manipulation(node: object, config: RuntimeConfig) -> None:
-    """Best-effort stop and safe arm posture after a failed manipulation phase."""
+def _recover_manipulation(
+    node: object, config: RuntimeConfig, *, retreat_z: float | None = None
+) -> None:
+    """Best-effort vertical retreat followed by a safe arm posture."""
     try:
         node.ensure_rrt_idle(config.search.targeted_cancel_timeout_sec)
+        if retreat_z is not None:
+            try:
+                _run_manipulation_pose(
+                    node,
+                    "RECOVERY_RETREAT",
+                    0.0,
+                    0.0,
+                    retreat_z,
+                    config,
+                    direct_controller=True,
+                )
+            except Exception as exc:
+                print(f"[MANIPULATION][RECOVERY] Vertical retreat failed: {exc}")
         _command_default_standing_posture_and_wait(node, config)
     except Exception as exc:
         print(f"[MANIPULATION][RECOVERY] Safe-posture recovery failed: {exc}")
 
 
-def move_rail_to_object(object_id: str) -> str:
+def move_rail_to_object(object_id: str) -> dict[str, object]:
     """Rail-align and look at one exact confirmed semantic object instance."""
+    node = None
+    config = None
     try:
         config = get_runtime_config()
         requested_id = str(object_id or "").strip()
@@ -2713,20 +3051,26 @@ def move_rail_to_object(object_id: str) -> str:
         else:
             item = _confirmed_semantic_object_by_id(config, requested_id)
             if item is None:
-                return (
-                    f"Error: {requested_id!r} is not a confirmed current object ID in "
-                    f"{config.paths.semantic_objects.name}. Re-query get_semantic_objects."
-                )
+                return {
+                    "status": "failure", "success": False, "recoverable": False,
+                    "reason": (
+                        f"{requested_id!r} is not a confirmed current object ID in "
+                        f"{config.paths.semantic_objects.name}. Re-query search_semantic_objects."
+                    ),
+                }
             target_x = float(item["position"]["x"])
         node = get_shared_node()
         if not _wait_for_search_telemetry(node):
-            return "Error: Timed out waiting for rail and arm telemetry."
+            return {"status": "failure", "success": False, "recoverable": True,
+                    "reason": "Timed out waiting for rail and arm telemetry."}
         if not node.ensure_rrt_idle(config.search.targeted_cancel_timeout_sec):
-            return "Error: Could not stop active RRT trajectory before navigation."
+            return {"status": "failure", "success": False, "recoverable": True,
+                    "reason": "Could not stop active RRT trajectory before navigation."}
         _command_default_standing_posture_and_wait(node, config)
         _command_rail_and_wait(node, target_x, config)
         if item is None:
-            return f"Success: moved rail to {requested_id}."
+            return {"status": "success", "success": True, "object_id": requested_id,
+                    "reason": "Rail move completed."}
 
         # Let direct rail/posture ownership settle before asking RRT to take
         # the arm for the final camera look-at motion.
@@ -2749,12 +3093,23 @@ def move_rail_to_object(object_id: str) -> str:
             node, "LOOK_AT", pose.x, pose.y, pose.z, config,
             roll=pose.roll, pitch=pose.pitch, yaw=pose.yaw,
         )
-        return (
-            f"Success: aligned and looking at {requested_id} ({item['class_name']}) "
-            f"at rail_j1={float(node.current_rail_position):.4f}m."
-        )
+        return {
+            "status": "success", "success": True, "object_id": requested_id,
+            "class_name": item["class_name"],
+            "rail_j1": round(float(node.current_rail_position), 4),
+            "reason": "Rail-aligned and looking at semantic object.",
+        }
     except Exception as exc:
-        return f"Error navigating to semantic object: {exc}"
+        recovery_error = (
+            _recover_rrt_navigation(node, config, context="MOVE_TO_OBJECT")
+            if node is not None and config is not None
+            else None
+        )
+        reason = f"Navigation failed after safe recovery: {exc}"
+        if recovery_error:
+            reason += f"; standing-posture recovery failed: {recovery_error}"
+        return {"status": "failure", "success": False, "recoverable": True,
+                "reason": reason}
 
 
 def execute_pick_script(object_id: str) -> dict[str, object]:
@@ -2765,6 +3120,7 @@ def execute_pick_script(object_id: str) -> dict[str, object]:
     if _held_object_id is not None:
         return {"status": "failure", "success": False, "reason": f"Already holding {_held_object_id}"}
     node = get_shared_node()
+    hover_z: float | None = None
     try:
         item = _confirmed_semantic_object_by_id(config, requested_id)
         if item is None:
@@ -2773,31 +3129,41 @@ def execute_pick_script(object_id: str) -> dict[str, object]:
         yaw = _manipulation_yaw(item)
         _command_gripper_and_wait(node, config.manipulation.gripper_open_command,
                                   config.manipulation.gripper_open_state_m, config)
+        _command_side_manipulation_posture_and_wait(node, item, config)
         hover_z = z + config.manipulation.hover_height_m
         _run_manipulation_pose(node, "PICK_HOVER", x, y, hover_z, config, yaw=yaw)
         descend_z = max(
             z + config.manipulation.grasp_z_offset_m,
             config.manipulation.min_pick_descend_z_m,
         )
-        _run_manipulation_pose(node, "PICK_DESCEND", x, y, descend_z, config, yaw=yaw)
-        _command_gripper_and_wait(node, config.manipulation.gripper_close_command,
-                                  config.manipulation.gripper_close_state_m, config,
-                                  close_acceptance_m=config.manipulation.gripper_close_acceptance_m)
-        _run_manipulation_pose(node, "PICK_RETREAT", x, y, hover_z, config, yaw=yaw)
         _run_manipulation_pose(
-            node,
-            "PICK_CLEARANCE_LIFT",
-            x,
-            y,
-            hover_z + config.manipulation.post_action_lift_m,
-            config,
-            yaw=yaw,
+            node, "PICK_DESCEND", x, y, descend_z, config, yaw=yaw,
+            direct_controller=True,
         )
+        _run_gripper_manipulation_state(
+            node,
+            "PICK_GRIPPER_CLOSE",
+            config.manipulation.gripper_close_command,
+            config.manipulation.gripper_close_state_m,
+            config,
+            close_acceptance_m=config.manipulation.gripper_close_acceptance_m,
+            minimum_grasp_opening_m=config.manipulation.gripper_grasp_min_opening_m,
+        )
+        _run_manipulation_pose(
+            node, "PICK_RETREAT", x, y, hover_z, config, yaw=yaw,
+            direct_controller=True,
+        )
+        _command_default_standing_posture_and_wait(node, config)
         _held_object_id = requested_id
         return {"status": "success", "success": True, "object_id": requested_id, "class_name": item["class_name"]}
     except Exception as exc:
-        _recover_manipulation(node, config)
-        return {"status": "failure", "success": False, "reason": f"Pick failed: {exc}"}
+        _recover_manipulation(node, config, retreat_z=hover_z)
+        return {
+            "status": "failure",
+            "success": False,
+            "recoverable": True,
+            "reason": f"Pick failed after safe recovery: {exc}",
+        }
 
 
 def execute_place_script(destination_object_id: str) -> dict[str, object]:
@@ -2808,20 +3174,37 @@ def execute_place_script(destination_object_id: str) -> dict[str, object]:
     if _held_object_id is None:
         return {"status": "failure", "success": False, "reason": "No held object to place"}
     node = get_shared_node()
+    hover_z: float | None = None
     try:
         destination = _confirmed_semantic_object_by_id(config, destination_id)
         if destination is None:
             raise RuntimeConfigurationError("Destination ID is not currently confirmed")
         x, y, z = _manipulation_base_position(node, destination, config)
         yaw = _manipulation_yaw(destination)
+        _command_side_manipulation_posture_and_wait(node, destination, config)
         hover_z = z + config.manipulation.hover_height_m
         _run_manipulation_pose(node, "PLACE_HOVER", x, y, hover_z, config, yaw=yaw)
-        _run_manipulation_pose(node, "PLACE_DESCEND", x, y, z + config.manipulation.place_drop_offset_m, config, yaw=yaw)
-        _command_gripper_and_wait(node, config.manipulation.gripper_open_command,
-                                  config.manipulation.gripper_open_state_m, config)
-        print("[MANIPULATION][PLACE_LIFT] Replaying the descend trajectory in reverse.")
-        if not node.reverse_last_eef_motion(config.cartesian.command_timeout_sec):
-            raise RuntimeConfigurationError("RRT reverse place-lift trajectory did not complete")
+        _run_manipulation_pose(
+            node,
+            "PLACE_DESCEND",
+            x,
+            y,
+            z + config.manipulation.place_drop_offset_m,
+            config,
+            yaw=yaw,
+            direct_controller=True,
+        )
+        _run_gripper_manipulation_state(
+            node,
+            "PLACE_GRIPPER_OPEN",
+            config.manipulation.gripper_open_command,
+            config.manipulation.gripper_open_state_m,
+            config,
+        )
+        _run_manipulation_pose(
+            node, "PLACE_RETREAT", x, y, hover_z, config, yaw=yaw,
+            direct_controller=True,
+        )
         _run_manipulation_pose(
             node,
             "PLACE_CLEARANCE_LIFT",
@@ -2830,10 +3213,16 @@ def execute_place_script(destination_object_id: str) -> dict[str, object]:
             hover_z + config.manipulation.post_action_lift_m,
             config,
             yaw=yaw,
+            direct_controller=True,
         )
         held_id = _held_object_id
         _held_object_id = None
         return {"status": "success", "success": True, "object_id": held_id, "destination_object_id": destination_id}
     except Exception as exc:
-        _recover_manipulation(node, config)
-        return {"status": "failure", "success": False, "reason": f"Place failed: {exc}"}
+        _recover_manipulation(node, config, retreat_z=hover_z)
+        return {
+            "status": "failure",
+            "success": False,
+            "recoverable": True,
+            "reason": f"Place failed after safe recovery: {exc}",
+        }

@@ -67,6 +67,14 @@ def main() -> int:
                 
             if not user_task:
                 continue
+
+            manipulation_state = runtime_tools.get_manipulation_state()
+            persistent_ledger = []
+            held_object_id = manipulation_state.get("held_object_id")
+            if held_object_id:
+                persistent_ledger.append(
+                    f"Durable robot state: holding {held_object_id}; do not pick another object."
+                )
                         
             input_state = {
                 "messages": [
@@ -75,14 +83,17 @@ def main() -> int:
                         "Plan adaptively from semantic map evidence and current camera evidence; do not follow a fixed object-by-object search script.\n\n"
                         "NON-NEGOTIABLE SAFETY:\n"
                         "- Call start_joint_controller first. Call exactly one high-level tool per step.\n"
-                        "- Immediately before EVERY execute_pick_script or execute_place_script call, call get_camera_frame. It waits two seconds, takes two new ROS wrist-camera frames, and supplies the later one. In the next <think>, state what is visibly present, including colors, and explicitly confirm the required pickup or destination object. Do not execute if it is absent or unclear; do not infer visual qualifiers from the semantic map.\n"
+                        "- Immediately before EVERY execute_pick_script or execute_place_script call, call get_camera_frame(question) with a narrow question that names the pickup or destination object and required action. It waits two seconds, captures two fresh wrist-camera frames, and asks a separate context-free visual verifier about the later frame. You receive structured visual evidence only, not an image. Do not execute unless that result has target_confirmed=true AND safe_for_action=true. Do not infer visual qualifiers from the semantic map.\n"
                         "- Manipulate the pickup object last among the verification moves so the robot is positioned at it. A targeted_search result with state=couldnt_find is recoverable planning evidence: decide whether broader mapping is justified or finish with an honest failure. Do not execute a dependent manipulation while a required object remains unconfirmed.\n\n"
+                        "- A failed execute_pick_script or execute_place_script result is recoverable: its motion has already attempted a safe retreat. Read the reason, then re-plan or retry only when it is safe; do not assume the object is held or placed.\n\n"
+                        "- A recoverable navigation, targeted-search, or mapping failure has already cancelled RRT motion and attempted a standing-posture recovery. Read the reason and re-plan; do not treat it as terminal.\n\n"
                         "SEMANTIC-FIRST PLANNING:\n"
-                        "1. In the first planning step after initialization, identify all important object classes in the user task and call get_semantic_objects with their canonical base classes. For example, query bowl for 'purple bowl'. Include objects needed to resolve spatial language such as closest, left/right, next to, or between.\n"
-                        "2. The returned JSON is map evidence: use confirmed XYZ positions to select objects, compare spatial relations, and choose an efficient approach order. A candidate, class_ambiguous, stale, or absent entry is insufficient. The map does not prove color, shape details, or physical presence.\n"
+                        "1. In the first planning step after initialization, identify every important object description and call search_semantic_objects once for each short natural-language description (for example 'purple bowl', 'apple', or 'personal computer'). Include objects needed to resolve spatial language such as closest, left/right, next to, or between. Do not pass an entire task as a text-search query.\n"
+                        "1a. Treat each successful search result as durable map evidence shown in the execution ledger. Do NOT call search_semantic_objects again with the same query merely to re-check it. After all required descriptions have been queried once, choose IDs and take the next planning action. You may repeat a query only after targeted_search or general_mapping, because those actions can change the map.\n"
+                        "2. Search results are map evidence: use confirmed XYZ positions, detector class_name, confidence, and text-match cosine_similarity together to choose candidates and compare spatial relations. Text ranking does not prove color, shape details, or physical presence; absent results mean search may be required.\n"
                         "3. If all information needed for the task is confirmed, select exact object_id values from the map and use move_rail_to_object(object_id). Use those same IDs for pick and destination placement. Do not move merely to discover whether an object exists.\n"
                         "4. Choose the search scale from the missing context. Use targeted_search for one missing/non-confirmed class when locating that class alone lets the task continue. Use general_mapping when the request requires scene-wide or relational context that is unavailable, or when two or more relevant classes are missing/non-confirmed.\n"
-                        "5. After targeted_search or general_mapping, call get_semantic_objects again for the relevant classes and re-plan from the refreshed JSON. Never assume a search result resolves a relation without examining the updated positions.\n\n"
+                        "5. After targeted_search or general_mapping, call search_semantic_objects again for the relevant descriptions and re-plan from the refreshed map. Never assume a search result resolves a relation without examining the updated positions.\n\n"
                         "EXECUTION:\n"
                         "Use the map to decide what to inspect and where to go, then use camera frames for physical verification before manipulation. Complete the task with finish_task only after the requested action succeeds."
                     )),
@@ -92,12 +103,19 @@ def main() -> int:
                 "terminated": False,
                 "outcome": "in_progress",
                 "tools_called": [],
+                "execution_ledger": persistent_ledger,
+                "semantic_query_cache": {},
             }
             
             
             print("\n[SYSTEM] Executing task...")
             start_time = time.time()
-            result = agent.invoke(input_state)
+            try:
+                result = agent.invoke(input_state)
+            except Exception as exc:
+                print(f"[TASK ERROR] VLM/tool workflow stopped: {exc}")
+                print("[SYSTEM] ROS remains running; you can enter another task.")
+                continue
             elapsed_time = time.time() - start_time
             
             print("\n--- WORKFLOW EXECUTION TRACE ---")

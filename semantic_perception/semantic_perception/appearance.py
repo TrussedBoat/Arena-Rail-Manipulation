@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from pathlib import Path
+import threading
 from typing import Any, Protocol
 
 import cv2
@@ -20,6 +21,10 @@ class AppearanceEmbeddingProvider(Protocol):
     def attach(self, image: np.ndarray, detections: list[RawDetection]) -> list[RawDetection]:
         ...
 
+    def encode_text(self, query: str) -> np.ndarray:
+        """Encode a natural-language description in this provider's embedding space."""
+        ...
+
 
 class DisabledAppearanceEmbeddingProvider:
     @property
@@ -28,6 +33,9 @@ class DisabledAppearanceEmbeddingProvider:
 
     def attach(self, image: np.ndarray, detections: list[RawDetection]) -> list[RawDetection]:
         return detections
+
+    def encode_text(self, query: str) -> np.ndarray:
+        raise RuntimeError("Text search is unavailable because appearance embeddings are disabled")
 
 
 class UltralyticsCropAppearanceEmbeddingProvider:
@@ -83,6 +91,9 @@ class UltralyticsCropAppearanceEmbeddingProvider:
                 appearance_provider_id=self.provider_id,
             )
         return updated
+
+    def encode_text(self, query: str) -> np.ndarray:
+        raise RuntimeError("Text search requires a text-aligned appearance backend")
 
 
 class MobileNetV3SmallAppearanceEmbeddingProvider:
@@ -159,6 +170,9 @@ class MobileNetV3SmallAppearanceEmbeddingProvider:
             )
         return updated
 
+    def encode_text(self, query: str) -> np.ndarray:
+        raise RuntimeError("Text search requires MobileCLIP; MobileNet embeddings are image-only")
+
 
 class MobileCLIPS0AppearanceEmbeddingProvider:
     """Batched image-only MobileCLIP-S0 embeddings for YOLO crops."""
@@ -197,11 +211,13 @@ class MobileCLIPS0AppearanceEmbeddingProvider:
             # The official loader reparameterizes by default. Calling its helper
             # again corrupts already-folded RepMixer modules.
             self._model = model.to(self._device).eval()
+            self._tokenizer = mobileclip.get_tokenizer("mobileclip_s0")
         except Exception as exc:
             raise RuntimeError(f"Could not load MobileCLIP-S0 checkpoint {checkpoint}: {exc}") from exc
         self._torch = torch
         self._image_class = Image
         self._preprocess = preprocess
+        self._inference_lock = threading.Lock()
         stat = checkpoint.stat()
         self._provider_id = (
             f"mobileclip_s0:{checkpoint.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
@@ -234,18 +250,19 @@ class MobileCLIPS0AppearanceEmbeddingProvider:
             return detections
 
         try:
-            batch = self._torch.stack(crops, dim=0).to(self._device, non_blocking=True)
-            autocast = (
-                self._torch.autocast(device_type="cuda", dtype=self._torch.float16)
-                if self._device.type == "cuda"
-                else _null_context()
-            )
-            with self._torch.inference_mode(), autocast:
-                embeddings = self._model.encode_image(batch)
-                embeddings = self._torch.nn.functional.normalize(
-                    embeddings.float(), p=2, dim=-1
+            with self._inference_lock:
+                batch = self._torch.stack(crops, dim=0).to(self._device, non_blocking=True)
+                autocast = (
+                    self._torch.autocast(device_type="cuda", dtype=self._torch.float16)
+                    if self._device.type == "cuda"
+                    else _null_context()
                 )
-            vectors = embeddings.cpu().numpy().astype(np.float32, copy=False)
+                with self._torch.inference_mode(), autocast:
+                    embeddings = self._model.encode_image(batch)
+                    embeddings = self._torch.nn.functional.normalize(
+                        embeddings.float(), p=2, dim=-1
+                    )
+                vectors = embeddings.cpu().numpy().astype(np.float32, copy=False)
         except Exception as exc:
             raise RuntimeError(f"MobileCLIP-S0 crop embedding failed: {exc}") from exc
 
@@ -259,6 +276,35 @@ class MobileCLIPS0AppearanceEmbeddingProvider:
                 appearance_provider_id=self.provider_id,
             )
         return updated
+
+    def encode_text(self, query: str) -> np.ndarray:
+        """Return one normalized MobileCLIP text vector for a description."""
+        cleaned = str(query).strip()
+        if not cleaned:
+            raise RuntimeError("Text query must not be empty")
+        prompts = (cleaned, f"a photo of {cleaned}")
+        try:
+            with self._inference_lock:
+                tokens = self._tokenizer(prompts).to(self._device, non_blocking=True)
+                autocast = (
+                    self._torch.autocast(device_type="cuda", dtype=self._torch.float16)
+                    if self._device.type == "cuda"
+                    else _null_context()
+                )
+                with self._torch.inference_mode(), autocast:
+                    embeddings = self._model.encode_text(tokens)
+                    embeddings = self._torch.nn.functional.normalize(
+                        embeddings.float(), p=2, dim=-1
+                    )
+                    embedding = self._torch.nn.functional.normalize(
+                        embeddings.mean(dim=0), p=2, dim=0
+                    )
+                vector = embedding.cpu().numpy().astype(np.float32, copy=False).reshape(-1)
+        except Exception as exc:
+            raise RuntimeError(f"MobileCLIP-S0 text embedding failed: {exc}") from exc
+        if vector.size == 0 or not np.all(np.isfinite(vector)):
+            raise RuntimeError("MobileCLIP-S0 returned an invalid text embedding")
+        return vector
 
 
 class _null_context:

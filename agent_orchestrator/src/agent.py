@@ -1,9 +1,7 @@
-import base64
-import binascii
 import json
 from typing import TypedDict
 
-from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
@@ -18,8 +16,8 @@ from tools import (
     turn_panda_arm,
     home_panda_arm,
     move_rail_relative,
-    get_settled_vlm_image,
-    get_semantic_objects,
+    verify_settled_camera_frame,
+    search_semantic_objects,
 )
 
 runtime_config = get_runtime_config()
@@ -31,13 +29,33 @@ tool_definitions = [
         "function": {
             "name": "start_joint_controller",
             "description": (
-                "Initialize the robot, move rail_j1 to -1.1m, set the arm to its "
-                "safe startup pose, and open the gripper. Always call this first."
+                "Initialize the robot at its current rail position, set the arm to its "
+                "safe startup pose, and open the gripper unless it is already holding "
+                "a previously confirmed object. Always call this first."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {},
                 "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_semantic_objects",
+            "description": "Natural-language semantic-map lookup powered by MobileCLIP text-to-image similarity. Use for visual descriptions or non-canonical wording such as 'purple bowl', 'small red apple', or 'remote control'. Returns at most five confirmed compatible tracks ranked by cosine_similarity; it is map evidence, not visual proof.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Short natural-language description of the desired physical object, not the full task request.",
+                    }
+                },
+                "required": ["query"],
                 "additionalProperties": False,
             },
         },
@@ -93,7 +111,7 @@ tool_definitions = [
                 "properties": {
                     "object_id": {
                         "type": "string",
-                        "description": "Exact object_id returned by get_semantic_objects.",
+                        "description": "Exact object_id returned by semantic map retrieval.",
                     }
                 },
                 "required": ["object_id"],
@@ -104,28 +122,8 @@ tool_definitions = [
     {
         "type": "function",
         "function": {
-            "name": "get_semantic_objects",
-            "description": "Semantic planning lookup. Query every relevant canonical base class before choosing search or navigation. Returns only confirmed matching objects with IDs, confidence, global XYZ, and last_seen; classes_without_match means no usable map entry. It is map evidence, not visual proof.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "class_names": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "description": "Relevant canonical base detector classes, for example [\"apple\", \"bowl\"]. Do not include visual qualifiers such as color.",
-                    }
-                },
-                "required": ["class_names"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "move_rail_to_object",
-            "description": "Rail-align and point at one selected confirmed semantic object ID. Use the exact ID returned by get_semantic_objects; duplicate classes must be disambiguated by ID.",
+            "description": "Rail-align and point at one selected confirmed semantic object ID returned by semantic map retrieval.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -167,7 +165,7 @@ tool_definitions = [
                 "properties": {
                     "destination_object_id": {
                         "type": "string",
-                        "description": "Exact confirmed destination object_id returned by get_semantic_objects.",
+                        "description": "Exact confirmed destination object_id returned by semantic map retrieval.",
                     }
                 },
                 "required": ["destination_object_id"],
@@ -210,11 +208,18 @@ tool_definitions = [
         "type": "function",
         "function": {
             "name": "get_camera_frame",
-            "description": "Wait two seconds for the robot/camera to settle, capture two new ROS wrist-camera frames, and return the later frame. Call this immediately before every execute_pick_script or execute_place_script and visually verify the needed object.",
+            "description": "Wait two seconds for the robot/camera to settle, capture two new ROS wrist-camera frames, then ask an isolated context-free VLM to answer one narrow visual question about the later frame. The planner receives structured evidence only, never the raw image. Call immediately before every execute_pick_script or execute_place_script. Do not manipulate unless target_confirmed and safe_for_action are both true.",
             "parameters": {
                 "type": "object",
-                "properties": {},
-                "required": [],
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 300,
+                        "description": "A short, image-grounded question naming the specific object and required action, e.g. 'Is the red apple clearly visible and safely graspable?'",
+                    },
+                },
+                "required": ["question"],
                 "additionalProperties": False,
             },
         },
@@ -261,6 +266,9 @@ class AgentState(TypedDict, total=False):
     outcome: str
     failure_reason: str
     tools_called: list[str]
+    execution_ledger: list[str]
+    semantic_query_cache: dict[str, str]
+    last_visual_verification: dict
 BOWL_TARGETS = {"bowl", "purple bowl"}
 
 
@@ -286,10 +294,10 @@ tools_impl = {
         args.get("target_rad")
     ),
     "home_panda_arm": lambda _: home_panda_arm(),
-    "get_camera_frame": lambda _: get_settled_vlm_image(
-        timeout_sec=10.0, settle_sec=2.0, frame_count=2
+    "get_camera_frame": lambda args: verify_settled_camera_frame(
+        args.get("question", ""), timeout_sec=10.0, settle_sec=2.0, frame_count=2
     ),
-    "get_semantic_objects": lambda args: get_semantic_objects(args.get("class_names")),
+    "search_semantic_objects": lambda args: search_semantic_objects(args.get("query", "")),
     "finish_task": lambda args: {
         "status": "success",
         "success": True,
@@ -322,21 +330,20 @@ def _validate_tool_for_stage(
         if not tools_called or tools_called[-1] != "get_camera_frame":
             return (
                 "Immediately before every pick or place hardware execution, call "
-                "get_camera_frame and visually verify the required object."
+                "get_camera_frame with a narrow visual question."
+            )
+        verification = state.get("last_visual_verification", {})
+        if (
+            not isinstance(verification, dict)
+            or verification.get("target_confirmed") is not True
+            or verification.get("safe_for_action") is not True
+        ):
+            return (
+                "The latest isolated visual verification did not clearly confirm a "
+                "safe target. Reposition or capture another frame; do not manipulate."
             )
 
     return None
-
-
-def _is_jpeg_base64(value: object) -> bool:
-    if not isinstance(value, str) or not value.strip():
-        return False
-    try:
-        image_bytes = base64.b64decode(value.strip(), validate=True)
-    except (ValueError, binascii.Error):
-        return False
-    # JPEG start-of-image marker plus a valid marker prefix.
-    return image_bytes.startswith(b"\xff\xd8\xff")
 
 
 def _tool_result_succeeded(tool_name: str, result: object) -> bool:
@@ -348,8 +355,6 @@ def _tool_result_succeeded(tool_name: str, result: object) -> bool:
         return result.get("status") == "success"
 
     text = str(result).strip()
-    if tool_name == "get_camera_frame":
-        return _is_jpeg_base64(text)
 
     text = text.lower()
     if not text or text.startswith(("error", "warning")):
@@ -384,9 +389,94 @@ def _failed_update(
 
 
 # ── 3. GRAPH NODES ──────────────────────────────────────────────────────────
+def _compact_ledger_entry(tool_name: str, arguments: dict, result: object) -> str:
+    """Persist only facts needed after older tool turns are removed."""
+    if tool_name == "execute_pick_script" and isinstance(result, dict):
+        if result.get("success") is True:
+            return f"Pick succeeded; holding {result.get('object_id', arguments.get('object_id', 'object'))}."
+        return f"Pick failed safely: {str(result.get('reason', 'unknown reason'))[:180]}"
+    if tool_name == "execute_place_script" and isinstance(result, dict):
+        if result.get("success") is True:
+            return f"Place succeeded at {result.get('destination_object_id', arguments.get('destination_object_id', 'destination'))}."
+        return f"Place failed safely: {str(result.get('reason', 'unknown reason'))[:180]}"
+    if tool_name == "move_rail_to_object":
+        if isinstance(result, dict) and result.get("success") is not True:
+            return f"Rail/look-at failed safely: {str(result.get('reason', 'unknown reason'))[:180]}"
+        return f"Rail/look-at completed for {arguments.get('object_id', 'requested object')}."
+    if tool_name == "get_camera_frame":
+        if not isinstance(result, dict):
+            return "Isolated visual verification did not return structured evidence."
+        return (
+            "Isolated visual verification: "
+            f"target_confirmed={str(result.get('target_confirmed') is True).lower()}, "
+            f"safe_for_action={str(result.get('safe_for_action') is True).lower()}. "
+            f"Evidence: {str(result.get('observation', {}).get('visible_evidence', ''))[:180]}"
+        )
+    if tool_name == "start_joint_controller":
+        return "Robot startup posture completed and gripper-open command issued."
+    if tool_name == "search_semantic_objects" and isinstance(result, dict):
+        matches = result.get("objects", [])
+        facts: list[str] = []
+        for item in matches[:5]:
+            if not isinstance(item, dict):
+                continue
+            object_id = str(item.get("object_id", "unknown"))
+            class_name = str(item.get("class_name", "unknown"))
+            state = str(item.get("state", "unknown"))
+            confidence = item.get("confidence", "?")
+            similarity = item.get("cosine_similarity", "?")
+            x, y, z = item.get("x", "?"), item.get("y", "?"), item.get("z", "?")
+            facts.append(
+                f"{object_id} ({class_name}, {state}, confidence={confidence}, "
+                f"text_similarity={similarity}, xyz=({x}, {y}, {z}))"
+            )
+        return (
+            f"Semantic search {arguments.get('query', '')!r} returned: "
+            f"{'; '.join(facts) if facts else 'no matches'}."
+        )
+    if tool_name in {"targeted_search", "general_mapping"}:
+        return f"{tool_name} result: {str(result)[:180]}"
+    return f"{tool_name}: {str(result)[:180]}"
+
+
+def _semantic_query_key(query: object) -> str:
+    """Normalize a query solely for duplicate-query suppression."""
+    return " ".join(str(query).casefold().split())
+
+
+def _messages_for_llm(state: AgentState) -> list[BaseMessage]:
+    """Bound prompt size while retaining task, durable state, and latest tool turn."""
+    messages = state["messages"]
+    if not messages:
+        return []
+
+    # Retain the initial system/task messages; historical tool exchanges are
+    # represented by the ledger below rather than repeatedly consuming context.
+    prompt: list[BaseMessage] = [messages[0]]
+    if len(messages) > 1:
+        prompt.append(messages[1])
+
+    ledger = state.get("execution_ledger", [])[-8:]
+    if ledger:
+        prompt.append(HumanMessage(content=(
+            "Execution ledger (durable facts from earlier steps):\n- "
+            + "\n- ".join(ledger)
+        )))
+
+    # A tool response must remain paired with the immediately preceding AI
+    # tool-call message. Keep that one current turn, including a current image.
+    latest_ai_index = max(
+        (index for index, message in enumerate(messages) if isinstance(message, AIMessage)),
+        default=-1,
+    )
+    if latest_ai_index >= 0:
+        prompt.extend(messages[latest_ai_index:])
+    return prompt
+
+
 def call_llm(state: AgentState) -> dict:
     print("\n[LLM IS EVALUATING TASK...]")
-    response = llm.invoke(state["messages"])
+    response = llm.invoke(_messages_for_llm(state))
 
     if getattr(response, "tool_calls", None):
         pass
@@ -450,7 +540,22 @@ def execute_tools(state: AgentState) -> dict:
                 print(f"\n[AI THOUGHT]:\n{thought}")
         
         print(f"\n[TOOL TRIGGERED]: Executing function {tool_name!r}...")
-        raw_result = tools_impl[tool_name](arguments)
+        query_key = _semantic_query_key(arguments.get("query", ""))
+        prior_search = state.get("semantic_query_cache", {}).get(query_key)
+        if tool_name == "search_semantic_objects" and prior_search:
+            raw_result = {
+                "status": "success",
+                "query": arguments.get("query", ""),
+                "already_queried": True,
+                "reason": (
+                    "This query was already run against the current semantic map. "
+                    "Use the durable execution ledger result and take the next planning action; "
+                    "repeat it only after targeted_search or general_mapping."
+                ),
+                "objects": [],
+            }
+        else:
+            raw_result = tools_impl[tool_name](arguments)
         print(f"[TOOL COMPLETED]: {tool_name!r} execution completed.")
     except Exception as exc:
         reason = f"{tool_name} raised an exception: {exc}"
@@ -460,33 +565,29 @@ def execute_tools(state: AgentState) -> dict:
             reason,
         )
 
-    camera_frame_message = None
-    if tool_name == "get_camera_frame" and _is_jpeg_base64(raw_result):
-        # llama.cpp VLMs reliably parse image_url blocks in a user message, but
-        # may render image data in a tool result as plain text. Keep the tool
-        # protocol response text-only and provide the JPEG through image_url.
-        result_message = _tool_message(tool_call, "Camera frame captured.")
-        camera_frame_message = HumanMessage(
-            content=[
-                {
-                    "type": "text",
-                    "text": "Use this current wrist-camera frame to visually verify the object.",
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{raw_result}"},
-                },
-            ]
-        )
-    else:
-        result_message = _tool_message(tool_call, _format_tool_result(raw_result))
+    result_message = _tool_message(tool_call, _format_tool_result(raw_result))
     recoverable_targeted_search_failure = (
         tool_name == "targeted_search"
         and isinstance(raw_result, dict)
         and raw_result.get("status") == "failure"
         and raw_result.get("state") == "couldnt_find"
     )
-    if not _tool_result_succeeded(tool_name, raw_result) and not recoverable_targeted_search_failure:
+    recoverable_manipulation_failure = (
+        tool_name in {"execute_pick_script", "execute_place_script"}
+        and isinstance(raw_result, dict)
+        and raw_result.get("status") == "failure"
+    )
+    recoverable_motion_failure = (
+        isinstance(raw_result, dict)
+        and raw_result.get("status") == "failure"
+        and raw_result.get("recoverable") is True
+    )
+    if (
+        not _tool_result_succeeded(tool_name, raw_result)
+        and not recoverable_targeted_search_failure
+        and not recoverable_manipulation_failure
+        and not recoverable_motion_failure
+    ):
         reason = f"{tool_name} failed: {_format_tool_result(raw_result)}"
         return _failed_update(state, [result_message], reason)
 
@@ -508,23 +609,38 @@ def execute_tools(state: AgentState) -> dict:
             called_identifier = "move_rail_to_object_home"
 
     tools_called = state.get("tools_called", []) + [called_identifier]
+    execution_ledger = (
+        state.get("execution_ledger", [])
+        + [_compact_ledger_entry(tool_name, arguments, raw_result)]
+    )[-8:]
+    semantic_query_cache = dict(state.get("semantic_query_cache", {}))
+    last_visual_verification = state.get("last_visual_verification", {})
+    if tool_name == "get_camera_frame":
+        last_visual_verification = raw_result if isinstance(raw_result, dict) else {}
+    if tool_name in {"targeted_search", "general_mapping"}:
+        # These motions can add, update, or expire map tracks.
+        semantic_query_cache.clear()
+    elif tool_name == "search_semantic_objects" and not raw_result.get("already_queried", False):
+        semantic_query_cache[_semantic_query_key(arguments.get("query", ""))] = execution_ledger[-1]
 
-    if recoverable_targeted_search_failure:
+    if recoverable_targeted_search_failure or recoverable_motion_failure:
         print(
-            "[PIPELINE] Targeted search did not find the target; "
+            "[PIPELINE] Motion/search failure recovered safely; "
             "returning result to the VLM for replanning."
         )
 
     update = {
         "messages": state["messages"] + [
             result_message,
-            *([camera_frame_message] if camera_frame_message is not None else []),
         ],
         "iterations": state.get("iterations", 0),
         "terminated": False,
         "outcome": "in_progress",
         "failure_reason": "",
         "tools_called": tools_called,
+        "execution_ledger": execution_ledger,
+        "semantic_query_cache": semantic_query_cache,
+        "last_visual_verification": last_visual_verification,
     }
     if tool_name == "finish_task":
         summary = str(arguments["summary"])

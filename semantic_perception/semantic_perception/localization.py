@@ -27,6 +27,7 @@ class LocalizedDetection:
     base_pixel_stddev_px: float = 0.0
     bbox_pixel_stddev_px: float = 0.0
     combined_pixel_stddev_px: float = 0.0
+    point_cloud: list[dict[str, float | int]] | None = None
 
 
 @dataclass(frozen=True)

@@ -142,7 +142,10 @@ chosen globally with Hungarian assignment. By default, every valid YOLO crop in
 a frame is batched through the image encoder of pretrained MobileCLIP-S0, then
 L2-normalized. Incompatible appearance pairs are rejected above cosine distance
 `0.35`, and the remaining assignment cost combines normalized `d²` and cosine
-distance equally. The text encoder is never used.
+distance equally. The `/semantic/search_objects` service additionally reuses MobileCLIP-S0's text
+encoder to rank compatible confirmed tracks for a natural-language description.
+It returns at most five tracks above cosine similarity `0.25` by default; this
+is retrieval evidence, not visual confirmation for manipulation.
 
 Install Apple's official `mobileclip` package in the ROS Python environment
 (`git clone https://github.com/apple/ml-mobileclip.git && ./agent_orchestrator/agent_env/bin/pip install -e ./ml-mobileclip`)

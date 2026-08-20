@@ -17,7 +17,9 @@ from interface.msg import (
     ClassProbability,
     DetectedObject,
     DetectedObjectArray,
+    SemanticTextMatch,
 )
+from interface.srv import SearchSemanticObjects
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
@@ -220,6 +222,12 @@ class SemanticPerceptionNode(Node):
             cancel_callback=lambda _: CancelResponse.ACCEPT,
             callback_group=ReentrantCallbackGroup(),
         )
+        self._text_search_service = self.create_service(
+            SearchSemanticObjects,
+            "/semantic/search_objects",
+            self._search_objects_callback,
+            callback_group=ReentrantCallbackGroup(),
+        )
         self._publish_registry()
         self.get_logger().info(
             f"Semantic perception ready: model={self._detector.model_id}, "
@@ -272,7 +280,7 @@ class SemanticPerceptionNode(Node):
         self.declare_parameter("association.duplicate_merge_interval_frames", 25)
         self.declare_parameter("filter.confirmation_hits", 3)
         self.declare_parameter("filter.confirmation_window_sec", 3.0)
-        self.declare_parameter("filter.stale_after_sec", 120.0)
+        self.declare_parameter("filter.stale_after_sec", 300.0)
         self.declare_parameter("filter.stale_retention_sec", 120.0)
         self.declare_parameter("class.confirmation_probability", 0.70)
         self.declare_parameter("class.conditional_reliability_floor", 0.60)
@@ -290,6 +298,9 @@ class SemanticPerceptionNode(Node):
         self.declare_parameter("registry.write_legacy_coordinates", False)
         self.declare_parameter("registry.persistence_interval_sec", 1.0)
         self.declare_parameter("search.default_timeout_sec", 30.0)
+        self.declare_parameter("semantic_text.enabled", True)
+        self.declare_parameter("semantic_text.minimum_cosine_similarity", 0.25)
+        self.declare_parameter("semantic_text.max_results", 5)
         self.declare_parameter("debug.publish_annotated", False)
         self.declare_parameter("debug.timing", False)
         self.declare_parameter("debug.timing_log_interval_sec", 1.0)
@@ -319,6 +330,7 @@ class SemanticPerceptionNode(Node):
             "uncertainty.process_noise_stddev_m",
             "registry.persistence_interval_sec",
             "search.default_timeout_sec",
+            "semantic_text.max_results",
         )
         for name in positive_parameters:
             if float(self.get_parameter(name).value) <= 0.0:
@@ -336,6 +348,7 @@ class SemanticPerceptionNode(Node):
             "class.confirmation_probability",
             "class.conditional_reliability_floor",
             "class.evidence_decay",
+            "semantic_text.minimum_cosine_similarity",
         )
         for name in unit_parameters:
             value = float(self.get_parameter(name).value)
@@ -648,6 +661,33 @@ class SemanticPerceptionNode(Node):
                 )
                 covariance_scale = max(1.0, (range_m / reference_distance_m) ** 2)
                 world_covariance *= covariance_scale
+
+                point_cloud_samples = []
+                inlier_ys, inlier_xs = np.where(diagnostics.inlier_mask)
+                num_inliers = len(inlier_ys)
+                if num_inliers > 0:
+                    sample_size = min(15, num_inliers)
+                    sample_indices = np.random.choice(num_inliers, sample_size, replace=False)
+                    for idx in sample_indices:
+                        roi_y = inlier_ys[idx]
+                        roi_x = inlier_xs[idx]
+                        left = diagnostics.bounds_xyxy[0]
+                        top = diagnostics.bounds_xyxy[1]
+                        u = int(roi_x + left)
+                        v = int(roi_y + top)
+                        z = float(depth[v, u])
+                        if z > 0:
+                            pt_cam = deproject_pixel((u, v), z, self._camera_calibration.camera_matrix)
+                            pt_world = transform_point(pt_cam, transform.transform)
+                            b, g, r = color[v, u]
+                            point_cloud_samples.append({
+                                "x": float(pt_world[0]),
+                                "y": float(pt_world[1]),
+                                "z": float(pt_world[2]),
+                                "r": int(r),
+                                "g": int(g),
+                                "b": int(b)
+                            })
             except ValueError as exc:
                 rejected_depth.append(
                     RejectedDepthDetection(
@@ -679,6 +719,7 @@ class SemanticPerceptionNode(Node):
                     base_pixel_stddev_px=base_pixel_stddev_px,
                     bbox_pixel_stddev_px=bbox_pixel_stddev_px,
                     combined_pixel_stddev_px=combined_pixel_stddev_px,
+                    point_cloud=point_cloud_samples,
                 )
             )
         timing["depth"] = time.perf_counter() - stage_started
@@ -962,6 +1003,107 @@ class SemanticPerceptionNode(Node):
         message.state = track.state
         return message
 
+    def _search_objects_callback(
+        self, request: SearchSemanticObjects.Request, response: SearchSemanticObjects.Response
+    ) -> SearchSemanticObjects.Response:
+        """Rank confirmed registry tracks against a MobileCLIP text description."""
+        response.appearance_provider_id = self._appearance_provider.provider_id
+        if not bool(self.get_parameter("semantic_text.enabled").value):
+            response.success = False
+            response.reason = "Semantic text search is disabled"
+            return response
+        query = str(request.query).strip()
+        if not query:
+            response.success = False
+            response.reason = "Text query must not be empty"
+            return response
+        configured_limit = int(self.get_parameter("semantic_text.max_results").value)
+        limit = configured_limit if request.max_results == 0 else min(
+            int(request.max_results), configured_limit
+        )
+        configured_threshold = float(
+            self.get_parameter("semantic_text.minimum_cosine_similarity").value
+        )
+        threshold = (
+            configured_threshold
+            if float(request.minimum_cosine_similarity) < 0.0
+            else float(request.minimum_cosine_similarity)
+        )
+        response.applied_minimum_cosine_similarity = threshold
+        if not -1.0 <= threshold <= 1.0:
+            response.success = False
+            response.reason = "minimum_cosine_similarity must be in [-1, 1]"
+            return response
+        try:
+            text_embedding = self._appearance_provider.encode_text(query)
+        except RuntimeError as exc:
+            response.success = False
+            response.reason = str(exc)
+            return response
+        text_embedding = np.asarray(text_embedding, dtype=np.float64).reshape(-1)
+        text_norm = float(np.linalg.norm(text_embedding))
+        if (
+            text_embedding.size == 0
+            or not np.all(np.isfinite(text_embedding))
+            or text_norm <= 0.0
+        ):
+            response.success = False
+            response.reason = "Appearance provider returned an invalid text embedding"
+            return response
+        text_embedding /= text_norm
+
+        compatible: list[tuple[float, ObjectTrack]] = []
+        provider_id = self._appearance_provider.provider_id
+        with self._registry_lock:
+            for track in self._registry.tracks():
+                embedding = track.appearance_embedding
+                if (
+                    track.state != "confirmed"
+                    or embedding is None
+                    or track.appearance_provider_id != provider_id
+                ):
+                    continue
+                vector = np.asarray(embedding, dtype=np.float64).reshape(-1)
+                norm = float(np.linalg.norm(vector))
+                if (
+                    vector.shape != text_embedding.shape
+                    or not np.all(np.isfinite(vector))
+                    or norm <= 0.0
+                ):
+                    continue
+                similarity = float(np.dot(text_embedding, vector / norm))
+                if np.isfinite(similarity):
+                    compatible.append((float(np.clip(similarity, -1.0, 1.0)), track))
+        response.compatible_track_count = len(compatible)
+        compatible.sort(
+            key=lambda item: (
+                -item[0],
+                -float(item[1].confidence),
+                -float(item[1].last_seen_sec),
+                item[1].object_id,
+            )
+        )
+        for similarity, track in compatible:
+            if similarity < threshold:
+                continue
+            match = SemanticTextMatch()
+            match.object_id = track.object_id
+            match.class_name = track.class_name
+            match.cosine_similarity = similarity
+            match.confidence = float(track.confidence)
+            match.position.x = float(track.position[0])
+            match.position.y = float(track.position[1])
+            match.position.z = float(track.position[2])
+            match.position_stddev_m = float(track.position_stddev_m)
+            match.last_seen = Time(nanoseconds=int(track.last_seen_sec * 1e9)).to_msg()
+            match.state = track.state
+            response.matches.append(match)
+            if len(response.matches) >= limit:
+                break
+        response.success = True
+        response.reason = ""
+        return response
+
     def _find_object_goal_callback(self, request: FindObject.Goal) -> GoalResponse:
         if not request.target_class.strip() or request.min_confidence > 1.0:
             return GoalResponse.REJECT
@@ -1074,6 +1216,7 @@ class SemanticPerceptionNode(Node):
                 except OSError as exc:
                     self.get_logger().error(f"Final registry write failed: {exc}")
         self._action_server.destroy()
+        self.destroy_service(self._text_search_service)
         return super().destroy_node()
 
 

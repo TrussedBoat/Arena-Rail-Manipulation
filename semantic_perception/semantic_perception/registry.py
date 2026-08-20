@@ -25,7 +25,7 @@ class RegistryConfig:
     confirmation_window_sec: float = 3.0
     class_confirmation_probability: float = 0.70
     max_explicit_classes: int = 4
-    stale_after_sec: float = 120.0
+    stale_after_sec: float = 300.0
     stale_retention_sec: float = 120.0
     evidence_decay: float = 0.95
     process_noise_stddev_m: float = 0.002
@@ -54,6 +54,7 @@ class ObjectTrack:
     state: str = "candidate"
     confirmation_locked: bool = False
     stale_since_sec: float | None = None
+    point_cloud: list[dict[str, float | int]] = field(default_factory=list)
 
     @property
     def class_distribution(self) -> dict[str, float]:
@@ -516,6 +517,10 @@ class ObjectRegistry:
         track.stale_since_sec = None
         track.model_id = self.model_id
         self._update_appearance(track, detection)
+        if detection.point_cloud:
+            track.point_cloud.extend(detection.point_cloud)
+            if len(track.point_cloud) > 150:
+                track.point_cloud = track.point_cloud[-150:]
         self._add_class_observation(track, detection, now_sec)
         self._update_state(track, now_sec)
 
@@ -532,6 +537,7 @@ class ObjectRegistry:
             model_id=self.model_id,
             appearance_embedding=_normalized_embedding(detection.appearance_embedding),
             appearance_provider_id=detection.appearance_provider_id,
+            point_cloud=detection.point_cloud or [],
         )
         self._add_class_observation(track, detection, now_sec)
         self._update_state(track, now_sec)
@@ -702,6 +708,7 @@ class ObjectRegistry:
                 if item.get("stale_since")
                 else None
             ),
+            point_cloud=item.get("point_cloud", []),
         )
         self._prune_class_scores(track)
         self._tracks[track.object_id] = track
@@ -795,6 +802,7 @@ class ObjectRegistry:
             "observation_count": track.observation_count,
             "first_seen": _iso_time(track.first_seen_sec),
             "last_seen": _iso_time(track.last_seen_sec),
+            "point_cloud": track.point_cloud,
             **(
                 {"stale_since": _iso_time(track.stale_since_sec)}
                 if track.stale_since_sec is not None

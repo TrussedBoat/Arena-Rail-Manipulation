@@ -33,7 +33,7 @@ and yaw in radians. It publishes `geometry_msgs/Pose` on `/rrt/pose_command`, ex
 relative to `panda_link0`. The RRT planner converts the pose into a timed
 seven-joint trajectory, validates self-collision, joint limits, and Jacobian
 singularity margin, and publishes it on `/rrt/joint_trajectory`. The caller
-waits for `/panda/controller_state` and receives failures immediately from
+waits for the arm-only `/panda/trajectory_complete` pulse and receives failures immediately from
 `/rrt/status`.
 
 The planner rejects any target or interpolated path state whose EEF height in
@@ -52,18 +52,25 @@ a later `/rrt/pose_command` re-arms planned trajectory forwarding.
 Targeted search may also publish `/rrt/cancel`; this creates an intentional
 current-joint hold and reports `cancelled` separately from runtime safety stops.
 
+The short vertical descend and retreat legs of pick/place use
+`/panda/cartesian_pose_command` directly in the Panda pose controller. This
+bypasses RRT only for those local manipulation legs; the controller's
+`/panda/trajectory_complete` pulse is their completion feedback.
+
 ### ROS command topics
 
 | Topic | Producer → consumer | Purpose |
 |---|---|---|
 | `/direct_joint_command` | orchestrator → bridge | Direct rail/Panda joint targets. |
 | `/rrt/pose_command` | orchestrator → RRT planner | Cartesian EEF target. |
+| `/panda/cartesian_pose_command` | orchestrator → Panda controller/bridge | Direct local Cartesian descend or ascend, bypassing RRT. |
 | `/rrt/joint_trajectory` | RRT planner → Panda controller | Validated joint trajectory. |
 | `/cartesian/joint_command` | Panda controller → bridge | Streamed joint targets while executing a trajectory. |
 | `/rrt/hold_command` | RRT planner → bridge | Emergency or cancellation joint hold. |
 | `/gripper/command` | orchestrator → bridge/Panda controller | Gripper command. |
 | `/panda/controller_ready` | Panda controller → clients | Controller startup readiness. |
-| `/panda/controller_state` | Panda controller → clients/RRT planner | Trajectory completion notification. |
+| `/panda/trajectory_complete` | Panda controller → clients/RRT planner | Arm/cartesian trajectory completion notification. |
+| `/gripper/reached` | Panda controller → clients | Gripper command completion notification. |
 
 The old `/joint_position_cmd` controller input is removed. Do not publish the
 old `/joint_position_command`, `/joint_command`, `/pose_cmd`, or

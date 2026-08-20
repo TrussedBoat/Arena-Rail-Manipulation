@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """RRT motion-planning gateway for Panda end-effector pose commands.
 
-The node owns /rrt/pose_command, plans a self-collision-free joint trajectory with
-MPlib, rejects joint-limit and singular configurations, and publishes the
-validated trajectory to /rrt/joint_trajectory.  During execution it monitors
-actual joint feedback and issues a direct hold command if a safety condition
-is violated.
+The node owns the /rrt/execute_pose action, plans a self-collision-free joint
+trajectory with MPlib, rejects joint-limit and singular configurations, and
+publishes a tagged trajectory to the Panda controller. During execution it
+monitors actual joint feedback and issues a direct hold command if a safety
+condition is violated.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ import shutil
 import tempfile
 import time
 import traceback
+import threading
+import uuid
 
 import mplib
 import numpy as np
@@ -26,13 +28,18 @@ import ros_logger
 ros_logger.setup_ros_logging()
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Pose
-from rclpy.executors import ExternalShutdownException
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 import roboticstoolbox as rtb
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Empty, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from interface.action import ExecuteRrtPose
+from interface.msg import ControllerExecutionStatus, TaggedJointTrajectory
+from interface.srv import AcquireArmLease, ReleaseArmLease
 
 
 PANDA_JOINT_NAMES = [f"panda_joint{i}" for i in range(1, 8)]
@@ -82,6 +89,8 @@ def _duration(seconds: float) -> Duration:
 class RRTPlannerNode(Node):
     def __init__(self) -> None:
         super().__init__("arena_rrt_planner")
+        self._callbacks = ReentrantCallbackGroup()
+        self._action_lock = threading.RLock()
 
         default_model_root = Path(
             os.environ.get(
@@ -92,8 +101,13 @@ class RRTPlannerNode(Node):
         )
         self.declare_parameter("pose_cmd_topic", "/rrt/pose_command")
         self.declare_parameter("joint_states_topic", "/joint_states")
-        self.declare_parameter("trajectory_topic", "/rrt/joint_trajectory")
-        self.declare_parameter("controller_state_topic", "/panda/controller_state")
+        self.declare_parameter("trajectory_topic", "/rrt/tagged_joint_trajectory")
+        self.declare_parameter("controller_execution_status_topic", "/panda/controller_execution_status")
+        self.declare_parameter("controller_cancel_topic", "/panda/cancel_execution")
+        self.declare_parameter("action_timeout_sec", 30.0)
+        # This legacy pulse is arm-only; action completion is instead correlated
+        # through /panda/controller_execution_status.
+        self.declare_parameter("trajectory_complete_topic", "/panda/trajectory_complete")
         self.declare_parameter("status_topic", "/rrt/status")
         self.declare_parameter("ready_topic", "/rrt/ready")
         # Keep RRT safety holds separate from the orchestrator's direct-joint
@@ -134,6 +148,7 @@ class RRTPlannerNode(Node):
             self.get_parameter("goal_orientation_tolerance_rad").value
         )
         self.eef_min_z_m = float(self.get_parameter("eef_min_z_m").value)
+        self.action_timeout_sec = float(self.get_parameter("action_timeout_sec").value)
         self._validate_parameters()
 
         model_root = Path(str(self.get_parameter("model_root").value)).expanduser()
@@ -158,9 +173,15 @@ class RRTPlannerNode(Node):
         self.executing = False
         self.safety_stop_sent = False
         self._last_runtime_warning = 0.0
+        self._active_action_goal = None
+        self._active_execution_id = None
+        self._active_lease_id = None
+        self._action_result_state = None
+        self._action_result_reason = ""
+        self._action_done = threading.Event()
 
         self.trajectory_pub = self.create_publisher(
-            JointTrajectory, str(self.get_parameter("trajectory_topic").value), 10
+            TaggedJointTrajectory, str(self.get_parameter("trajectory_topic").value), 10
         )
         self.status_pub = self.create_publisher(
             String, str(self.get_parameter("status_topic").value), 10
@@ -171,38 +192,68 @@ class RRTPlannerNode(Node):
         self.hold_pub = self.create_publisher(
             JointState, str(self.get_parameter("hold_topic").value), 10
         )
-        self.completion_pub = self.create_publisher(
-            Bool, str(self.get_parameter("controller_state_topic").value), 10
+        self.trajectory_complete_pub = self.create_publisher(
+            Bool, str(self.get_parameter("trajectory_complete_topic").value), 10
+        )
+        self.controller_cancel_pub = self.create_publisher(
+            String, str(self.get_parameter("controller_cancel_topic").value), 10
+        )
+        self.acquire_lease_client = self.create_client(
+            AcquireArmLease, "/bridge/acquire_arm_lease", callback_group=self._callbacks
+        )
+        self.release_lease_client = self.create_client(
+            ReleaseArmLease, "/bridge/release_arm_lease", callback_group=self._callbacks
         )
         self.create_subscription(
             JointState,
             str(self.get_parameter("joint_states_topic").value),
             self._joint_state_callback,
             10,
+            callback_group=self._callbacks,
         )
         self.create_subscription(
             Pose,
             str(self.get_parameter("pose_cmd_topic").value),
             self._pose_callback,
             10,
+            callback_group=self._callbacks,
         )
         self.create_subscription(
             Bool,
-            str(self.get_parameter("controller_state_topic").value),
-            self._controller_state_callback,
+            str(self.get_parameter("trajectory_complete_topic").value),
+            self._trajectory_complete_callback,
             10,
+            callback_group=self._callbacks,
         )
         self.create_subscription(
             Empty,
             str(self.get_parameter("cancel_topic").value),
             self._cancel_callback,
             10,
+            callback_group=self._callbacks,
         )
         self.create_subscription(
             Empty,
             str(self.get_parameter("reverse_topic").value),
             self._reverse_last_trajectory_callback,
             10,
+            callback_group=self._callbacks,
+        )
+        self.create_subscription(
+            ControllerExecutionStatus,
+            str(self.get_parameter("controller_execution_status_topic").value),
+            self._controller_execution_status_callback,
+            10,
+            callback_group=self._callbacks,
+        )
+        self.execute_pose_action = ActionServer(
+            self,
+            ExecuteRrtPose,
+            "/rrt/execute_pose",
+            execute_callback=self._execute_pose_action,
+            goal_callback=self._rrt_goal_callback,
+            cancel_callback=self._rrt_cancel_callback,
+            callback_group=self._callbacks,
         )
         self.ready_timer = self.create_timer(
             1.0, lambda: self.ready_pub.publish(Bool(data=True))
@@ -210,8 +261,7 @@ class RRTPlannerNode(Node):
         self.ready_pub.publish(Bool(data=True))
 
         self.get_logger().info(
-            "RRT planner ready: /rrt/pose_command -> self-collision/singularity validation "
-            "-> /rrt/joint_trajectory"
+            "RRT planner ready: /rrt/execute_pose -> lease -> validation -> tagged trajectory"
         )
 
     def _validate_parameters(self) -> None:
@@ -244,10 +294,160 @@ class RRTPlannerNode(Node):
         shutil.copytree(source, destination)
 
     def _publish_status(self, state: str, message: str, **details: object) -> None:
-        payload = {"state": state, "message": message, **details}
+        payload = {
+            "state": state,
+            "message": message,
+            "execution_id": self._active_execution_id or "",
+            **details,
+        }
         self.status_pub.publish(String(data=json.dumps(payload, sort_keys=True)))
         log = self.get_logger().error if state == "failure" else self.get_logger().info
         log(f"[RRT {state.upper()}] {message}")
+
+    def _wait_future(self, future, timeout_sec: float):
+        deadline = time.monotonic() + timeout_sec
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return future.result() if future.done() else None
+
+    def _acquire_rrt_lease(self, execution_id: str):
+        if not self.acquire_lease_client.wait_for_service(timeout_sec=2.0):
+            return None, "bridge lease service unavailable"
+        request = AcquireArmLease.Request()
+        request.owner, request.execution_id = "rrt", execution_id
+        response = self._wait_future(self.acquire_lease_client.call_async(request), 2.0)
+        if response is None:
+            return None, "bridge lease request timed out"
+        if not response.granted:
+            return None, (
+                f"{response.reason}; owner={response.active_owner} "
+                f"execution={response.active_execution_id} age={response.owner_age_sec:.2f}s "
+                f"remaining={response.owner_remaining_sec:.2f}s"
+            )
+        return str(response.lease_id), ""
+
+    def _release_rrt_lease(self, lease_id: str | None, state: str, reason: str) -> None:
+        if not lease_id or not self.release_lease_client.wait_for_service(timeout_sec=1.0):
+            return
+        request = ReleaseArmLease.Request()
+        request.lease_id, request.terminal_state, request.reason = lease_id, state, reason
+        self.release_lease_client.call_async(request)
+
+    def _rrt_goal_callback(self, goal_request):
+        return GoalResponse.ACCEPT if _finite_pose(goal_request.target_pose) else GoalResponse.REJECT
+
+    def _rrt_cancel_callback(self, _goal_handle):
+        return CancelResponse.ACCEPT
+
+    def _rrt_result(self, success: bool, state: str, reason: str, execution_id: str):
+        result = ExecuteRrtPose.Result()
+        result.success, result.state, result.reason, result.execution_id = success, state, reason, execution_id
+        return result
+
+    def _action_feedback(self, goal_handle, state: str, reason: str, started_at: float) -> None:
+        feedback = ExecuteRrtPose.Feedback()
+        feedback.state, feedback.reason = state, reason
+        feedback.elapsed_sec = float(time.monotonic() - started_at)
+        goal_handle.publish_feedback(feedback)
+
+    def _controller_execution_status_callback(self, message: ControllerExecutionStatus) -> None:
+        with self._action_lock:
+            if not self.executing or str(message.execution_id) != self._active_execution_id:
+                return
+            state, reason = str(message.state), str(message.reason)
+            if state == "reached":
+                self.executing = False
+                self.last_successful_trajectory = self.active_trajectory_message
+                self.active_trajectory = None
+                self.active_trajectory_message = None
+                self._action_result_state, self._action_result_reason = "reached", reason
+                self._publish_status("success", "RRT tagged trajectory completed")
+                self._action_done.set()
+            elif state in {"cancelled", "timeout", "failed", "safety_interrupted"}:
+                self.executing = False
+                self.active_trajectory = None
+                self.active_trajectory_message = None
+                self._action_result_state, self._action_result_reason = state, reason
+                self._publish_status("failure", f"Controller execution {state}: {reason}")
+                self._action_done.set()
+
+    def _execute_pose_action(self, goal_handle):
+        started_at = time.monotonic()
+        execution_id = f"rrt-{uuid.uuid4().hex}"
+        lease_id, reason = self._acquire_rrt_lease(execution_id)
+        if lease_id is None:
+            result = self._rrt_result(False, "blocked_by_direct_action", reason, execution_id)
+            goal_handle.abort()
+            return result
+        try:
+            with self._action_lock:
+                if self.executing:
+                    raise PlanningError("Planner is busy executing another trajectory")
+                pose = goal_handle.request.target_pose
+                if pose.position.z < self.eef_min_z_m:
+                    raise PlanningError(
+                        f"Target EEF z={pose.position.z:.4f}m is below the table safety floor of {self.eef_min_z_m:.4f}m"
+                    )
+                self._active_action_goal = goal_handle
+                self._active_execution_id = execution_id
+                self._active_lease_id = lease_id
+                self._action_result_state, self._action_result_reason = None, ""
+                self._action_done.clear()
+                self._publish_status("planning", "Planning collision-free RRT trajectory")
+                self._action_feedback(goal_handle, "planning", "lease granted", started_at)
+                if self._target_already_reached(pose):
+                    self._action_result_state, self._action_result_reason = "reached", "EEF target already reached"
+                    self._action_done.set()
+                else:
+                    trajectory = self._plan(pose)
+                    self.active_trajectory = np.asarray([point.positions for point in trajectory.points], dtype=float)
+                    self.active_trajectory_message = trajectory
+                    self.safety_stop_sent = False
+                    self.executing = True
+                    tagged = TaggedJointTrajectory()
+                    tagged.execution_id, tagged.trajectory = execution_id, trajectory
+                    self.trajectory_pub.publish(tagged)
+                    self._publish_status("executing", "Validated tagged RRT trajectory published", points=len(trajectory.points))
+            last_feedback = 0.0
+            while not self._action_done.wait(timeout=0.05):
+                now = time.monotonic()
+                if goal_handle.is_cancel_requested:
+                    self.controller_cancel_pub.publish(String(data=execution_id))
+                    with self._action_lock:
+                        self.executing = False
+                        self.active_trajectory = None
+                        self.active_trajectory_message = None
+                        self._action_result_state, self._action_result_reason = "cancelled", "RRT action cancellation requested"
+                        self._action_done.set()
+                    break
+                if now - started_at >= self.action_timeout_sec:
+                    self.controller_cancel_pub.publish(String(data=execution_id))
+                    with self._action_lock:
+                        self.executing = False
+                        self.active_trajectory = None
+                        self.active_trajectory_message = None
+                        self._action_result_state, self._action_result_reason = "timeout", "RRT planning/execution timeout"
+                        self._action_done.set()
+                    break
+                if now - last_feedback >= 0.25:
+                    self._action_feedback(goal_handle, "executing" if self.executing else "planning", "", started_at)
+                    last_feedback = now
+            state = self._action_result_state or "failed"
+            reason = self._action_result_reason or "RRT action stopped unexpectedly"
+        except Exception as exc:
+            state, reason = "planning_failed", str(exc)
+            self._publish_status("failure", reason)
+        finally:
+            self._release_rrt_lease(lease_id, state, reason)
+            with self._action_lock:
+                self._active_action_goal = None
+                self._active_execution_id = None
+                self._active_lease_id = None
+        result = self._rrt_result(state == "reached", state, reason, execution_id)
+        if state == "reached": goal_handle.succeed()
+        elif state == "cancelled": goal_handle.canceled()
+        else: goal_handle.abort()
+        return result
 
     def _joint_state_callback(self, message: JointState) -> None:
         try:
@@ -282,15 +482,16 @@ class RRTPlannerNode(Node):
                 if q is not None:
                     self._stop_with_hold(q, f"safety monitor exception: {exc}")
 
-    def _controller_state_callback(self, message: Bool) -> None:
-        if message.data and self.executing and not self.safety_stop_sent:
-            self.executing = False
-            self.active_trajectory = None
-            self.last_successful_trajectory = self.active_trajectory_message
-            self.active_trajectory_message = None
-            self._publish_status("success", "RRT trajectory completed")
+    def _trajectory_complete_callback(self, message: Bool) -> None:
+        if message.data:
+            self.get_logger().debug(
+                "Ignoring untagged /panda/trajectory_complete; tagged controller status owns action completion"
+            )
 
     def _cancel_callback(self, _message: Empty) -> None:
+        self.get_logger().warning("Rejected legacy /rrt/cancel; cancel /rrt/execute_pose action instead")
+        return
+        # Legacy implementation retained below for source-history readability.
         if not self.executing:
             self._publish_status("cancelled", "No active RRT trajectory to cancel")
             return
@@ -308,31 +509,17 @@ class RRTPlannerNode(Node):
         self._publish_status("cancelled", "RRT trajectory cancelled with joint hold")
 
     def _reverse_last_trajectory_callback(self, _message: Empty) -> None:
-        """Replay the latest completed RRT path backwards without replanning."""
-        if self.executing:
-            self._publish_status("failure", "Planner is busy executing another trajectory")
-            return
-        trajectory = self.last_successful_trajectory
-        if trajectory is None or len(trajectory.points) < 2:
-            self._publish_status("failure", "No completed RRT trajectory is available to reverse")
-            return
-        try:
-            reversed_trajectory = self._reverse_trajectory(trajectory)
-            self.active_trajectory = np.asarray(
-                [point.positions for point in reversed_trajectory.points], dtype=float
-            )
-            self.active_trajectory_message = reversed_trajectory
-            self.safety_stop_sent = False
-            self.executing = True
-            self.trajectory_pub.publish(reversed_trajectory)
-            self._publish_status(
-                "executing",
-                "Replaying completed RRT trajectory in reverse",
-                points=len(reversed_trajectory.points),
-            )
-        except Exception as exc:
-            self.get_logger().error(f"Could not reverse RRT trajectory: {exc}")
-            self._publish_status("failure", f"Could not reverse RRT trajectory: {exc}")
+        """Keep the old debug trigger visible without bypassing ownership.
+
+        A reverse move needs its own recoverable action so its lease, completion,
+        and cancellation are correlated like every other arm motion.  Until that
+        action exists, rejecting this legacy trigger is safer than publishing an
+        unowned trajectory.
+        """
+        self._publish_status(
+            "failure",
+            "Legacy reverse is disabled by central command ownership; use a recovery action",
+        )
 
     @staticmethod
     def _reverse_trajectory(trajectory: JointTrajectory) -> JointTrajectory:
@@ -369,6 +556,9 @@ class RRTPlannerNode(Node):
         return np.concatenate([arm, [finger1, finger2]])
 
     def _pose_callback(self, pose: Pose) -> None:
+        self.get_logger().warning("Rejected legacy /rrt/pose_command; use /rrt/execute_pose action")
+        return
+        # Legacy implementation retained below for source-history readability.
         try:
             if self.executing:
                 self._publish_status("failure", "Planner is busy executing another trajectory")
@@ -383,7 +573,7 @@ class RRTPlannerNode(Node):
             self._publish_status("planning", "Planning collision-free RRT trajectory")
             if self._target_already_reached(pose):
                 self._publish_status("success", "EEF target is already reached")
-                self.completion_pub.publish(Bool(data=True))
+                self.trajectory_complete_pub.publish(Bool(data=True))
                 return
             trajectory = self._plan(pose)
         except Exception as exc:
@@ -400,7 +590,10 @@ class RRTPlannerNode(Node):
         self.active_trajectory_message = trajectory
         self.safety_stop_sent = False
         self.executing = True
-        self.trajectory_pub.publish(trajectory)
+        tagged = TaggedJointTrajectory()
+        tagged.execution_id = self._active_execution_id or f"legacy-{uuid.uuid4().hex}"
+        tagged.trajectory = trajectory
+        self.trajectory_pub.publish(tagged)
         self._publish_status(
             "executing",
             "Validated RRT trajectory published",
@@ -583,10 +776,15 @@ class RRTPlannerNode(Node):
 
     def _stop_with_hold(self, q: np.ndarray, reason: str) -> None:
         self._publish_hold(q)
+        if self._active_execution_id:
+            self.controller_cancel_pub.publish(String(data=self._active_execution_id))
         self.safety_stop_sent = True
         self.executing = False
         self.active_trajectory = None
         self.active_trajectory_message = None
+        self._action_result_state = "safety_interrupted"
+        self._action_result_reason = reason
+        self._action_done.set()
         self._publish_status("failure", f"Runtime safety stop: {reason}")
 
     def _publish_hold(self, q: np.ndarray) -> None:
@@ -609,7 +807,12 @@ def main() -> int:
     node = None
     try:
         node = RRTPlannerNode()
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor(num_threads=4)
+        executor.add_node(node)
+        try:
+            executor.spin()
+        finally:
+            executor.shutdown()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:

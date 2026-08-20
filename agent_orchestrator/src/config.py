@@ -115,8 +115,10 @@ MANIPULATION_GRIPPER_CLOSE_COMMAND = 0.0
 MANIPULATION_GRIPPER_OPEN_STATE_M = 0.04
 MANIPULATION_GRIPPER_CLOSE_STATE_M = 0.0
 MANIPULATION_GRIPPER_CLOSE_ACCEPTANCE_M = 0.035
+MANIPULATION_GRIPPER_GRASP_MIN_OPENING_M = 0.005
 MANIPULATION_GRIPPER_TOLERANCE_M  = 0.005
 MANIPULATION_GRIPPER_TIMEOUT_SEC  = 5.0
+MANIPULATION_GRIPPER_MIN_SETTLE_SEC = 4.0
 MANIPULATION_GRIPPER_HANDOFF_DELAY_SEC = 0.15
 
 # --- Cartesian EEF settings ---
@@ -252,8 +254,10 @@ class ManipulationConfig:
     gripper_open_state_m: float
     gripper_close_state_m: float
     gripper_close_acceptance_m: float
+    gripper_grasp_min_opening_m: float
     gripper_tolerance_m: float
     gripper_timeout_sec: float
+    gripper_min_settle_sec: float
     gripper_handoff_delay_sec: float
 
 
@@ -550,8 +554,10 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             gripper_open_state_m=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_OPEN_STATE_M", MANIPULATION_GRIPPER_OPEN_STATE_M),
             gripper_close_state_m=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_CLOSE_STATE_M", MANIPULATION_GRIPPER_CLOSE_STATE_M),
             gripper_close_acceptance_m=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_CLOSE_ACCEPTANCE_M", MANIPULATION_GRIPPER_CLOSE_ACCEPTANCE_M),
+            gripper_grasp_min_opening_m=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_GRASP_MIN_OPENING_M", MANIPULATION_GRIPPER_GRASP_MIN_OPENING_M),
             gripper_tolerance_m=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_TOLERANCE_M", MANIPULATION_GRIPPER_TOLERANCE_M),
             gripper_timeout_sec=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_TIMEOUT_SEC", MANIPULATION_GRIPPER_TIMEOUT_SEC),
+            gripper_min_settle_sec=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_MIN_SETTLE_SEC", MANIPULATION_GRIPPER_MIN_SETTLE_SEC),
             gripper_handoff_delay_sec=_env_float(source, "YOLO_VLM_MANIPULATION_GRIPPER_HANDOFF_DELAY_SEC", MANIPULATION_GRIPPER_HANDOFF_DELAY_SEC),
         ),
         paths=PathConfig(
@@ -948,10 +954,17 @@ def validate_runtime_config(
         ("manipulation post-action lift", config.manipulation.post_action_lift_m),
         ("manipulation gripper tolerance", config.manipulation.gripper_tolerance_m),
         ("manipulation gripper timeout", config.manipulation.gripper_timeout_sec),
+        ("manipulation gripper minimum settle time", config.manipulation.gripper_min_settle_sec),
         ("manipulation gripper handoff delay", config.manipulation.gripper_handoff_delay_sec),
     ):
         if not math.isfinite(value) or value <= 0:
             errors.append(f"{label} must be finite and positive, got {value}")
+    if config.manipulation.gripper_timeout_sec < config.manipulation.gripper_min_settle_sec:
+        errors.append(
+            "manipulation gripper timeout must be at least the minimum settle time "
+            f"({config.manipulation.gripper_timeout_sec} < "
+            f"{config.manipulation.gripper_min_settle_sec})"
+        )
     for label, value in (
         ("manipulation grasp Z offset", config.manipulation.grasp_z_offset_m),
         ("manipulation minimum pick descend Z", config.manipulation.min_pick_descend_z_m),
@@ -965,6 +978,7 @@ def validate_runtime_config(
         ("manipulation gripper open state", config.manipulation.gripper_open_state_m),
         ("manipulation gripper close state", config.manipulation.gripper_close_state_m),
         ("manipulation gripper close acceptance", config.manipulation.gripper_close_acceptance_m),
+        ("manipulation gripper grasp minimum opening", config.manipulation.gripper_grasp_min_opening_m),
     ):
         if not math.isfinite(value):
             errors.append(f"{label} must be finite, got {value}")
@@ -975,7 +989,7 @@ def validate_runtime_config(
         )
     if not 0 <= config.manipulation.gripper_close_command <= config.manipulation.gripper_open_command <= 0.08:
         errors.append("manipulation gripper commands must be ordered within [0, 0.08] metres")
-    if not 0 <= config.manipulation.gripper_close_state_m <= config.manipulation.gripper_close_acceptance_m <= config.manipulation.gripper_open_state_m:
+    if not 0 <= config.manipulation.gripper_close_state_m < config.manipulation.gripper_grasp_min_opening_m <= config.manipulation.gripper_close_acceptance_m <= config.manipulation.gripper_open_state_m:
         errors.append("gripper close acceptance must be between closed and open feedback states")
 
     if not errors and config.yolo.checkpoint_path.is_file():

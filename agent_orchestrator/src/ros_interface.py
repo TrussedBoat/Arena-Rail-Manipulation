@@ -14,11 +14,12 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, JointState
 from std_srvs.srv import Trigger
-from std_msgs.msg import Bool, Empty, Float64, String
+from std_msgs.msg import Bool, Float64, String
 import tf2_ros
 from geometry_msgs.msg import Pose
-from interface.action import FindObject
+from interface.action import DirectJointCommand, ExecuteRrtPose, ExecuteVerticalMotion, FindObject
 from interface.msg import DetectedObjectArray
+from interface.srv import SearchSemanticObjects
 from scipy.spatial.transform import Rotation
 
 _shared_node = None
@@ -26,6 +27,7 @@ VLM_CAMERA_MAX_SIDE_PX = 256
 GRIPPER_COMMAND_CLOSED = 0.0
 GRIPPER_COMMAND_OPEN = 0.04
 GRIPPER_COMMAND_MAX = 0.08
+GRIPPER_JOINT = 'panda_finger_joint1'
 
 def get_shared_node():
     global _shared_node
@@ -42,19 +44,24 @@ class RobotHardwareInterface(Node):
         self.image_sub = self.create_subscription(Image, '/sim/rail_franka1/cam/wrist/color/image_raw', self.image_callback, 10)
         self.depth_sub = self.create_subscription(Image, '/sim/rail_franka1/cam/wrist/depth/image_raw', self.depth_callback, 10)
         self.rail_subscriber = self.create_subscription(JointState, '/sim/rail_franka1/joint_states', self.rail_state_callback, 10)
-        self.rail_publisher = self.create_publisher(JointState, '/direct_joint_command', 10)
-        self.gripper_publisher = self.create_publisher(Float64, '/gripper/command', 10)
         self.gripper_state_sub = self.create_subscription(
             Float64, '/gripper_state', self.gripper_state_callback, 10
         )
-        self.pose_publisher = self.create_publisher(Pose, '/rrt/pose_command', 10)
-        self.rrt_cancel_publisher = self.create_publisher(Empty, '/rrt/cancel', 10)
-        self.rrt_reverse_publisher = self.create_publisher(Empty, '/rrt/reverse_last_trajectory', 10)
-        self.controller_state_sub = self.create_subscription(
-            Bool, '/panda/controller_state', self.controller_state_callback, 10
+        self.direct_command_client = ActionClient(self, DirectJointCommand, '/bridge/direct_joint_command')
+        self.rrt_pose_client = ActionClient(self, ExecuteRrtPose, '/rrt/execute_pose')
+        self.vertical_motion_client = ActionClient(
+            self, ExecuteVerticalMotion, '/panda/execute_vertical_motion'
+        )
+        controller_ready_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.controller_ready_sub = self.create_subscription(
-            Bool, '/panda/controller_ready', self.controller_ready_callback, 10
+            Bool,
+            '/panda/controller_ready',
+            self.controller_ready_callback,
+            controller_ready_qos,
         )
         direct_control_qos = QoSProfile(
             depth=1,
@@ -82,6 +89,9 @@ class RobotHardwareInterface(Node):
             DetectedObjectArray, '/semantic/objects', self.semantic_objects_callback, semantic_qos
         )
         self.semantic_find_client = ActionClient(self, FindObject, '/semantic/find_object')
+        self.semantic_text_search_client = self.create_client(
+            SearchSemanticObjects, '/semantic/search_objects'
+        )
 
         self.grasp_srv = self.create_service(Trigger, '/vlm_grasp_completed', self.grasp_callback)
         self.place_srv = self.create_service(Trigger, '/vlm_place_completed', self.place_callback)
@@ -103,10 +113,17 @@ class RobotHardwareInterface(Node):
         self.direct_joint_control_active = False
         self._cartesian_completion = threading.Event()
         self._cartesian_failure = None
+        self._active_cartesian_source = None
+        self._rrt_action_lock = threading.RLock()
+        self._rrt_action_generation = 0
         self._rrt_status_event = threading.Event()
         self._rrt_status_state = None
         self._rrt_status_message = None
+        self._rrt_diagnostic_state = None
+        self._rrt_diagnostic_message = None
         self._rrt_ready_at = None
+        self._active_rrt_goal = None
+        self._active_rrt_result_future = None
         self._semantic_lock = threading.RLock()
         self._semantic_objects = {}
         self._semantic_objects_received = False
@@ -122,12 +139,6 @@ class RobotHardwareInterface(Node):
     def controller_ready_callback(self, msg):
         self.cartesian_controller_ready = bool(msg.data)
 
-    def controller_state_callback(self, msg):
-        # This is a one-shot completion notification from the Panda controller,
-        # not an ownership state.  Ownership is tracked from /rrt/status so a
-        # delayed completion pulse cannot re-lock the gripper after success.
-        del msg
-
     def gripper_state_callback(self, msg):
         value = float(msg.data)
         if math.isfinite(value):
@@ -142,21 +153,11 @@ class RobotHardwareInterface(Node):
         except (TypeError, ValueError, json.JSONDecodeError):
             return
         state = str(status.get('state', ''))
-        self._rrt_status_state = state
-        self._rrt_status_message = str(status.get('message', ''))
-        self._rrt_status_event.set()
-        if state in {'success', 'cancelled'}:
-            # /panda/controller_state is a completion pulse, not a persistent
-            # ownership signal.  RRT's terminal status is the authoritative
-            # indication that its Cartesian command stream is no longer active.
-            self.cartesian_control_active = False
-        if state == 'failure':
-            self._cartesian_failure = str(status.get('message', 'RRT planning failed'))
-            self._cartesian_completion.set()
-        elif state == 'success':
-            self._cartesian_completion.set()
-        elif state == 'cancelled':
-            self._cartesian_completion.set()
+        self._rrt_diagnostic_state = state
+        self._rrt_diagnostic_message = str(status.get('message', ''))
+        # Status is diagnostic only.  The ExecuteRrtPose result is correlated
+        # to one goal; using a generic status topic here could complete a newer
+        # goal from an older trajectory's terminal status.
 
     def rrt_ready_callback(self, msg):
         if msg.data:
@@ -226,6 +227,32 @@ class RobotHardwareInterface(Node):
             item = self._semantic_objects.get(str(object_id))
             return copy.deepcopy(item) if item is not None else None
 
+    def search_semantic_objects(
+        self,
+        query: str,
+        *,
+        timeout_sec: float = 5.0,
+        max_results: int = 0,
+        minimum_cosine_similarity: float = -1.0,
+    ):
+        """Request ranked text-to-object matches from semantic perception."""
+        if not self.semantic_text_search_client.wait_for_service(timeout_sec=timeout_sec):
+            raise TimeoutError("Semantic text-search service /semantic/search_objects is unavailable")
+        request = SearchSemanticObjects.Request()
+        request.query = str(query)
+        request.max_results = max(0, int(max_results))
+        request.minimum_cosine_similarity = float(minimum_cosine_similarity)
+        future = self.semantic_text_search_client.call_async(request)
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            raise TimeoutError("Timed out waiting for semantic text-search response")
+        exception = future.exception()
+        if exception is not None:
+            raise RuntimeError(f"Semantic text-search request failed: {exception}")
+        return future.result()
+
     def cancel_semantic_find_object(self):
         with self._semantic_lock:
             handle = self._semantic_goal_handle
@@ -233,17 +260,88 @@ class RobotHardwareInterface(Node):
             handle.cancel_goal_async()
 
     def wait_for_cartesian_controller(self, timeout_sec: float = 5.0) -> bool:
-        deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline:
-            if (
-                self._rrt_ready_at is not None
-                and time.monotonic() - self._rrt_ready_at <= 2.5
-                and self.pose_publisher.get_subscription_count() > 0
-                and not self.direct_joint_control_active
-            ):
-                return True
-            time.sleep(0.05)
-        return False
+        return self.rrt_pose_client.wait_for_server(timeout_sec=timeout_sec)
+
+    def wait_for_direct_cartesian_controller(self, timeout_sec: float = 5.0) -> bool:
+        """Require the feedbacked, vertical-only controller action."""
+        return self.vertical_motion_client.wait_for_server(timeout_sec=timeout_sec)
+
+    @staticmethod
+    def _wait_future(future, timeout_sec: float):
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return future.result() if future.done() else None
+
+    def _direct_action_once(
+        self, resource: str, joint_names: list[str], positions: list[float],
+        velocities: list[float] | None = None, completion_policy: str = 'target_tolerance',
+        timeout_sec: float = 12.0,
+    ):
+        if not self.direct_command_client.wait_for_server(timeout_sec=min(5.0, timeout_sec)):
+            raise RuntimeError('Bridge direct-command action is unavailable')
+        goal = DirectJointCommand.Goal()
+        goal.resource = resource
+        goal.joint_names = list(joint_names)
+        goal.positions = [float(value) for value in positions]
+        goal.velocities = [] if velocities is None else [float(value) for value in velocities]
+        goal.completion_policy = completion_policy
+        goal_handle = self._wait_future(self.direct_command_client.send_goal_async(goal), 3.0)
+        if goal_handle is None:
+            raise RuntimeError(f'Direct {resource} command acknowledgement timed out')
+        if not goal_handle.accepted:
+            raise RuntimeError(f'Direct {resource} command was rejected')
+        wrapped = self._wait_future(goal_handle.get_result_async(), timeout_sec)
+        if wrapped is None:
+            goal_handle.cancel_goal_async()
+            raise RuntimeError(f'Direct {resource} command result timed out')
+        return wrapped.result
+
+    def _direct_action(
+        self, resource: str, joint_names: list[str], positions: list[float],
+        velocities: list[float] | None = None, completion_policy: str = 'target_tolerance',
+        timeout_sec: float | None = None,
+    ):
+        """Send one acknowledged direct action, retrying only brief arm-lease races."""
+        if timeout_sec is None:
+            timeout_sec = 35.0 if resource == 'rail' else 12.0
+        attempts = 5 if resource == 'arm' else 1
+        result = None
+        for attempt in range(attempts):
+            result = self._direct_action_once(
+                resource, joint_names, positions, velocities, completion_policy, timeout_sec
+            )
+            if result.state != 'blocked_by_cartesian' or attempt + 1 >= attempts:
+                return result
+            time.sleep(0.5)
+        return result
+
+    def _rrt_result_callback(self, future, generation: int) -> None:
+        try:
+            result = future.result().result
+            with self._rrt_action_lock:
+                if generation != self._rrt_action_generation:
+                    self.get_logger().debug(
+                        f'Ignoring terminal result from superseded RRT action generation {generation}',
+                    )
+                    return
+                self._rrt_status_state = str(result.state)
+                self._rrt_status_message = str(result.reason)
+                if not result.success and str(result.state) != 'cancelled':
+                    self._cartesian_failure = str(result.reason) or str(result.state)
+                self.cartesian_control_active = False
+                self._cartesian_completion.set()
+                self._rrt_status_event.set()
+        except Exception as exc:
+            with self._rrt_action_lock:
+                if generation != self._rrt_action_generation:
+                    return
+                self._rrt_status_state = 'failed'
+                self._rrt_status_message = str(exc)
+                self._cartesian_failure = str(exc)
+                self.cartesian_control_active = False
+                self._cartesian_completion.set()
+                self._rrt_status_event.set()
 
     def send_eef_pose(
         self,
@@ -260,12 +358,7 @@ class RobotHardwareInterface(Node):
         eef_frame: str = 'eef',
     ) -> bool:
         self.begin_eef_pose(
-            x,
-            y,
-            z,
-            roll,
-            pitch,
-            yaw,
+            x, y, z, roll, pitch, yaw,
             readiness_timeout_sec=readiness_timeout_sec,
             tf_timeout_sec=tf_timeout_sec,
             base_frame=base_frame,
@@ -274,7 +367,7 @@ class RobotHardwareInterface(Node):
         completed = self._cartesian_completion.wait(timeout=max(0.0, timeout_sec))
         if self._cartesian_failure is not None:
             raise RuntimeError(self._cartesian_failure)
-        return completed and self._rrt_status_state == 'success'
+        return completed and self._rrt_status_state == 'reached'
 
     def begin_eef_pose(
         self,
@@ -294,7 +387,7 @@ class RobotHardwareInterface(Node):
         if not all(math.isfinite(float(value)) for value in values):
             raise ValueError("EEF pose values must all be finite numbers")
         if not self.wait_for_cartesian_controller(readiness_timeout_sec):
-            raise RuntimeError("RRT planner is not healthy or subscribed to /rrt/pose_command")
+            raise RuntimeError('RRT execute-pose action is unavailable')
 
         # The home_robotics controller interprets Pose relative to panda_link0.
         quaternion = Rotation.from_euler('xyz', [roll, pitch, yaw]).as_quat()
@@ -306,24 +399,94 @@ class RobotHardwareInterface(Node):
         # Validate that the controller's feedback transform exists before actuating.
         self.get_transform_matrix(base_frame, eef_frame, timeout_sec=tf_timeout_sec)
 
-        msg = Pose()
-        msg.position.x, msg.position.y, msg.position.z = map(float, (x, y, z))
-        msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = map(
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = map(float, (x, y, z))
+        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = map(
             float, quaternion
         )
 
-        self._cartesian_completion.clear()
-        self._cartesian_failure = None
-        self._rrt_status_event.clear()
-        self._rrt_status_state = None
-        self._rrt_status_message = None
-        self.cartesian_control_active = True
-        self.pose_publisher.publish(msg)
+        goal = ExecuteRrtPose.Goal()
+        goal.target_pose = pose
+        # A just-finished direct-arm goal may still be releasing the bridge
+        # lease. Retry only the fast, explicitly reported ownership race.
+        for attempt in range(3):
+            with self._rrt_action_lock:
+                self._rrt_action_generation += 1
+                generation = self._rrt_action_generation
+                self._cartesian_completion.clear()
+                self._cartesian_failure = None
+                self._rrt_status_event.clear()
+                self._rrt_status_state = None
+                self._rrt_status_message = None
+                self._active_cartesian_source = 'rrt'
+                self.cartesian_control_active = True
+            goal_handle = self._wait_future(self.rrt_pose_client.send_goal_async(goal), 3.0)
+            if goal_handle is None or not goal_handle.accepted:
+                self.cartesian_control_active = False
+                raise RuntimeError('RRT execute-pose action did not acknowledge the goal')
+            with self._rrt_action_lock:
+                self._active_rrt_goal = goal_handle
+                self._active_rrt_result_future = goal_handle.get_result_async()
+                self._active_rrt_result_future.add_done_callback(
+                    lambda future, action_generation=generation: self._rrt_result_callback(
+                        future, action_generation
+                    )
+                )
+            # Lease denial happens before planning and returns immediately.
+            if not self._cartesian_completion.wait(timeout=0.08):
+                break
+            if self._rrt_status_state != 'blocked_by_direct_action' or attempt == 2:
+                break
+            time.sleep(0.25)
         self.get_logger().info(
-            f"Published EEF pose in {base_frame}: "
+            f"Submitted RRT EEF pose in {base_frame}: "
             f"xyz=({x:.4f}, {y:.4f}, {z:.4f}), "
             f"rpy=({roll:.4f}, {pitch:.4f}, {yaw:.4f})"
         )
+
+    def send_direct_cartesian_pose(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        roll: float,
+        pitch: float,
+        yaw: float,
+        timeout_sec: float = 30.0,
+        readiness_timeout_sec: float = 5.0,
+        tf_timeout_sec: float = 3.0,
+        base_frame: str = 'panda_link0',
+        eef_frame: str = 'eef',
+    ) -> bool:
+        """Execute a feedbacked vertical-only descend/ascend action."""
+        values = (x, y, z, roll, pitch, yaw)
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("Direct Cartesian pose values must all be finite numbers")
+        if not self.wait_for_direct_cartesian_controller(readiness_timeout_sec):
+            raise RuntimeError(
+                'Direct vertical controller action is unavailable'
+            )
+        # Verify the current feedback transform.  The vertical action retains
+        # measured XY/RPY, so the requested RPY is intentionally not applied.
+        self.get_transform_matrix(base_frame, eef_frame, timeout_sec=tf_timeout_sec)
+        for attempt in range(3):
+            goal = ExecuteVerticalMotion.Goal()
+            goal.target_z = float(z)
+            goal_handle = self._wait_future(self.vertical_motion_client.send_goal_async(goal), 3.0)
+            if goal_handle is None or not goal_handle.accepted:
+                raise RuntimeError('Direct vertical action did not acknowledge the goal')
+            wrapped = self._wait_future(goal_handle.get_result_async(), timeout_sec)
+            if wrapped is None:
+                goal_handle.cancel_goal_async()
+                raise RuntimeError(f'Direct vertical motion result timed out (target_z={z:.4f}m)')
+            result = wrapped.result
+            if result.success:
+                return True
+            if str(result.state) in {'blocked_by_arm_owner', 'controller_busy'} and attempt < 2:
+                time.sleep(0.25)
+                continue
+            raise RuntimeError(f'Direct vertical motion {result.state}: {result.reason}')
+        return False
 
     def eef_motion_done(self) -> bool:
         return self._cartesian_completion.is_set()
@@ -332,13 +495,18 @@ class RobotHardwareInterface(Node):
         completed = self._cartesian_completion.wait(timeout=max(0.0, timeout_sec))
         if self._cartesian_failure is not None:
             raise RuntimeError(self._cartesian_failure)
-        return completed and self._rrt_status_state == 'success'
+        # ExecuteRrtPose uses ``reached`` as its terminal success state.
+        # ``success`` is retained only for compatibility with old diagnostic
+        # status publishers; treating it as the sole success value made every
+        # asynchronously executed scan viewpoint look like an early failure.
+        return completed and self._rrt_status_state in {'reached', 'success'}
 
     def cancel_eef_motion(self, timeout_sec: float = 3.0) -> bool:
+        handle = self._active_rrt_goal
+        if handle is None:
+            return not self.rrt_motion_active()
         self._rrt_status_event.clear()
-        self._rrt_status_state = None
-        self._rrt_status_message = None
-        self.rrt_cancel_publisher.publish(Empty())
+        handle.cancel_goal_async()
         deadline = time.monotonic() + max(0.0, timeout_sec)
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
@@ -351,21 +519,12 @@ class RobotHardwareInterface(Node):
         return False
 
     def reverse_last_eef_motion(self, timeout_sec: float) -> bool:
-        """Replay the most recently completed RRT trajectory in reverse."""
-        if not self.wait_for_cartesian_controller(timeout_sec=min(5.0, timeout_sec)):
-            raise RuntimeError("RRT planner is not ready for reverse trajectory replay")
-        self._cartesian_completion.clear()
-        self._cartesian_failure = None
-        self._rrt_status_event.clear()
-        self._rrt_status_state = None
-        self._rrt_status_message = None
-        self.cartesian_control_active = True
-        self.rrt_reverse_publisher.publish(Empty())
-        return self.wait_for_eef_motion(timeout_sec)
+        raise RuntimeError('Reverse RRT replay is disabled until it has a leased recovery action')
 
     def rrt_motion_active(self) -> bool:
-        """Whether the latest planner status still owns a Cartesian trajectory."""
-        return self._rrt_status_state in {"planning", "executing"}
+        """Whether the current, correlated RRT action still owns the arm."""
+        with self._rrt_action_lock:
+            return bool(self.cartesian_control_active)
 
     def ensure_rrt_idle(self, timeout_sec: float = 3.0) -> bool:
         """Cancel a previous Cartesian trajectory before direct motion/new RRT work."""
@@ -497,42 +656,37 @@ class RobotHardwareInterface(Node):
                 pass
 
     def send_absolute_rail_command(self, absolute_value: float, speed: float = None):
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = ['rail_j1']
-        msg.position = [float(absolute_value)]
-        if speed is not None:
-            msg.velocity = [float(speed)]
-        self.rail_publisher.publish(msg)
-        self.get_logger().info(f"Published Absolute JointState for rail_j1: {absolute_value}m")
+        result = self._direct_action(
+            'rail', ['rail_j1'], [float(absolute_value)],
+            None if speed is None else [float(speed)],
+        )
+        if not result.success:
+            raise RuntimeError(f'Rail command {result.state}: {result.reason}')
+        self.get_logger().info(f"Rail action reached rail_j1={absolute_value}m")
+        return result
         
     def send_rail_and_joint6_command(self, rail_val: float, rail_speed: float, j6_val: float, j6_speed: float):
-        self._ensure_direct_arm_control_allowed()
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = ['rail_j1', 'panda_joint6']
-        msg.position = [float(rail_val), float(j6_val)]
-        msg.velocity = [float(rail_speed), float(j6_speed)]
-        self.rail_publisher.publish(msg)
-        self.get_logger().info(f"Published JointState for rail_j1={rail_val}m and panda_joint6={j6_val}rad")
+        rail = self._direct_action('rail', ['rail_j1'], [float(rail_val)], [float(rail_speed)])
+        if not rail.success:
+            raise RuntimeError(f'Rail command {rail.state}: {rail.reason}')
+        arm = self._direct_action('arm', ['panda_joint6'], [float(j6_val)], [float(j6_speed)])
+        if not arm.success:
+            raise RuntimeError(f'Arm command {arm.state}: {arm.reason}')
+        return rail, arm
 
     def send_panda_joint1_command(self, target_rad: float):
-        self._ensure_direct_arm_control_allowed()
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = ['panda_joint1']
-        msg.position = [float(target_rad)]
-        self.rail_publisher.publish(msg)
-        self.get_logger().info(f"Published JointState for panda_joint1: {target_rad}rad")
+        result = self._direct_action('arm', ['panda_joint1'], [float(target_rad)])
+        if not result.success:
+            raise RuntimeError(f'Arm command {result.state}: {result.reason}')
+        return result
 
     def send_panda_search_posture(self, j1: float, j2: float, j3: float, j4: float, j5: float, j6: float, j7: float):
-        self._ensure_direct_arm_control_allowed()
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
-        msg.position = [float(j1), float(j2), float(j3), float(j4), float(j5), float(j6), float(j7)]
-        self.rail_publisher.publish(msg)
-        self.get_logger().info("Published JointState for full arm search posture.")
+        names = [f'panda_joint{index}' for index in range(1, 8)]
+        result = self._direct_action('arm', names, [j1, j2, j3, j4, j5, j6, j7])
+        if not result.success:
+            raise RuntimeError(f'Arm posture {result.state}: {result.reason}')
+        self.get_logger().info('Arm posture action reached target.')
+        return result
 
     def set_gripper_command(self, opening_command: float) -> None:
         """Command the gripper opening through the independent direct interface.
@@ -549,14 +703,12 @@ class RobotHardwareInterface(Node):
                 "Gripper command must be within "
                 f"[{GRIPPER_COMMAND_CLOSED:g}, {GRIPPER_COMMAND_MAX:g}] metres, got {command:g}"
             )
-        if self.cartesian_control_active:
-            raise RuntimeError(
-                "Cannot command gripper while an RRT Cartesian trajectory owns the Panda"
-            )
-        msg = Float64()
-        msg.data = command
-        self.gripper_publisher.publish(msg)
-        self.get_logger().info(f"Published gripper command: opening={msg.data:.1f}")
+        policy = 'grasp_range' if command <= GRIPPER_COMMAND_CLOSED + 1e-6 else 'target_tolerance'
+        result = self._direct_action('gripper', [GRIPPER_JOINT], [command], completion_policy=policy)
+        if not result.success:
+            raise RuntimeError(f'Gripper command {result.state}: {result.reason}')
+        self.get_logger().info(f'Gripper action reached opening={command:.3f}m')
+        return result
 
     def open_gripper(self, opening_command: float = GRIPPER_COMMAND_OPEN) -> None:
         self.set_gripper_command(opening_command)
@@ -579,15 +731,13 @@ class RobotHardwareInterface(Node):
         return False
 
     def send_panda_joint6_command(self, target_rad: float, speed: float = None):
-        self._ensure_direct_arm_control_allowed()
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = ['panda_joint6']
-        msg.position = [float(target_rad)]
-        if speed is not None:
-            msg.velocity = [float(speed)]
-        self.rail_publisher.publish(msg)
-        self.get_logger().info(f"Published JointState for panda_joint6: {target_rad}rad")
+        result = self._direct_action(
+            'arm', ['panda_joint6'], [float(target_rad)],
+            None if speed is None else [float(speed)],
+        )
+        if not result.success:
+            raise RuntimeError(f'Arm command {result.state}: {result.reason}')
+        return result
 
 def wait_for_joint_target(node: RobotHardwareInterface, joint_name: str, target_value: float, tolerance=0.02, timeout=20.0) -> bool:
     start = time.time()

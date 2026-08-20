@@ -60,7 +60,10 @@ if [ ! -f "$RRT_MODEL_ROOT/panda.urdf" ] || [ ! -f "$RRT_MODEL_ROOT/panda.srdf" 
 fi
 
 echo "[+] Starting Bridge Node in background..."
-python3 scripts/rail_bridge.py &
+python3 scripts/rail_bridge.py --ros-args \
+    -p rail_damping_time_constant_sec:="${ARENA_RAIL_DAMPING_TAU_SEC:-0.18}" \
+    -p rail_damping_max_speed_mps:="${ARENA_RAIL_DAMPING_MAX_SPEED_MPS:-0.35}" \
+    -p rail_command_timeout_sec:="${ARENA_RAIL_COMMAND_TIMEOUT_SEC:-30.0}" &
 BRIDGE_PID=$!
 
 echo "[+] Starting RRT motion planner in background..."
@@ -76,10 +79,11 @@ rrt_supervisor() {
             -p singularity_stop:="${ARENA_RRT_SINGULARITY_STOP:-0.045}" \
             -p eef_min_z_m:="${ARENA_RRT_EEF_MIN_Z_M:-0.08}" \
             -p model_root:="$RRT_MODEL_ROOT" \
-            -p pose_cmd_topic:=/rrt/pose_command \
             -p joint_states_topic:=/joint_states \
-            -p trajectory_topic:=/rrt/joint_trajectory \
-            -p controller_state_topic:=/panda/controller_state \
+            -p trajectory_topic:=/rrt/tagged_joint_trajectory \
+            -p controller_execution_status_topic:=/panda/controller_execution_status \
+            -p controller_cancel_topic:=/panda/cancel_execution \
+            -p trajectory_complete_topic:=/panda/trajectory_complete \
             -p hold_topic:=/rrt/hold_command &
         planner_pid=$!
         if wait "$planner_pid"; then
@@ -96,13 +100,17 @@ RRT_PID=$!
 
 echo "[+] Starting Cartesian Panda controller in background..."
 python3 "$PANDA_CONTROLLER" --ros-args \
-    -p cartesian_pose_topic:=/panda/disabled_cartesian_pose_command \
-    -p joint_trajectory_topic:=/rrt/joint_trajectory \
+    -p joint_trajectory_topic:=/rrt/tagged_joint_trajectory \
     -p joint_state_topic:=/joint_states \
     -p joint_command_topic:=/cartesian/joint_command \
-    -p gripper_cmd_topic:=/gripper/command \
-    -p controller_state_topic:=/panda/controller_state \
-    -p controller_ready_topic:=/panda/controller_ready >> agent_ros.log 2>&1 &
+    -p trajectory_complete_topic:=/panda/trajectory_complete \
+    -p controller_execution_status_topic:=/panda/controller_execution_status \
+    -p cancel_execution_topic:=/panda/cancel_execution \
+    -p controller_ready_topic:=/panda/controller_ready \
+    -p vertical_action_timeout_sec:="${ARENA_VERTICAL_ACTION_TIMEOUT_SEC:-20.0}" \
+    -p pose_controller_max_lin_vel:="${ARENA_VERTICAL_MAX_LINEAR_VELOCITY_MPS:-0.18}" \
+    -p pose_controller_jacobian_damping:="${ARENA_VERTICAL_JACOBIAN_DAMPING:-0.035}" \
+    -p pose_controller_max_joint_velocity:="${ARENA_VERTICAL_MAX_JOINT_VELOCITY_RADPS:-1.0}" >> agent_ros.log 2>&1 &
 CARTESIAN_PID=$!
 
 cleanup() {
