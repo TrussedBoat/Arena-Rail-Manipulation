@@ -1,77 +1,313 @@
-import os
+"""Gaussian Splatting ROS 2 Node.
+
+Monitors the Ramdisk cache written by semantic_perception, compiles
+training data into a unified transforms.json, launches the 3DGS
+training subprocess, persists the resulting model, and cleans up.
+"""
+
+import json
 import glob
-import time
+import os
+import shutil
+import subprocess
 import threading
+import time
+
 import rclpy
 from rclpy.node import Node
 from std_srvs.srv import Trigger
 
-class GaussianSplattingNode(Node):
-    def __init__(self):
-        super().__init__('gaussian_splatting_node')
-        
-        self.declare_parameter('cache_dir', '/dev/shm/3dgs_cache')
-        self.cache_dir = self.get_parameter('cache_dir').value
-        
-        # Service to trigger optimization
-        self.srv = self.create_service(Trigger, '~/optimize_object', self.optimize_callback)
-        
-        # Timer to monitor the cache
-        self.timer = self.create_timer(1.0, self.monitor_cache_callback)
-        
-        self.get_logger().info(f"Gaussian Splatting Node initialized. Monitoring {self.cache_dir}")
 
-    def monitor_cache_callback(self):
-        if not os.path.exists(self.cache_dir):
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+_DEFAULT_CACHE_DIR = "/dev/shm/3dgs_cache"
+_DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Arena-RealSim-Data/3dgs_models")
+_MIN_FRAMES_FOR_TRAINING = 30
+
+
+class GaussianSplattingNode(Node):
+    """Async 3DGS training node that reads from a Ramdisk cache."""
+
+    def __init__(self):
+        super().__init__("gaussian_splatting_node")
+
+        # -- Parameters -------------------------------------------------------
+        self.declare_parameter("cache_dir", _DEFAULT_CACHE_DIR)
+        self.declare_parameter("output_dir", _DEFAULT_OUTPUT_DIR)
+        self.declare_parameter("min_frames", _MIN_FRAMES_FOR_TRAINING)
+        self.declare_parameter("training_iterations", 2000)
+        self.declare_parameter("training_command", "ns-train")  # placeholder
+
+        self.cache_dir: str = self.get_parameter("cache_dir").value
+        self.output_dir: str = self.get_parameter("output_dir").value
+        self.min_frames: int = self.get_parameter("min_frames").value
+
+        # -- State -------------------------------------------------------------
+        self._training_lock = threading.Lock()
+        self._active_trainings: dict[str, threading.Thread] = {}
+
+        # -- ROS interfaces ----------------------------------------------------
+        self.srv = self.create_service(
+            Trigger, "~/optimize_object", self.optimize_callback
+        )
+        self.timer = self.create_timer(2.0, self.monitor_cache_callback)
+
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.get_logger().info(
+            f"Gaussian Splatting Node initialized. "
+            f"Cache: {self.cache_dir} | Output: {self.output_dir}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Cache Monitor  (runs on a 2 Hz timer)
+    # -----------------------------------------------------------------------
+    def monitor_cache_callback(self) -> None:
+        """Scan the Ramdisk cache and log readiness per object."""
+        if not os.path.isdir(self.cache_dir):
             return
-            
-        for object_id in os.listdir(self.cache_dir):
+
+        for object_id in sorted(os.listdir(self.cache_dir)):
             obj_dir = os.path.join(self.cache_dir, object_id)
             if not os.path.isdir(obj_dir):
                 continue
-                
-            png_files = glob.glob(os.path.join(obj_dir, '*.png'))
-            num_frames = len(png_files)
-            
-            # For demonstration, we log if an object hits exactly 50 frames
-            if num_frames == 50:
-                self.get_logger().info(f"Object {object_id} has accumulated exactly {num_frames} views. Ready for optimization!")
 
+            num_frames = len(glob.glob(os.path.join(obj_dir, "*.png")))
+            if num_frames > 0 and num_frames % 25 == 0:
+                ready = num_frames >= self.min_frames
+                status = "READY" if ready else "accumulating"
+                self.get_logger().info(
+                    f"[Monitor] {object_id}: {num_frames} views ({status})"
+                )
+
+    # -----------------------------------------------------------------------
+    # Service  ~/optimize_object
+    # -----------------------------------------------------------------------
     def optimize_callback(self, request, response):
-        # We assume the object_id is passed in the request string or we just hardcode it for the skeleton
-        object_id = "object_001" # In a real implementation, this would be a custom service with an object_id field
-        
-        obj_dir = os.path.join(self.cache_dir, object_id)
-        if not os.path.exists(obj_dir):
+        """Trigger training for the first object that has enough frames."""
+        if not os.path.isdir(self.cache_dir):
             response.success = False
-            response.message = f"Cache directory for {object_id} not found."
+            response.message = "Cache directory does not exist."
             return response
-            
-        self.get_logger().info(f"Received request to optimize {object_id}.")
-        
-        # Start heavy training loop in background thread
-        training_thread = threading.Thread(
-            target=self._run_3dgs_training, 
-            args=(object_id,)
-        )
-        training_thread.start()
-        
+
+        # Find the first object with enough frames
+        target_id = None
+        for object_id in sorted(os.listdir(self.cache_dir)):
+            obj_dir = os.path.join(self.cache_dir, object_id)
+            if not os.path.isdir(obj_dir):
+                continue
+            num_frames = len(glob.glob(os.path.join(obj_dir, "*.png")))
+            if num_frames >= self.min_frames:
+                target_id = object_id
+                break
+
+        if target_id is None:
+            response.success = False
+            response.message = (
+                f"No object has accumulated >= {self.min_frames} frames yet."
+            )
+            return response
+
+        # Prevent double-training
+        with self._training_lock:
+            if target_id in self._active_trainings:
+                response.success = False
+                response.message = f"{target_id} is already being trained."
+                return response
+
+            thread = threading.Thread(
+                target=self._run_3dgs_training,
+                args=(target_id,),
+                daemon=True,
+            )
+            self._active_trainings[target_id] = thread
+            thread.start()
+
         response.success = True
-        response.message = f"Started background training for {object_id}."
+        response.message = f"Started background training for {target_id}."
         return response
 
-    def _run_3dgs_training(self, object_id):
-        self.get_logger().info(f"[Thread] Starting 3DGS batch optimization for {object_id}...")
-        
-        # Simulate heavy CPU/GPU load
-        time.sleep(5)
-        
-        self.get_logger().info(f"[Thread] Finished 3DGS optimization for {object_id}! Model saved to disk.")
+    # -----------------------------------------------------------------------
+    # Step 1 – Compile per-frame JSONs into a single transforms.json
+    # -----------------------------------------------------------------------
+    def _compile_transforms(self, obj_dir: str) -> str:
+        """Read individual <timestamp>.json files and merge them into
+        a single ``transforms.json`` in Nerfstudio-compatible format.
+
+        Returns the path to the written ``transforms.json``.
+        """
+        json_files = sorted(glob.glob(os.path.join(obj_dir, "*.json")))
+        # Exclude any previously written transforms.json
+        json_files = [f for f in json_files if not f.endswith("transforms.json")]
+
+        frames = []
+        for jf in json_files:
+            with open(jf, "r") as fh:
+                data = json.load(fh)
+            timestamp = os.path.splitext(os.path.basename(jf))[0]
+            png_path = os.path.join(obj_dir, f"{timestamp}.png")
+            if not os.path.isfile(png_path):
+                continue
+
+            frames.append(
+                {
+                    "file_path": png_path,
+                    "transform_matrix": data["camera_to_world"],
+                    "fl_x": data["intrinsics"]["fx"],
+                    "fl_y": data["intrinsics"]["fy"],
+                    "cx": data["intrinsics"]["cx"],
+                    "cy": data["intrinsics"]["cy"],
+                    "w": data["intrinsics"]["width"],
+                    "h": data["intrinsics"]["height"],
+                }
+            )
+
+        # Use intrinsics from the first frame as the global default
+        first = frames[0] if frames else {}
+        transforms = {
+            "fl_x": first.get("fl_x", 0.0),
+            "fl_y": first.get("fl_y", 0.0),
+            "cx": first.get("cx", 0.0),
+            "cy": first.get("cy", 0.0),
+            "w": first.get("w", 0),
+            "h": first.get("h", 0),
+            "camera_model": "PINHOLE",
+            "frames": frames,
+        }
+
+        out_path = os.path.join(obj_dir, "transforms.json")
+        with open(out_path, "w") as fh:
+            json.dump(transforms, fh, indent=2)
+
+        self.get_logger().info(
+            f"[Compile] Wrote transforms.json with {len(frames)} frames."
+        )
+        return out_path
+
+    # -----------------------------------------------------------------------
+    # Step 2 – Launch Training Subprocess
+    # -----------------------------------------------------------------------
+    def _launch_training(self, obj_dir: str, object_id: str) -> int:
+        """Launch the 3DGS training engine as a subprocess.
+
+        Returns the process exit code (0 = success).
+        """
+        iterations = self.get_parameter("training_iterations").value
+        train_cmd = self.get_parameter("training_command").value
+
+        cmd = [
+            train_cmd,
+            "splatfacto",
+            "--data", obj_dir,
+            "--max-num-iterations", str(iterations),
+            "--output-dir", os.path.join(self.output_dir, object_id),
+        ]
+
+        self.get_logger().info(f"[Train] Launching: {' '.join(cmd)}")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            # Stream stdout into the ROS logger
+            for line in iter(proc.stdout.readline, ""):
+                stripped = line.rstrip()
+                if stripped:
+                    self.get_logger().info(f"[Train] {stripped}")
+            proc.wait()
+            return proc.returncode
+        except FileNotFoundError:
+            self.get_logger().error(
+                f"[Train] Command '{train_cmd}' not found. "
+                "Is the 3DGS engine installed and on PATH?"
+            )
+            return -1
+
+    # -----------------------------------------------------------------------
+    # Step 3 – Persist Model
+    # -----------------------------------------------------------------------
+    def _persist_model(self, object_id: str) -> bool:
+        """Copy the trained .ply model out of the engine's output dir
+        into a permanent location.
+
+        Returns True if a model was found and copied.
+        """
+        engine_out = os.path.join(self.output_dir, object_id)
+        # Search recursively for .ply files produced by the engine
+        ply_files = glob.glob(os.path.join(engine_out, "**", "*.ply"), recursive=True)
+        if not ply_files:
+            self.get_logger().warning(
+                f"[Persist] No .ply model found under {engine_out}."
+            )
+            return False
+
+        # Take the most recently modified .ply
+        best = max(ply_files, key=os.path.getmtime)
+        dest = os.path.join(self.output_dir, f"{object_id}.ply")
+        shutil.copy2(best, dest)
+        self.get_logger().info(f"[Persist] Model saved to {dest}")
+        return True
+
+    # -----------------------------------------------------------------------
+    # Step 4 – Cleanup
+    # -----------------------------------------------------------------------
+    def _cleanup_cache(self, object_id: str) -> None:
+        """Remove the Ramdisk cache for this object to reclaim RAM."""
+        obj_dir = os.path.join(self.cache_dir, object_id)
+        if os.path.isdir(obj_dir):
+            shutil.rmtree(obj_dir)
+            self.get_logger().info(
+                f"[Cleanup] Removed cache for {object_id} from Ramdisk."
+            )
+
+    # -----------------------------------------------------------------------
+    # Orchestrator  (runs in background thread)
+    # -----------------------------------------------------------------------
+    def _run_3dgs_training(self, object_id: str) -> None:
+        """Full pipeline: compile ➜ train ➜ persist ➜ cleanup."""
+        obj_dir = os.path.join(self.cache_dir, object_id)
+        self.get_logger().info(
+            f"[Thread] Starting 3DGS pipeline for {object_id}..."
+        )
+
+        try:
+            # Step 1 – Compile transforms.json
+            self._compile_transforms(obj_dir)
+
+            # Step 2 – Launch training subprocess
+            exit_code = self._launch_training(obj_dir, object_id)
+            if exit_code != 0:
+                self.get_logger().error(
+                    f"[Thread] Training failed for {object_id} "
+                    f"(exit code {exit_code}). Skipping persist & cleanup."
+                )
+                return
+
+            # Step 3 – Persist the .ply model
+            self._persist_model(object_id)
+
+            # Step 4 – Cleanup Ramdisk
+            self._cleanup_cache(object_id)
+
+            self.get_logger().info(
+                f"[Thread] 3DGS pipeline completed for {object_id}!"
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f"[Thread] 3DGS pipeline crashed for {object_id}: {exc}"
+            )
+        finally:
+            with self._training_lock:
+                self._active_trainings.pop(object_id, None)
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = GaussianSplattingNode()
-    
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -80,5 +316,6 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
