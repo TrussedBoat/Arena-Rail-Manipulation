@@ -15,7 +15,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from std_srvs.srv import Trigger
+from interface.srv import OptimizeObject
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ class GaussianSplattingNode(Node):
         self.declare_parameter("cache_dir", _DEFAULT_CACHE_DIR)
         self.declare_parameter("output_dir", _DEFAULT_OUTPUT_DIR)
         self.declare_parameter("min_frames", _MIN_FRAMES_FOR_TRAINING)
-        self.declare_parameter("training_iterations", 2000)
+        self.declare_parameter("training_iterations", 30000)
         self.declare_parameter("training_command", "ns-train")  # placeholder
 
         self.cache_dir: str = self.get_parameter("cache_dir").value
@@ -49,7 +49,7 @@ class GaussianSplattingNode(Node):
 
         # -- ROS interfaces ----------------------------------------------------
         self.srv = self.create_service(
-            Trigger, "~/optimize_object", self.optimize_callback
+            OptimizeObject, "~/optimize_object", self.optimize_callback
         )
         self.timer = self.create_timer(2.0, self.monitor_cache_callback)
 
@@ -84,29 +84,42 @@ class GaussianSplattingNode(Node):
     # Service  ~/optimize_object
     # -----------------------------------------------------------------------
     def optimize_callback(self, request, response):
-        """Trigger training for the first object that has enough frames."""
+        """Trigger training for a specific object, or auto-find one if empty."""
         if not os.path.isdir(self.cache_dir):
             response.success = False
             response.message = "Cache directory does not exist."
             return response
 
-        # Find the first object with enough frames
-        target_id = None
-        for object_id in sorted(os.listdir(self.cache_dir)):
-            obj_dir = os.path.join(self.cache_dir, object_id)
-            if not os.path.isdir(obj_dir):
-                continue
-            num_frames = len(glob.glob(os.path.join(obj_dir, "*.png")))
-            if num_frames >= self.min_frames:
-                target_id = object_id
-                break
+        target_id = request.object_id.strip() if request.object_id else None
 
         if target_id is None:
-            response.success = False
-            response.message = (
-                f"No object has accumulated >= {self.min_frames} frames yet."
-            )
-            return response
+            # Auto-find the first object with enough frames
+            for object_id in sorted(os.listdir(self.cache_dir)):
+                obj_dir = os.path.join(self.cache_dir, object_id)
+                if not os.path.isdir(obj_dir):
+                    continue
+                num_frames = len(glob.glob(os.path.join(obj_dir, "*.png")))
+                if num_frames >= self.min_frames:
+                    target_id = object_id
+                    break
+
+            if target_id is None:
+                response.success = False
+                response.message = (
+                    f"No object has accumulated >= {self.min_frames} frames yet."
+                )
+                return response
+        else:
+            # Validate user-provided target_id
+            obj_dir = os.path.join(self.cache_dir, target_id)
+            if not os.path.isdir(obj_dir):
+                response.success = False
+                response.message = f"Cache directory {obj_dir} does not exist."
+                return response
+            
+            num_frames = len(glob.glob(os.path.join(obj_dir, "*.png")))
+            if num_frames < self.min_frames:
+                self.get_logger().warning(f"Object {target_id} only has {num_frames}/{self.min_frames} frames. Triggering anyway!")
 
         # Prevent double-training
         with self._training_lock:
@@ -173,15 +186,7 @@ class GaussianSplattingNode(Node):
 
             frames.append(frame)
 
-        # Use intrinsics from the first frame as the global default
-        first = frames[0] if frames else {}
         transforms = {
-            "fl_x": first.get("fl_x", 0.0),
-            "fl_y": first.get("fl_y", 0.0),
-            "cx": first.get("cx", 0.0),
-            "cy": first.get("cy", 0.0),
-            "w": first.get("w", 0),
-            "h": first.get("h", 0),
             "camera_model": "PINHOLE",
             "frames": frames,
         }
@@ -231,6 +236,10 @@ class GaussianSplattingNode(Node):
             "--data", obj_dir,
             "--max-num-iterations", str(iterations),
             "--output-dir", os.path.join(self.output_dir, object_id),
+            "--vis", "viewer+tensorboard",
+            "--viewer.quit-on-train-completion", "True",
+            "--pipeline.datamanager.cache-images", "cpu",
+            "--pipeline.datamanager.max-thread-workers", "4",
         ]
 
         self.get_logger().info(f"[Train] Launching: {' '.join(cmd)}")
@@ -248,7 +257,24 @@ class GaussianSplattingNode(Node):
                 if stripped:
                     self.get_logger().info(f"[Train] {stripped}")
             proc.wait()
-            return proc.returncode
+            if proc.returncode != 0:
+                return proc.returncode
+                
+            # After successful training, we must explicitly export the .ply model
+            engine_out = os.path.join(self.output_dir, object_id)
+            configs = glob.glob(os.path.join(engine_out, "**", "config.yml"), recursive=True)
+            if configs:
+                best_config = max(configs, key=os.path.getmtime)
+                export_cmd = [
+                    train_cmd.replace("ns-train", "ns-export"),
+                    "gaussian-splat",
+                    "--load-config", best_config,
+                    "--output-dir", engine_out
+                ]
+                self.get_logger().info(f"[Export] Launching PLY export: {' '.join(export_cmd)}")
+                subprocess.run(export_cmd, check=False)
+                
+            return 0
         except FileNotFoundError:
             self.get_logger().error(
                 f"[Train] Command '{train_cmd}' not found. "

@@ -20,4 +20,9 @@ export PYTHONPATH="$SCRIPT_DIR/gaussian_splatting_ros${PYTHONPATH:+:$PYTHONPATH}
 USE_SIM_TIME="${ARENA_USE_SIM_TIME:-true}"
 
 echo "Starting Gaussian Splatting Node..."
-python3 -m gaussian_splatting_ros.node --ros-args -p use_sim_time:="$USE_SIM_TIME" "$@"
+
+# Inject CUDA and the virtual environment into the PATH so the subprocess can find ninja and nvcc!
+export PATH="/usr/local/cuda/bin:/home/thinkstation-sim/workspace/Arena-RealSim/gaussian_splatting_ros/nerfstudio_env/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+
+python3 -m gaussian_splatting_ros.node --ros-args -p use_sim_time:="$USE_SIM_TIME" -p training_command:="ns-train" -p training_iterations:=5000 "$@"
