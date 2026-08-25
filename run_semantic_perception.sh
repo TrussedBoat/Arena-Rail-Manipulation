@@ -33,8 +33,11 @@ WRITE_LEGACY="${ARENA_WRITE_LEGACY_COORDINATES:-false}"
 USE_SIM_TIME="${ARENA_USE_SIM_TIME:-true}"
 PUBLISH_ANNOTATED_DEBUG="${ARENA_PUBLISH_ANNOTATED_DEBUG:-false}"
 CONFIRMATION_HITS="${ARENA_CONFIRMATION_HITS:-8}"
+PROCESSING_RATE_HZ="${ARENA_PROCESSING_RATE_HZ:-12.0}"
+OBJECT_POINT_VOXEL_SIZE_M="${ARENA_OBJECT_POINT_VOXEL_SIZE_M:-0.02}"
 START_RVIZ_VISUALIZER=false
 RVIZ_CONFIRMED_ONLY=false
+EXPORT_SCENE=false
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -49,6 +52,10 @@ while [ "$#" -gt 0 ]; do
         --rviz-confirmed-only)
             START_RVIZ_VISUALIZER=true
             RVIZ_CONFIRMED_ONLY=true
+            shift
+            ;;
+        --scene-export)
+            EXPORT_SCENE=true
             shift
             ;;
         *)
@@ -75,6 +82,10 @@ python3 -m semantic_perception.node --ros-args \
   -p registry.write_legacy_coordinates:="$WRITE_LEGACY" \
   -p debug.publish_annotated:="$PUBLISH_ANNOTATED_DEBUG" \
   -p filter.confirmation_hits:="$CONFIRMATION_HITS" \
+  -p processing_rate_hz:="$PROCESSING_RATE_HZ" \
   -p export.voxel_size_m:=0.05 \
   -p export.voxel_size_deg:=5.0 \
+  -p export.object_point_voxel_size_m:="$OBJECT_POINT_VOXEL_SIZE_M" \
+  -p export.maximum_sample_range_m:=3.0 \
+  -p export.scene.enabled:="$EXPORT_SCENE" \
   "$@"

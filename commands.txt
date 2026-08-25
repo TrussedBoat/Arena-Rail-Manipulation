@@ -19,7 +19,33 @@
 ./run_semantic_perception.sh
 
 # Run Semantic Perception with highly tuned parameters
-./run_semantic_perception.sh --rviz-confirmed-only --publish-debug \
+./run_semantic_perception.sh --rviz-confirmed-only --publish-debug --scene-export \
+  -p export.maximum_sample_range_m:=2.0 \
+  -p tf.fallback_to_latest:=false \
+  -p appearance.max_cosine_distance:=0.50 \
+  -p detector.confidence_threshold:=0.45 \
+  -p detector.max_bbox_area_fraction:=0.40 \
+  -p depth.maximum_m:=2.5 \
+  -p filter.confirmation_hits:=3 \
+  -p filter.confirmation_window_sec:=5.0 \
+  -p class.confirmation_probability:=0.55 \
+  -p association.mahalanobis_threshold:=11.345 \
+  -p uncertainty.extrinsic_stddev_m:=0.03 \
+  -p uncertainty.world_stddev_m:=0.05 \
+  -p uncertainty.process_noise_stddev_m:=0.01 \
+  -p detector.image_size:=384 \
+  -p processing_rate_hz:=60.0 \
+  -p diagnostics.publish:=false \
+  -p export.voxel_size_m:=0.05 \
+  -p export.voxel_size_deg:=5.0 \
+  -p debug.timing:=true \
+  -p debug.timing_log_interval_sec:=1.0 \
+  -p debug.timing_log_path:=semantic_perception_timing.log \
+  --log-level semantic_perception:=debug
+
+# Run Semantic Perception for Real
+./run_semantic_perception.sh --scene-export \
+  -p export.maximum_sample_range_m:=2.0 \
   -p tf.fallback_to_latest:=false \
   -p appearance.max_cosine_distance:=0.50 \
   -p detector.confidence_threshold:=0.45 \

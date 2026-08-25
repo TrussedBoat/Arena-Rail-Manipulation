@@ -728,7 +728,9 @@ class ObjectRegistry:
                 if item.get("stale_since")
                 else None
             ),
-            point_cloud=item.get("point_cloud", []),
+            # Point clouds are visualization-only and intentionally no longer
+            # persisted in semantic_objects.json.
+            point_cloud=[],
         )
         self._prune_class_scores(track)
         self._tracks[track.object_id] = track
@@ -822,7 +824,6 @@ class ObjectRegistry:
             "observation_count": track.observation_count,
             "first_seen": _iso_time(track.first_seen_sec),
             "last_seen": _iso_time(track.last_seen_sec),
-            "point_cloud": track.point_cloud,
             **(
                 {"stale_since": _iso_time(track.stale_since_sec)}
                 if track.stale_since_sec is not None

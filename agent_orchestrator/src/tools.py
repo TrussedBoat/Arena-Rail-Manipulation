@@ -57,6 +57,13 @@ DIRECT_ARM_POSTURE_HANDOFF_DELAY_SEC = 0.25
 MAX_MANIPULATION_RAIL_OFFSET_M = 0.25
 STARTUP_RAIL_POSITION_M = -1.1
 STARTUP_ARM_JOINTS = (0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854)
+# Fixed, high observation poses retained while the rail traverses between
+# mapping stations.  The right pose mirrors the supplied left pose across the
+# robot X-Z plane: Y and yaw change sign, while roll/pitch are unchanged.
+# Pitch is slightly more downward than the scan poses so rail travel also
+# contributes useful table/scene observations.
+MAPPING_LEFT_TRANSIT_POSE = ScanPose(0.00, 0.40, 0.40, 3.14, -1.46, 1.56)
+MAPPING_RIGHT_TRANSIT_POSE = ScanPose(0.00, -0.40, 0.40, 3.14, -1.46, -1.56)
 _yolo_detector = None
 
 
@@ -1352,8 +1359,30 @@ def _scan_mapping_desk_sides(
     return completed
 
 
+def _move_mapping_to_transit_view(
+    node: object, config: RuntimeConfig, pose: ScanPose, label: str
+) -> None:
+    """Move to one fixed safe observation pose before rail travel."""
+    print(
+        f"[MAPPING][{label.upper()}_TRANSIT] "
+        f"xyz=({pose.x:.2f}, {pose.y:.2f}, {pose.z:.2f}) "
+        f"rpy=({pose.roll:.2f}, {pose.pitch:.2f}, {pose.yaw:.2f})"
+    )
+    _execute_mapping_pose(node, pose, config)
+
+
+def _return_mapping_to_home(node: object, config: RuntimeConfig) -> None:
+    """Return rail home while retaining a left-side camera view."""
+    _move_mapping_to_transit_view(node, config, MAPPING_LEFT_TRANSIT_POSE, "left")
+    print("[MAPPING][HOME] Returning rail home while retaining left-side camera view.")
+    _command_rail_and_wait(
+        node, STARTUP_RAIL_POSITION_M, config, timeout_sec=HOME_MOTION_TIMEOUT_SEC
+    )
+    _command_default_standing_posture_and_wait(node, config)
+
+
 def general_mapping() -> dict[str, object]:
-    """Build a full semantic map from min, centre, and max rail stations."""
+    """Build a full semantic map from quarter, centre, and three-quarter rail stations."""
     completed_viewpoints = 0
     started = time.monotonic()
     node = None
@@ -1363,17 +1392,24 @@ def general_mapping() -> dict[str, object]:
         node = get_shared_node()
         if not _wait_for_search_telemetry(node):
             return _failure_result("", "Timed out waiting for rail and arm telemetry.", state="initialize")
+        rail_min = config.search.rail_min_position
+        rail_span = config.search.rail_max_position - rail_min
         stations = (
-            config.search.rail_min_position,
-            rail_centre(config.search.rail_min_position, config.search.rail_max_position),
-            config.search.rail_max_position,
+            rail_min + 0.25 * rail_span,
+            rail_min + 0.50 * rail_span,
+            rail_min + 0.75 * rail_span,
         )
         for index, station in enumerate(stations, 1):
             print(f"[MAPPING][STATION] {index}/3: moving rail to {station:.3f}m")
-            _command_default_standing_posture_and_wait(node, config)
+            if index > 1:
+                _move_mapping_to_transit_view(
+                    node, config, MAPPING_RIGHT_TRANSIT_POSE, "right"
+                )
             _command_rail_and_wait(node, station, config)
+            print("[MAPPING][POSTURE] Station reached; moving to initial pose before scan.")
+            _command_default_standing_posture_and_wait(node, config)
             completed_viewpoints += _scan_mapping_desk_sides(node, config, station)
-        _return_targeted_search_to_home(node, config)
+        _return_mapping_to_home(node, config)
         return {
             "status": "success",
             "success": True,

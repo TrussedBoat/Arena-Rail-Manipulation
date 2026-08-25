@@ -7,6 +7,7 @@ training subprocess, persists the resulting model, and cleans up.
 
 import json
 import glob
+import itertools
 import os
 import shutil
 import subprocess
@@ -16,6 +17,13 @@ import time
 import rclpy
 from rclpy.node import Node
 from interface.srv import OptimizeObject
+from .dataset import (
+    frame_metadata_paths,
+    load_json_if_available,
+    ros_optical_to_nerfstudio_camera_to_world,
+    spatial_voxel_filter,
+    write_ascii_ply,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -36,12 +44,44 @@ class GaussianSplattingNode(Node):
         self.declare_parameter("cache_dir", _DEFAULT_CACHE_DIR)
         self.declare_parameter("output_dir", _DEFAULT_OUTPUT_DIR)
         self.declare_parameter("min_frames", _MIN_FRAMES_FOR_TRAINING)
-        self.declare_parameter("training_iterations", 30000)
+        self.declare_parameter("training_iterations", 20000)
         self.declare_parameter("training_command", "ns-train")  # placeholder
+        self.declare_parameter("scene_background_voxel_size_m", 0.03)
+        self.declare_parameter("object_point_voxel_size_m", 0.01)
+        self.declare_parameter("depth_supervision.enabled", True)
+        self.declare_parameter("depth_supervision.loss_weight", 0.05)
+        self.declare_parameter("depth_supervision.warmup_steps", 500)
+        self.declare_parameter("depth_supervision.ramp_steps", 1500)
+        self.declare_parameter("depth_supervision.huber_delta_m", 0.02)
+        self.declare_parameter("depth_supervision.minimum_depth_m", 0.10)
+        self.declare_parameter("depth_supervision.maximum_depth_m", 3.0)
+        self.declare_parameter("depth_supervision.edge_threshold_m", 0.06)
+        self.declare_parameter("depth_supervision.minimum_opacity", 0.05)
 
         self.cache_dir: str = self.get_parameter("cache_dir").value
         self.output_dir: str = self.get_parameter("output_dir").value
         self.min_frames: int = self.get_parameter("min_frames").value
+        if float(self.get_parameter("scene_background_voxel_size_m").value) <= 0.0:
+            raise ValueError("scene_background_voxel_size_m must be positive")
+        if float(self.get_parameter("object_point_voxel_size_m").value) <= 0.0:
+            raise ValueError("object_point_voxel_size_m must be positive")
+        for name in (
+            "depth_supervision.loss_weight",
+            "depth_supervision.huber_delta_m",
+            "depth_supervision.minimum_depth_m",
+            "depth_supervision.maximum_depth_m",
+            "depth_supervision.edge_threshold_m",
+            "depth_supervision.minimum_opacity",
+        ):
+            if float(self.get_parameter(name).value) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
+        if float(self.get_parameter("depth_supervision.maximum_depth_m").value) <= float(
+            self.get_parameter("depth_supervision.minimum_depth_m").value
+        ):
+            raise ValueError("depth supervision maximum depth must exceed minimum depth")
+        for name in ("depth_supervision.warmup_steps", "depth_supervision.ramp_steps"):
+            if int(self.get_parameter(name).value) < 0:
+                raise ValueError(f"{name} must be non-negative")
 
         # -- State -------------------------------------------------------------
         self._training_lock = threading.Lock()
@@ -72,7 +112,7 @@ class GaussianSplattingNode(Node):
             if not os.path.isdir(obj_dir):
                 continue
 
-            num_frames = len(glob.glob(os.path.join(obj_dir, "*.png")))
+            num_frames = len(frame_metadata_paths(obj_dir))
             if num_frames > 0 and num_frames % 25 == 0:
                 ready = num_frames >= self.min_frames
                 status = "READY" if ready else "accumulating"
@@ -98,7 +138,7 @@ class GaussianSplattingNode(Node):
                 obj_dir = os.path.join(self.cache_dir, object_id)
                 if not os.path.isdir(obj_dir):
                     continue
-                num_frames = len(glob.glob(os.path.join(obj_dir, "*.png")))
+                num_frames = len(frame_metadata_paths(obj_dir))
                 if num_frames >= self.min_frames:
                     target_id = object_id
                     break
@@ -117,7 +157,7 @@ class GaussianSplattingNode(Node):
                 response.message = f"Cache directory {obj_dir} does not exist."
                 return response
             
-            num_frames = len(glob.glob(os.path.join(obj_dir, "*.png")))
+            num_frames = len(frame_metadata_paths(obj_dir))
             if num_frames < self.min_frames:
                 self.get_logger().warning(f"Object {target_id} only has {num_frames}/{self.min_frames} frames. Triggering anyway!")
 
@@ -143,79 +183,122 @@ class GaussianSplattingNode(Node):
     # -----------------------------------------------------------------------
     # Step 1 – Compile per-frame JSONs into a single transforms.json
     # -----------------------------------------------------------------------
-    def _compile_transforms(self, obj_dir: str) -> str:
+    @staticmethod
+    def _point_groups(metadata_paths: list[str]):
+        for metadata_path in metadata_paths:
+            payload = load_json_if_available(metadata_path)
+            if payload is None:
+                continue
+            points = payload.get("point_cloud", [])
+            if isinstance(points, list):
+                yield points
+
+    def _scene_object_point_groups(self):
+        """Yield dense full-crop clouds from every live non-scene cache."""
+        for object_id in sorted(os.listdir(self.cache_dir)):
+            if object_id == "scene":
+                continue
+            object_dir = os.path.join(self.cache_dir, object_id)
+            if not os.path.isdir(object_dir):
+                continue
+            yield from self._object_point_groups(object_dir)
+
+    def _object_point_groups(self, object_dir: str):
+        """Return one globally de-duplicated dense cloud for an object cache."""
+        points = spatial_voxel_filter(
+            (
+                point
+                for group in self._point_groups(frame_metadata_paths(object_dir))
+                for point in group
+            ),
+            float(self.get_parameter("object_point_voxel_size_m").value),
+        )
+        if points:
+            yield points
+
+    def _compile_transforms(self, obj_dir: str, target_id: str) -> str:
         """Read individual <timestamp>.json files and merge them into
         a single ``transforms.json`` in Nerfstudio-compatible format.
 
         Returns the path to the written ``transforms.json``.
         """
-        json_files = sorted(glob.glob(os.path.join(obj_dir, "*.json")))
-        # Exclude any previously written transforms.json
-        json_files = [f for f in json_files if not f.endswith("transforms.json")]
-
+        metadata_paths = frame_metadata_paths(obj_dir)
         frames = []
-        all_points = []
-        
-        for jf in json_files:
-            with open(jf, "r") as fh:
-                data = json.load(fh)
+        for jf in metadata_paths:
+            data = load_json_if_available(jf)
+            if data is None:
+                self.get_logger().warning(f"[Compile] Skipping unavailable metadata {jf}")
+                continue
             timestamp = os.path.splitext(os.path.basename(jf))[0]
             png_path = os.path.join(obj_dir, f"{timestamp}.png")
             if not os.path.isfile(png_path):
                 continue
-
-            frame = {
-                "file_path": png_path,
-                "transform_matrix": data["camera_to_world"],
-                "fl_x": data["intrinsics"]["fx"],
-                "fl_y": data["intrinsics"]["fy"],
-                "cx": data["intrinsics"]["cx"],
-                "cy": data["intrinsics"]["cy"],
-                "w": data["intrinsics"]["width"],
-                "h": data["intrinsics"]["height"],
-            }
+            try:
+                intrinsics = data["intrinsics"]
+                frame = {
+                    "file_path": png_path,
+                    # Cache poses are ROS optical-frame c2w matrices.  The
+                    # Nerfstudio pinhole camera emits OpenGL-frame rays, so
+                    # convert the camera basis while retaining the identical
+                    # global-origin translation and world-space seed cloud.
+                    "transform_matrix": ros_optical_to_nerfstudio_camera_to_world(
+                        data["camera_to_world"]
+                    ),
+                    "fl_x": intrinsics["fx"],
+                    "fl_y": intrinsics["fy"],
+                    "cx": intrinsics["cx"],
+                    "cy": intrinsics["cy"],
+                    "w": intrinsics["width"],
+                    "h": intrinsics["height"],
+                }
+            except (KeyError, TypeError):
+                self.get_logger().warning(f"[Compile] Skipping malformed metadata {jf}")
+                continue
 
             # Include depth map if available
             depth_path = os.path.join(obj_dir, f"{timestamp}_depth.png")
             if os.path.isfile(depth_path):
                 frame["depth_file_path"] = depth_path
 
-            # Aggregate point cloud samples
-            if "point_cloud" in data and data["point_cloud"]:
-                all_points.extend(data["point_cloud"])
-
             frames.append(frame)
+
+        if not frames:
+            raise RuntimeError(f"No complete training frames found in {obj_dir}")
 
         transforms = {
             "camera_model": "PINHOLE",
             "frames": frames,
         }
 
-        # Write PLY file if we have point clouds
-        if all_points:
-            ply_path = os.path.join(obj_dir, "points3D.ply")
-            with open(ply_path, "w") as f:
-                f.write("ply\n")
-                f.write("format ascii 1.0\n")
-                f.write(f"element vertex {len(all_points)}\n")
-                f.write("property float x\n")
-                f.write("property float y\n")
-                f.write("property float z\n")
-                f.write("property uchar red\n")
-                f.write("property uchar green\n")
-                f.write("property uchar blue\n")
-                f.write("end_header\n")
-                for pt in all_points:
-                    f.write(f"{pt['x']} {pt['y']} {pt['z']} {pt['r']} {pt['g']} {pt['b']}\n")
-            
+        ply_path = os.path.join(obj_dir, "points3D.ply")
+        if target_id == "scene":
+            background_points = spatial_voxel_filter(
+                (
+                    point
+                    for group in self._point_groups(metadata_paths)
+                    for point in group
+                ),
+                float(self.get_parameter("scene_background_voxel_size_m").value),
+            )
+            point_groups = iter((background_points,))
+            point_groups = itertools.chain(
+                point_groups, self._scene_object_point_groups()
+            )
+        else:
+            point_groups = self._object_point_groups(obj_dir)
+        point_count = write_ascii_ply(ply_path, point_groups)
+        if point_count > 0:
             transforms["ply_file_path"] = "points3D.ply"
 
         out_path = os.path.join(obj_dir, "transforms.json")
-        with open(out_path, "w") as fh:
+        temporary_path = f"{out_path}.tmp"
+        with open(temporary_path, "w") as fh:
             json.dump(transforms, fh, indent=2)
+        os.replace(temporary_path, out_path)
 
         self.get_logger().info(
-            f"[Compile] Wrote transforms.json with {len(frames)} frames."
+            f"[Compile] Wrote transforms.json with {len(frames)} frames "
+            f"and {point_count} initialization points."
         )
         return out_path
 
@@ -230,9 +313,11 @@ class GaussianSplattingNode(Node):
         iterations = self.get_parameter("training_iterations").value
         train_cmd = self.get_parameter("training_command").value
 
+        depth_enabled = bool(self.get_parameter("depth_supervision.enabled").value)
+        method = "depth-splatfacto" if depth_enabled else "splatfacto"
         cmd = [
             train_cmd,
-            "splatfacto",
+            method,
             "--data", obj_dir,
             "--max-num-iterations", str(iterations),
             "--output-dir", os.path.join(self.output_dir, object_id),
@@ -241,6 +326,31 @@ class GaussianSplattingNode(Node):
             "--pipeline.datamanager.cache-images", "cpu",
             "--pipeline.datamanager.max-thread-workers", "4",
         ]
+        environment = os.environ.copy()
+        if depth_enabled:
+            plugin = (
+                "depth-splatfacto="
+                "gaussian_splatting_ros.depth_splatfacto:depth_splatfacto_method"
+            )
+            existing = environment.get("NERFSTUDIO_METHOD_CONFIGS", "").strip()
+            environment["NERFSTUDIO_METHOD_CONFIGS"] = (
+                f"{existing},{plugin}" if existing else plugin
+            )
+            option_map = {
+                "depth-loss-weight": "depth_supervision.loss_weight",
+                "depth-warmup-steps": "depth_supervision.warmup_steps",
+                "depth-ramp-steps": "depth_supervision.ramp_steps",
+                "depth-huber-delta-m": "depth_supervision.huber_delta_m",
+                "depth-minimum-m": "depth_supervision.minimum_depth_m",
+                "depth-maximum-m": "depth_supervision.maximum_depth_m",
+                "depth-edge-threshold-m": "depth_supervision.edge_threshold_m",
+                "depth-minimum-opacity": "depth_supervision.minimum_opacity",
+            }
+            for option, parameter in option_map.items():
+                cmd.extend([
+                    f"--pipeline.model.{option}",
+                    str(self.get_parameter(parameter).value),
+                ])
 
         self.get_logger().info(f"[Train] Launching: {' '.join(cmd)}")
 
@@ -250,6 +360,7 @@ class GaussianSplattingNode(Node):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                env=environment,
             )
             # Stream stdout into the ROS logger
             for line in iter(proc.stdout.readline, ""):
@@ -263,17 +374,32 @@ class GaussianSplattingNode(Node):
             # After successful training, we must explicitly export the .ply model
             engine_out = os.path.join(self.output_dir, object_id)
             configs = glob.glob(os.path.join(engine_out, "**", "config.yml"), recursive=True)
-            if configs:
-                best_config = max(configs, key=os.path.getmtime)
-                export_cmd = [
-                    train_cmd.replace("ns-train", "ns-export"),
-                    "gaussian-splat",
-                    "--load-config", best_config,
-                    "--output-dir", engine_out
-                ]
-                self.get_logger().info(f"[Export] Launching PLY export: {' '.join(export_cmd)}")
-                subprocess.run(export_cmd, check=False)
-                
+            if not configs:
+                self.get_logger().error("[Export] Training completed but produced no config.yml.")
+                return -2
+            best_config = max(configs, key=os.path.getmtime)
+            export_cmd = [
+                train_cmd.replace("ns-train", "ns-export"),
+                "gaussian-splat",
+                "--load-config", best_config,
+                "--output-dir", engine_out
+            ]
+            self.get_logger().info(f"[Export] Launching PLY export: {' '.join(export_cmd)}")
+            # ``ns-export`` loads the saved method name from config.yml in
+            # a fresh process, so it needs the same local method registry
+            # as the training subprocess.
+            export_result = subprocess.run(export_cmd, check=False, env=environment)
+            if export_result.returncode != 0:
+                self.get_logger().error(
+                    "[Export] PLY export failed (exit code %s); preserving cache for retry."
+                    % export_result.returncode
+                )
+                return export_result.returncode
+            if not glob.glob(os.path.join(engine_out, "**", "*.ply"), recursive=True):
+                self.get_logger().error(
+                    "[Export] Export exited successfully but produced no PLY; preserving cache for retry."
+                )
+                return -3
             return 0
         except FileNotFoundError:
             self.get_logger().error(
@@ -311,12 +437,16 @@ class GaussianSplattingNode(Node):
     # Step 4 – Cleanup
     # -----------------------------------------------------------------------
     def _cleanup_cache(self, object_id: str) -> None:
-        """Remove the Ramdisk cache for this object to reclaim RAM."""
-        obj_dir = os.path.join(self.cache_dir, object_id)
-        if os.path.isdir(obj_dir):
-            shutil.rmtree(obj_dir)
+        """Reclaim cache after training; scene export consumes every cache source."""
+        cleanup_path = (
+            self.cache_dir if object_id == "scene"
+            else os.path.join(self.cache_dir, object_id)
+        )
+        if os.path.isdir(cleanup_path):
+            shutil.rmtree(cleanup_path)
             self.get_logger().info(
-                f"[Cleanup] Removed cache for {object_id} from Ramdisk."
+                "[Cleanup] Removed %s from Ramdisk after %s training."
+                % (cleanup_path, object_id)
             )
 
     # -----------------------------------------------------------------------
@@ -331,7 +461,7 @@ class GaussianSplattingNode(Node):
 
         try:
             # Step 1 – Compile transforms.json
-            self._compile_transforms(obj_dir)
+            self._compile_transforms(obj_dir, object_id)
 
             # Step 2 – Launch training subprocess
             exit_code = self._launch_training(obj_dir, object_id)

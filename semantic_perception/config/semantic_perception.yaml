@@ -13,9 +13,9 @@ semantic_perception:
       # Image headers use sim_camera, while the robot TF tree uses wrist_camera.
       tf_frame_override: wrist_camera
     reference_frame: global_origin
-    processing_rate_hz: 5.0
+    processing_rate_hz: 12.0
     sync:
-      queue_size: 8
+      queue_size: 20
       # Accept RGB/depth pairs only when their header stamps differ by <=30 ms.
       slop_sec: 0.03
       # Reject a matched pair if RGB/depth still differ by more than 15 ms.
@@ -24,7 +24,7 @@ semantic_perception:
     tf:
       # Buffer synchronized RGB-D packets briefly so lower-rate TF publication
       # can catch up and interpolate at the image timestamp.
-      sync_queue_size: 30
+      sync_queue_size: 60
       max_wait_sec: 0.5
       # Require TF data 30 ms after each camera frame before localizing it.
       post_image_guard_sec: 0.03
@@ -92,3 +92,17 @@ semantic_perception:
       annotated_topic: /semantic/debug/yolo
     diagnostics:
       publish: true
+    export:
+      voxel_size_m: 0.05
+      voxel_size_deg: 5.0
+      # Sparse object seeds are sufficient for 3DGS and keep capture responsive.
+      object_point_voxel_size_m: 0.02
+      object_max_seed_points: 1200
+      maximum_sample_range_m: 3.0
+      scene:
+        enabled: false
+        keyframe_translation_m: 0.10
+        keyframe_rotation_deg: 8.0
+        max_frames: 600
+        max_background_points: 1500
+        mask_padding_fraction: 0.02
