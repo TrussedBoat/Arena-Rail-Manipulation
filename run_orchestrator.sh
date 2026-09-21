@@ -74,10 +74,10 @@ rrt_supervisor() {
     while true; do
         PYTHONFAULTHANDLER=1 python3 agent_orchestrator/src/rrt_planner.py --ros-args \
             -p planning_time_sec:=8.0 \
-            -p goal_position_tolerance_m:=0.005 \
+            -p goal_position_tolerance_m:=0.015 \
             -p goal_orientation_tolerance_rad:=0.05 \
             -p singularity_stop:="${ARENA_RRT_SINGULARITY_STOP:-0.045}" \
-            -p eef_min_z_m:="${ARENA_RRT_EEF_MIN_Z_M:-0.08}" \
+            -p eef_min_z_m:="${ARENA_RRT_EEF_MIN_Z_M:-0.05}" \
             -p model_root:="$RRT_MODEL_ROOT" \
             -p joint_states_topic:=/joint_states \
             -p trajectory_topic:=/rrt/tagged_joint_trajectory \

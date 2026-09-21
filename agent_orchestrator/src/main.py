@@ -94,6 +94,7 @@ def main() -> int:
                         "3. If all information needed for the task is confirmed, select exact object_id values from the map and use move_rail_to_object(object_id). Use those same IDs for pick and destination placement. Do not move merely to discover whether an object exists.\n"
                         "4. Choose the search scale from the missing context. Use targeted_search for one missing/non-confirmed class when locating that class alone lets the task continue. Use general_mapping when the request requires scene-wide or relational context that is unavailable, or when two or more relevant classes are missing/non-confirmed.\n"
                         "5. After targeted_search or general_mapping, call search_semantic_objects again for the relevant descriptions and re-plan from the refreshed map. Never assume a search result resolves a relation without examining the updated positions.\n\n"
+                        "6. When a selected confirmed object needs richer multi-view evidence, first call move_rail_to_object(object_id), then scan_object(object_id). The scan follows an object-centered arc and refreshes semantic perception; query the semantic map again afterward if the updated position is needed.\n\n"
                         "EXECUTION:\n"
                         "Use the map to decide what to inspect and where to go, then use camera frames for physical verification before manipulation. Complete the task with finish_task only after the requested action succeeds."
                     )),

@@ -1,7 +1,11 @@
 """ROS 2 RGB-D semantic perception node."""
 
 from dataclasses import dataclass
+from collections import deque
 from pathlib import Path
+import json
+import math
+import os
 import threading
 import time
 
@@ -51,6 +55,11 @@ from .localization import (
     transform_point,
 )
 from .registry import AssociationResult, ObjectRegistry, ObjectTrack, RegistryConfig
+from .scene_export import (
+    camera_pose_voxel,
+    sample_scene_background_points,
+    voxel_downsample_points,
+)
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,7 @@ class SensorPacket:
     sequence: int
     color: Image
     depth: Image
+    received_monotonic: float
 
 
 @dataclass(frozen=True)
@@ -84,13 +94,18 @@ class SemanticPerceptionNode(Node):
         self._packet_lock = threading.Lock()
         self._registry_lock = threading.RLock()
         self._registry_changed = threading.Condition(self._registry_lock)
-        self._latest_packet: SensorPacket | None = None
+        self._pending_packets: deque[SensorPacket] = deque(
+            maxlen=int(self.get_parameter("tf.sync_queue_size").value)
+        )
         self._received_sequence = 0
         self._processed_sequence = 0
+        self._processed_packets_count = 0
         self._color_messages_received = 0
         self._depth_messages_received = 0
         self._synchronized_packets_received = 0
+        self._rgb_depth_skew_rejected = 0
         self._last_health_processed = 0
+        self._tf_wait_expirations = 0
         self._last_health_monotonic = time.monotonic()
         self._last_timing_monotonic = time.monotonic()
         self._last_persist_monotonic = 0.0
@@ -213,6 +228,14 @@ class SemanticPerceptionNode(Node):
         self._persistence_timer = self.create_timer(1.0, self._persist_if_due)
         self._lifecycle_timer = self.create_timer(1.0, self._maintain_registry_lifecycle)
         self._input_health_timer = self.create_timer(1.0, self._log_input_health)
+        # Voxel hash tracking for 3DGS camera poses
+        self._saved_voxels: dict[str, set[tuple[int, int, int, int, int, int]]] = {}
+        self._scene_pose_voxels: set[tuple[int, int, int, int, int, int]] = set()
+        self._scene_frame_count = 0
+        self._scene_rng = np.random.default_rng()
+        self._splat_rng = np.random.default_rng()
+        self._load_scene_keyframes()
+
         self._action_server = ActionServer(
             self,
             FindObject,
@@ -248,11 +271,17 @@ class SemanticPerceptionNode(Node):
         self.declare_parameter("camera.image_height", 720)
         self.declare_parameter("camera.tf_frame_override", "wrist_camera")
         self.declare_parameter("reference_frame", "global_origin")
-        self.declare_parameter("processing_rate_hz", 5.0)
-        self.declare_parameter("sync.queue_size", 8)
-        self.declare_parameter("sync.slop_sec", 0.05)
+        # The camera delivers roughly 15 Hz.  Keep tracking close to that
+        # rate, while retaining exact image-time TF for geometric correctness.
+        self.declare_parameter("processing_rate_hz", 12.0)
+        self.declare_parameter("sync.queue_size", 20)
+        self.declare_parameter("sync.slop_sec", 0.03)
+        self.declare_parameter("sync.max_rgb_depth_delta_sec", 0.015)
         self.declare_parameter("tf_timeout_sec", 0.2)
-        self.declare_parameter("tf.fallback_to_latest", True)
+        self.declare_parameter("tf.sync_queue_size", 60)
+        self.declare_parameter("tf.max_wait_sec", 0.5)
+        self.declare_parameter("tf.post_image_guard_sec", 0.03)
+        self.declare_parameter("tf.fallback_to_latest", False)
         self.declare_parameter("detector.backend", "ultralytics")
         self.declare_parameter("detector.model_path", "")
         self.declare_parameter("detector.device", "cuda:0")
@@ -304,15 +333,38 @@ class SemanticPerceptionNode(Node):
         self.declare_parameter("debug.publish_annotated", False)
         self.declare_parameter("debug.timing", False)
         self.declare_parameter("debug.timing_log_interval_sec", 1.0)
+        self.declare_parameter("debug.timing_log_path", "")
+        self.declare_parameter("visualization.point_cloud_enabled", False)
+        self.declare_parameter("visualization.point_cloud_max_points", 300)
         self.declare_parameter("debug.annotated_topic", "/semantic/debug/yolo")
         self.declare_parameter("diagnostics.publish", True)
+        
+        # 3DGS Parameters
+        self.declare_parameter("export.voxel_size_m", 0.05)
+        self.declare_parameter("export.voxel_size_deg", 5.0)
+        self.declare_parameter("export.object_point_voxel_size_m", 0.02)
+        self.declare_parameter("export.object_max_seed_points", 1200)
+        self.declare_parameter("export.maximum_sample_range_m", 3.0)
+        self.declare_parameter("export.scene.enabled", False)
+        # Scene keyframes are deliberately less sparse than object keyframes:
+        # dense camera coverage is more valuable than many background samples
+        # from the same camera pose.
+        self.declare_parameter("export.scene.keyframe_translation_m", 0.10)
+        self.declare_parameter("export.scene.keyframe_rotation_deg", 8.0)
+        self.declare_parameter("export.scene.max_frames", 600)
+        self.declare_parameter("export.scene.max_background_points", 1500)
+        self.declare_parameter("export.scene.mask_padding_fraction", 0.02)
 
     def _validate_parameters(self) -> None:
         positive_parameters = (
             "processing_rate_hz",
             "sync.queue_size",
             "sync.slop_sec",
+            "sync.max_rgb_depth_delta_sec",
             "tf_timeout_sec",
+            "tf.sync_queue_size",
+            "tf.max_wait_sec",
+            "tf.post_image_guard_sec",
             "detector.image_size",
             "detector.max_detections",
             "appearance.image_size",
@@ -331,6 +383,14 @@ class SemanticPerceptionNode(Node):
             "registry.persistence_interval_sec",
             "search.default_timeout_sec",
             "semantic_text.max_results",
+            "export.scene.keyframe_translation_m",
+            "export.scene.keyframe_rotation_deg",
+            "export.scene.max_frames",
+            "export.scene.max_background_points",
+            "export.object_point_voxel_size_m",
+            "export.object_max_seed_points",
+            "visualization.point_cloud_max_points",
+            "export.maximum_sample_range_m",
         )
         for name in positive_parameters:
             if float(self.get_parameter(name).value) <= 0.0:
@@ -349,6 +409,7 @@ class SemanticPerceptionNode(Node):
             "class.conditional_reliability_floor",
             "class.evidence_decay",
             "semantic_text.minimum_cosine_similarity",
+            "export.scene.mask_padding_fraction",
         )
         for name in unit_parameters:
             value = float(self.get_parameter(name).value)
@@ -369,14 +430,30 @@ class SemanticPerceptionNode(Node):
             raise ValueError("depth.maximum_m must be greater than depth.minimum_m")
 
     def _sensor_callback(self, color: Image, depth: Image) -> None:
+        rgb_depth_delta_sec = abs(
+            Time.from_msg(color.header.stamp).nanoseconds
+            - Time.from_msg(depth.header.stamp).nanoseconds
+        ) / 1e9
+        if rgb_depth_delta_sec > float(
+            self.get_parameter("sync.max_rgb_depth_delta_sec").value
+        ):
+            self._rgb_depth_skew_rejected += 1
+            self.get_logger().debug(
+                "Rejected RGB-D pair with timestamp delta %.3f ms" % (
+                    rgb_depth_delta_sec * 1e3
+                ),
+                throttle_duration_sec=1.0,
+            )
+            return
         with self._packet_lock:
             self._received_sequence += 1
             self._synchronized_packets_received += 1
-            self._latest_packet = SensorPacket(
+            self._pending_packets.append(SensorPacket(
                 sequence=self._received_sequence,
                 color=color,
                 depth=depth,
-            )
+                received_monotonic=time.monotonic(),
+            ))
 
     def _color_received(self, _: Image) -> None:
         self._color_messages_received += 1
@@ -384,11 +461,266 @@ class SemanticPerceptionNode(Node):
     def _depth_received(self, _: Image) -> None:
         self._depth_messages_received += 1
 
+    def _packet_source_frame(self, packet: SensorPacket) -> str:
+        source_frame = str(
+            self.get_parameter("camera.tf_frame_override").value
+        ).strip()
+        if not source_frame:
+            source_frame = packet.color.header.frame_id.strip()
+        if not source_frame:
+            raise ValueError("RGB image has no frame_id")
+        return source_frame
+
+    def _full_crop_splat_points(
+        self,
+        color: np.ndarray,
+        depth: np.ndarray,
+        bounds_xyxy: tuple[int, int, int, int],
+        camera_to_world: np.ndarray,
+    ) -> list[dict[str, float | int]]:
+        """Project every valid-depth pixel in a YOLO crop for 3DGS seeding.
+
+        This intentionally retains object surroundings and background context.
+        It is separate from the compact, object-depth-filtered tracking cloud.
+        """
+        left, top, right, bottom = bounds_xyxy
+        crop_depth = depth[top:bottom, left:right]
+        valid = (
+            np.isfinite(crop_depth)
+            & (crop_depth >= float(self.get_parameter("depth.minimum_m").value))
+            & (crop_depth <= float(self.get_parameter("depth.maximum_m").value))
+        )
+        crop_v, crop_u = np.nonzero(valid)
+        if crop_u.size == 0:
+            return []
+        maximum_seed_points = int(
+            self.get_parameter("export.object_max_seed_points").value
+        )
+        if crop_u.size > maximum_seed_points:
+            selected = self._splat_rng.choice(
+                crop_u.size, size=maximum_seed_points, replace=False
+            )
+            crop_v = crop_v[selected]
+            crop_u = crop_u[selected]
+
+        z = crop_depth[crop_v, crop_u].astype(np.float64, copy=False)
+        u = crop_u.astype(np.float64) + left
+        v = crop_v.astype(np.float64) + top
+        calibration = self._camera_calibration
+        camera_points = np.column_stack((
+            (u - calibration.cx) * z / calibration.fx,
+            (v - calibration.cy) * z / calibration.fy,
+            z,
+        ))
+        within_range = np.linalg.norm(camera_points, axis=1) <= float(
+            self.get_parameter("export.maximum_sample_range_m").value
+        )
+        camera_points = camera_points[within_range]
+        crop_v = crop_v[within_range]
+        crop_u = crop_u[within_range]
+        if camera_points.size == 0:
+            return []
+        world_points = (
+            camera_points @ camera_to_world[:3, :3].T
+            + camera_to_world[:3, 3]
+        )
+        # OpenCV/ROS color images are BGR; cache RGB for PLY initialization.
+        bgr = color[top + crop_v, left + crop_u]
+        points = [
+            {
+                "x": float(point[0]),
+                "y": float(point[1]),
+                "z": float(point[2]),
+                "r": int(pixel[2]),
+                "g": int(pixel[1]),
+                "b": int(pixel[0]),
+            }
+            for point, pixel in zip(world_points, bgr, strict=True)
+        ]
+        return voxel_downsample_points(
+            points,
+            float(self.get_parameter("export.object_point_voxel_size_m").value),
+        )
+
+    @staticmethod
+    def _camera_to_world_matrix(transform: object) -> np.ndarray:
+        translation = transform.translation
+        rotation = transform.rotation
+        quaternion = np.asarray(
+            [rotation.x, rotation.y, rotation.z, rotation.w], dtype=np.float64
+        )
+        norm = float(np.linalg.norm(quaternion))
+        if norm <= 1e-12:
+            raise ValueError("TF quaternion has zero norm")
+        x, y, z, w = quaternion / norm
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[:3, :3] = np.asarray([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ])
+        matrix[:3, 3] = (translation.x, translation.y, translation.z)
+        return matrix
+
+    @staticmethod
+    def _atomic_json_write(path: str, payload: object) -> None:
+        temporary = f"{path}.tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream)
+        os.replace(temporary, path)
+
+    def _load_scene_keyframes(self) -> None:
+        scene_dir = "/dev/shm/3dgs_cache/scene"
+        manifest_path = os.path.join(scene_dir, "scene_keyframes.json")
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as stream:
+                    payload = json.load(stream)
+                self._scene_pose_voxels = {
+                    tuple(int(value) for value in item)
+                    for item in payload.get("pose_voxels", [])
+                    if isinstance(item, list) and len(item) == 6
+                }
+                self._scene_frame_count = int(payload.get("frame_count", 0))
+                return
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                self.get_logger().warning(f"Could not load scene keyframes: {exc}")
+        if os.path.isdir(scene_dir):
+            self._scene_frame_count = sum(
+                1
+                for name in os.listdir(scene_dir)
+                if name.endswith(".json")
+                and name not in ("scene_keyframes.json", "transforms.json")
+                and os.path.isfile(os.path.join(scene_dir, f"{name[:-5]}.png"))
+            )
+
+    def _persist_scene_frame(
+        self,
+        *,
+        color: np.ndarray,
+        depth: np.ndarray,
+        detections: list,
+        camera_to_world: np.ndarray,
+        stamp_ns: int,
+    ) -> dict[str, float]:
+        """Persist one scene keyframe and return per-stage wall timings."""
+        timings: dict[str, float] = {}
+        if not bool(self.get_parameter("export.scene.enabled").value):
+            return timings
+        scene_dir = "/dev/shm/3dgs_cache/scene"
+        # Successful scene training removes this directory. Reset the in-memory
+        # keyframe index so a fresh capture epoch can begin without restarting.
+        if self._scene_frame_count > 0 and not os.path.isdir(scene_dir):
+            self._scene_pose_voxels.clear()
+            self._scene_frame_count = 0
+        maximum_frames = int(self.get_parameter("export.scene.max_frames").value)
+        if self._scene_frame_count >= maximum_frames:
+            return timings
+        pose_key = camera_pose_voxel(
+            camera_to_world,
+            float(self.get_parameter("export.scene.keyframe_translation_m").value),
+            float(self.get_parameter("export.scene.keyframe_rotation_deg").value),
+        )
+        if pose_key in self._scene_pose_voxels:
+            return timings
+
+        stage_started = time.perf_counter()
+        points = sample_scene_background_points(
+            color=color,
+            depth=depth,
+            detection_boxes=[item.bbox_xyxy for item in detections],
+            camera_matrix=self._camera_calibration.camera_matrix,
+            camera_to_world=camera_to_world,
+            minimum_depth_m=float(self.get_parameter("depth.minimum_m").value),
+            maximum_depth_m=float(self.get_parameter("depth.maximum_m").value),
+            maximum_range_m=float(
+                self.get_parameter("export.maximum_sample_range_m").value
+            ),
+            maximum_points=int(
+                self.get_parameter("export.scene.max_background_points").value
+            ),
+            box_padding_fraction=float(
+                self.get_parameter("export.scene.mask_padding_fraction").value
+            ),
+            rng=self._scene_rng,
+        )
+        timings["scene_sample"] = time.perf_counter() - stage_started
+        os.makedirs(scene_dir, exist_ok=True)
+        stem = str(stamp_ns)
+        image_path = os.path.join(scene_dir, f"{stem}.png")
+        depth_path = os.path.join(scene_dir, f"{stem}_depth.png")
+        metadata_path = os.path.join(scene_dir, f"{stem}.json")
+        temporary_image = os.path.join(scene_dir, f".{stem}.tmp.png")
+        temporary_depth = os.path.join(scene_dir, f".{stem}_depth.tmp.png")
+        stage_started = time.perf_counter()
+        if not cv2.imwrite(temporary_image, color):
+            raise RuntimeError(f"Could not cache scene RGB frame {temporary_image}")
+        timings["scene_rgb_png"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
+        depth_mm = np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
+        if not cv2.imwrite(temporary_depth, depth_mm):
+            os.unlink(temporary_image)
+            raise RuntimeError(f"Could not cache scene depth frame {temporary_depth}")
+        timings["scene_depth_png"] = time.perf_counter() - stage_started
+        os.replace(temporary_image, image_path)
+        os.replace(temporary_depth, depth_path)
+        metadata = {
+            "schema_version": 1,
+            "point_cloud_role": "scene_background",
+            "camera_to_world": camera_to_world.tolist(),
+            "intrinsics": {
+                "fx": self._camera_calibration.fx,
+                "fy": self._camera_calibration.fy,
+                "cx": self._camera_calibration.cx,
+                "cy": self._camera_calibration.cy,
+                "width": int(color.shape[1]),
+                "height": int(color.shape[0]),
+            },
+            "point_cloud": points,
+        }
+        stage_started = time.perf_counter()
+        self._atomic_json_write(metadata_path, metadata)
+        self._scene_pose_voxels.add(pose_key)
+        self._scene_frame_count += 1
+        self._atomic_json_write(
+            os.path.join(scene_dir, "scene_keyframes.json"),
+            {
+                "frame_count": self._scene_frame_count,
+                "pose_voxels": [list(item) for item in self._scene_pose_voxels],
+            },
+        )
+        timings["scene_json"] = time.perf_counter() - stage_started
+        self.get_logger().info(
+            "Cached scene keyframe %d/%d with %d background points"
+            % (self._scene_frame_count, maximum_frames, len(points))
+        )
+        return timings
+
+    def _tf_ready_for_packet(self, packet: SensorPacket) -> bool:
+        """Whether TF brackets this camera timestamp with the configured guard."""
+        source_frame = self._packet_source_frame(packet)
+        image_stamp = Time.from_msg(packet.color.header.stamp)
+        if not self._tf_buffer.can_transform(
+            self._reference_frame(),
+            source_frame,
+            image_stamp,
+            timeout=Duration(seconds=0.0),
+        ):
+            return False
+        guard_sec = float(self.get_parameter("tf.post_image_guard_sec").value)
+        if guard_sec <= 0.0:
+            return True
+        latest_transform = self._tf_buffer.lookup_transform(
+            self._reference_frame(), source_frame, Time(), timeout=Duration(seconds=0.0)
+        )
+        latest_stamp = Time.from_msg(latest_transform.header.stamp)
+        return latest_stamp.nanoseconds - image_stamp.nanoseconds >= int(guard_sec * 1e9)
+
     def _log_input_health(self) -> None:
         now_monotonic = time.monotonic()
         elapsed_sec = max(now_monotonic - self._last_health_monotonic, 1e-6)
         processed_hz = (
-            self._processed_sequence - self._last_health_processed
+            self._processed_packets_count - self._last_health_processed
         ) / elapsed_sec
         confirmation_window_sec = float(
             self.get_parameter("filter.confirmation_window_sec").value
@@ -396,22 +728,44 @@ class SemanticPerceptionNode(Node):
         confirmation_hits = int(self.get_parameter("filter.confirmation_hits").value)
         available_observations = processed_hz * confirmation_window_sec
         confirmation_ratio = confirmation_hits / max(available_observations, 1e-6)
+        with self._packet_lock:
+            pending_tf_packets = len(self._pending_packets)
         self.get_logger().info(
             "RGB-D input health: color=%d depth=%d synchronized=%d processed=%d "
-            "processed_hz=%.2f confirmation=%d/%.1f(%.0f%%)"
+            "processed_hz=%.2f confirmation=%d/%.1f(%.0f%%) "
+            "rgb_depth_skew_rejected=%d tf_pending=%d tf_wait_expired=%d"
             % (
                 self._color_messages_received,
                 self._depth_messages_received,
                 self._synchronized_packets_received,
-                self._processed_sequence,
+                self._processed_packets_count,
                 processed_hz,
                 confirmation_hits,
                 available_observations,
                 confirmation_ratio * 100.0,
+                self._rgb_depth_skew_rejected,
+                pending_tf_packets,
+                self._tf_wait_expirations,
             )
         )
-        self._last_health_processed = self._processed_sequence
+        self._last_health_processed = self._processed_packets_count
         self._last_health_monotonic = now_monotonic
+
+    def _write_timing_log(self, line: str) -> None:
+        """Append one timing sample to an optional dedicated text log."""
+        path_text = str(self.get_parameter("debug.timing_log_path").value).strip()
+        if not path_text:
+            return
+        try:
+            path = Path(path_text).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(line + "\n")
+        except OSError as exc:
+            self.get_logger().warning(
+                f"Could not append semantic timing log {path_text}: {exc}",
+                throttle_duration_sec=5.0,
+            )
 
     def _maintain_registry_lifecycle(self) -> None:
         """Publish/persist stale transitions even while no new camera packet arrives."""
@@ -431,11 +785,48 @@ class SemanticPerceptionNode(Node):
             self.get_logger().info("Deleted stale tracks: %s" % deleted_stale)
 
     def _process_latest(self) -> None:
+        packet: SensorPacket | None = None
         with self._packet_lock:
-            packet = self._latest_packet
-            if packet is None or packet.sequence == self._processed_sequence:
+            pending = [
+                item for item in self._pending_packets
+                if item.sequence > self._processed_sequence
+            ]
+        if not pending:
+            return
+
+        # Prefer the newest RGB-D pair for which TF can interpolate at the
+        # image timestamp. This deliberately lets a lower-rate TF stream lag
+        # behind the camera instead of applying a transform from another time.
+        for candidate in reversed(pending):
+            try:
+                transform_ready = self._tf_ready_for_packet(candidate)
+            except (TransformException, ValueError):
+                transform_ready = False
+            if transform_ready:
+                packet = candidate
+                break
+
+        if packet is None:
+            oldest = pending[0]
+            waited_sec = time.monotonic() - oldest.received_monotonic
+            if waited_sec < float(self.get_parameter("tf.max_wait_sec").value):
+                return
+            # Once the bounded wait expires, process the oldest pair. Exact TF
+            # lookup will either reject it or use the explicitly enabled
+            # latest-transform fallback.
+            packet = oldest
+            self._tf_wait_expirations += 1
+
+        with self._packet_lock:
+            if packet.sequence <= self._processed_sequence:
                 return
             self._processed_sequence = packet.sequence
+            self._processed_packets_count += 1
+            while (
+                self._pending_packets
+                and self._pending_packets[0].sequence <= packet.sequence
+            ):
+                self._pending_packets.popleft()
         frame_started = time.perf_counter()
         try:
             localized, rejected_depth, tf_mode, selected_tf_stamp, timing = self._localize_packet(packet)
@@ -495,6 +886,113 @@ class SemanticPerceptionNode(Node):
         persistence_started = time.perf_counter()
         self._persist_if_due()
         timing["persistence"] = time.perf_counter() - persistence_started
+        # Export 3DGS Data
+        object_cache_started = time.perf_counter()
+        import os
+        import json
+        import cv2
+        for result in association_results:
+            if (
+                result.decision != "unmatched" 
+                and result.track is not None 
+                and result.track.state == "confirmed"
+            ):
+                det = localized[result.detection_index]
+                if det.color_crop is not None and det.camera_to_world is not None:
+                    
+                    # 6D Voxel Hashing Filter
+                    voxel_size_m = float(self.get_parameter("export.voxel_size_m").value)
+                    voxel_size_rad = float(self.get_parameter("export.voxel_size_deg").value) * math.pi / 180.0
+                    
+                    tx, ty, tz = det.camera_to_world[0, 3], det.camera_to_world[1, 3], det.camera_to_world[2, 3]
+                    R = det.camera_to_world[:3, :3]
+                    yaw = np.arctan2(R[1, 0], R[0, 0])
+                    pitch = np.arctan2(-R[2, 0], np.sqrt(R[2, 1]**2 + R[2, 2]**2))
+                    roll = np.arctan2(R[2, 1], R[2, 2])
+                    
+                    voxel_hash = (
+                        int(math.floor(tx / voxel_size_m)),
+                        int(math.floor(ty / voxel_size_m)),
+                        int(math.floor(tz / voxel_size_m)),
+                        int(math.floor(roll / voxel_size_rad)),
+                        int(math.floor(pitch / voxel_size_rad)),
+                        int(math.floor(yaw / voxel_size_rad))
+                    )
+                    
+                    object_id = result.track.object_id
+                    obj_dir = f"/dev/shm/3dgs_cache/{object_id}"
+                    voxels_path = os.path.join(obj_dir, "voxels.json")
+                    
+                    if object_id not in self._saved_voxels:
+                        self._saved_voxels[object_id] = set()
+                        # Attempt to load existing voxels if node restarted
+                        if os.path.isfile(voxels_path):
+                            try:
+                                with open(voxels_path, "r") as f:
+                                    loaded_voxels = json.load(f)
+                                    self._saved_voxels[object_id] = {tuple(v) for v in loaded_voxels}
+                            except Exception as e:
+                                self.get_logger().warning(f"Failed to load voxels for {object_id}: {e}")
+                        
+                    if voxel_hash in self._saved_voxels[object_id]:
+                        continue  # Skip this frame; voxel already filled!
+                        
+                    self._saved_voxels[object_id].add(voxel_hash)
+                    
+                    os.makedirs(obj_dir, exist_ok=True)
+                    
+                    # Save updated voxels to disk
+                    try:
+                        with open(voxels_path, "w") as f:
+                            json.dump([list(v) for v in self._saved_voxels[object_id]], f)
+                    except Exception as e:
+                        self.get_logger().warning(f"Failed to save voxels for {object_id}: {e}")
+                    
+                    rgb_crop = det.color_crop.copy()
+                    
+                    stamp_ns = det.stamp_ns
+                    img_path = os.path.join(obj_dir, f"{stamp_ns}.png")
+                    cv2.imwrite(img_path, rgb_crop)
+                    
+                    # Save depth crop as uint16 millimeters
+                    if det.depth_crop is not None:
+                        depth_mm = np.clip(det.depth_crop * 1000.0, 0, 65535).astype(np.uint16)
+                        depth_path = os.path.join(obj_dir, f"{stamp_ns}_depth.png")
+                        cv2.imwrite(depth_path, depth_mm)
+                    
+                    cx = self._camera_calibration.cx - det.crop_offset[0]
+                    cy = self._camera_calibration.cy - det.crop_offset[1]
+                    
+                    meta = {
+                        "camera_to_world": det.camera_to_world.tolist(),
+                        "intrinsics": {
+                            "fx": self._camera_calibration.fx,
+                            "fy": self._camera_calibration.fy,
+                            "cx": cx,
+                            "cy": cy,
+                            "width": int(rgb_crop.shape[1]),
+                            "height": int(rgb_crop.shape[0])
+                        },
+                        "point_cloud": (
+                            det.splat_point_cloud
+                            if det.splat_point_cloud is not None else []
+                        ),
+                    }
+                    meta_path = os.path.join(obj_dir, f"{stamp_ns}.json")
+                    with open(meta_path, "w") as f:
+                        json.dump(meta, f)
+        timing["object_cache"] = time.perf_counter() - object_cache_started
+
+        for name in (
+            "depth_sampling",
+            "tracking_cloud",
+            "object_splat_cloud",
+            "scene_sample",
+            "scene_rgb_png",
+            "scene_depth_png",
+            "scene_json",
+        ):
+            timing.setdefault(name, 0.0)
         timing["total"] = time.perf_counter() - frame_started
         now_monotonic = time.monotonic()
         if (
@@ -503,18 +1001,22 @@ class SemanticPerceptionNode(Node):
             >= float(self.get_parameter("debug.timing_log_interval_sec").value)
         ):
             self._last_timing_monotonic = now_monotonic
-            self.get_logger().debug(
+            timing_line = (
                 "Timing ms: total={total:.1f} decode={decode:.1f} tf={tf:.1f} "
                 "yolo={yolo:.1f} filter={filter:.1f} appearance={appearance:.1f} "
-                "depth={depth:.1f} debug_image={debug_image:.1f} association={association:.1f} diagnostics={diagnostics:.1f} "
-                "persist={persistence:.1f} detections={detections} localized={localized}".format(
+                "depth={depth:.1f}(sample={depth_sampling:.1f},track_cloud={tracking_cloud:.1f},splat_cloud={object_splat_cloud:.1f}) "
+                "association={association:.1f} diagnostics={diagnostics:.1f} persist={persistence:.1f} object_cache={object_cache:.1f} "
+                "scene={scene_cache:.1f}(sample={scene_sample:.1f},rgb_png={scene_rgb_png:.1f},depth_png={scene_depth_png:.1f},json={scene_json:.1f}) "
+                "debug_image={debug_image:.1f} detections={detections} localized={localized}"
+            ).format(
                     **{
                         **{name: seconds * 1000.0 for name, seconds in timing.items()},
                         "detections": timing["detections"],
                         "localized": len(localized),
                     }
-                )
             )
+            self.get_logger().debug(timing_line)
+            self._write_timing_log(timing_line)
 
     def _localize_packet(
         self, packet: SensorPacket
@@ -539,11 +1041,7 @@ class SemanticPerceptionNode(Node):
                 f"{expected_shape}"
             )
         timing["decode"] = time.perf_counter() - stage_started
-        source_frame = str(self.get_parameter("camera.tf_frame_override").value).strip()
-        if not source_frame:
-            source_frame = packet.color.header.frame_id.strip()
-        if not source_frame:
-            raise ValueError("RGB image has no frame_id")
+        source_frame = self._packet_source_frame(packet)
         stamp = Time.from_msg(packet.color.header.stamp)
         stage_started = time.perf_counter()
         try:
@@ -568,6 +1066,7 @@ class SemanticPerceptionNode(Node):
                 self._reference_frame(), source_frame, Time()
             )
             tf_mode = "latest_fallback"
+        packet_camera_to_world = self._camera_to_world_matrix(transform.transform)
         timing["tf"] = time.perf_counter() - stage_started
         # Registry time must use one clock domain.  Image header stamps are
         # retained for TF lookup, but simulators may stamp images with wall
@@ -603,12 +1102,16 @@ class SemanticPerceptionNode(Node):
                 throttle_duration_sec=5.0,
             )
         timing["appearance"] = time.perf_counter() - stage_started
+        depth_sampling_seconds = 0.0
+        tracking_cloud_seconds = 0.0
+        object_splat_seconds = 0.0
         stage_started = time.perf_counter()
         localized: list[LocalizedDetection] = []
         depth_diagnostics: dict[int, DepthSamplingDiagnostics] = {}
         rejected_depth: list[RejectedDepthDetection] = []
         for detection_index, detection in enumerate(raw_detections):
             try:
+                detection_started = time.perf_counter()
                 diagnostics = depth_sampling_diagnostics(
                     depth,
                     detection.bbox_xyxy,
@@ -621,9 +1124,14 @@ class SemanticPerceptionNode(Node):
                     minimum_depth_m=float(self.get_parameter("depth.minimum_m").value),
                     maximum_depth_m=float(self.get_parameter("depth.maximum_m").value),
                 )
+                depth_sampling_seconds += time.perf_counter() - detection_started
                 depth_diagnostics[detection_index] = diagnostics
                 depth_m = diagnostics.median_m
                 depth_stddev = diagnostics.stddev_m
+                # Adaptive depth threshold for background removal (MAD-based)
+                adaptive_depth_threshold = float(np.clip(
+                    3.0 * depth_stddev, 0.03, 0.25
+                ))
                 pixel = diagnostics.centre_pixel
                 camera_point = deproject_pixel(
                     pixel, depth_m, self._camera_calibration.camera_matrix
@@ -663,31 +1171,39 @@ class SemanticPerceptionNode(Node):
                 world_covariance *= covariance_scale
 
                 point_cloud_samples = []
-                inlier_ys, inlier_xs = np.where(diagnostics.inlier_mask)
-                num_inliers = len(inlier_ys)
-                if num_inliers > 0:
-                    sample_size = min(15, num_inliers)
-                    sample_indices = np.random.choice(num_inliers, sample_size, replace=False)
-                    for idx in sample_indices:
-                        roi_y = inlier_ys[idx]
-                        roi_x = inlier_xs[idx]
-                        left = diagnostics.bounds_xyxy[0]
-                        top = diagnostics.bounds_xyxy[1]
-                        u = int(roi_x + left)
-                        v = int(roi_y + top)
-                        z = float(depth[v, u])
-                        if z > 0:
-                            pt_cam = deproject_pixel((u, v), z, self._camera_calibration.camera_matrix)
-                            pt_world = transform_point(pt_cam, transform.transform)
-                            b, g, r = color[v, u]
-                            point_cloud_samples.append({
-                                "x": float(pt_world[0]),
-                                "y": float(pt_world[1]),
-                                "z": float(pt_world[2]),
-                                "r": int(r),
-                                "g": int(g),
-                                "b": int(b)
-                            })
+                if bool(self.get_parameter("visualization.point_cloud_enabled").value):
+                    tracking_cloud_started = time.perf_counter()
+                    inlier_ys, inlier_xs = np.where(np.ones_like(diagnostics.inlier_mask))
+                    num_inliers = len(inlier_ys)
+                    if num_inliers > 0:
+                        sample_size = min(
+                            int(self.get_parameter("visualization.point_cloud_max_points").value),
+                            num_inliers,
+                        )
+                        sample_indices = self._splat_rng.choice(
+                            num_inliers, size=sample_size, replace=False
+                        )
+                        for idx in sample_indices:
+                            roi_y = inlier_ys[idx]
+                            roi_x = inlier_xs[idx]
+                            left = diagnostics.bounds_xyxy[0]
+                            top = diagnostics.bounds_xyxy[1]
+                            u = int(roi_x + left)
+                            v = int(roi_y + top)
+                            z = float(depth[v, u])
+                            if z > 0 and abs(z - depth_m) < adaptive_depth_threshold:
+                                pt_cam = deproject_pixel((u, v), z, self._camera_calibration.camera_matrix)
+                                pt_world = transform_point(pt_cam, transform.transform)
+                                b, g, r = color[v, u]
+                                point_cloud_samples.append({
+                                    "x": float(pt_world[0]),
+                                    "y": float(pt_world[1]),
+                                    "z": float(pt_world[2]),
+                                    "r": int(r),
+                                    "g": int(g),
+                                    "b": int(b),
+                                })
+                    tracking_cloud_seconds += time.perf_counter() - tracking_cloud_started
             except ValueError as exc:
                 rejected_depth.append(
                     RejectedDepthDetection(
@@ -698,6 +1214,120 @@ class SemanticPerceptionNode(Node):
                     f"Rejected {detection.class_name} detection: {exc}"
                 )
                 continue
+            # 3DGS Data Extraction
+            left, top, right, bottom = map(int, detection.bbox_xyxy)
+            left = max(0, left)
+            top = max(0, top)
+            right = min(color.shape[1], right)
+            bottom = min(color.shape[0], bottom)
+            
+            if right > left and bottom > top:
+                object_splat_started = time.perf_counter()
+                color_crop = color[top:bottom, left:right].copy()
+                depth_crop = depth[top:bottom, left:right].copy()
+                splat_point_cloud_samples: list[dict[str, float | int]] = []
+                
+                # [OPTIONAL] ── Gradient-based Depth Segmentation ──────────
+                # Uncomment the following block to mask out the background in saved images
+                #
+                # # 1. Compute depth gradients (depth change per pixel)
+                # sobelx = cv2.Sobel(depth_crop, cv2.CV_64F, 1, 0, ksize=3)
+                # sobely = cv2.Sobel(depth_crop, cv2.CV_64F, 0, 1, ksize=3)
+                # grad_mag = np.sqrt(sobelx**2 + sobely**2)
+                # 
+                # # 2. Coarse mask: within 0.3m of the estimated median depth
+                # coarse_mask = (
+                #     np.isfinite(depth_crop)
+                #     & (depth_crop > 0)
+                #     & (np.abs(depth_crop - depth_m) < 0.3)
+                # )
+                # 
+                # # 3. Disconnect object from background by removing high-gradient edges (> 2cm jump)
+                # edge_mask = grad_mag > 0.02
+                # core_mask = coarse_mask & ~edge_mask
+                # 
+                # # 4. Find the object blob using Connected Components
+                # num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                #     core_mask.astype(np.uint8), connectivity=8
+                # )
+                # 
+                # depth_mask = np.zeros_like(core_mask, dtype=bool)
+                # if num_labels > 1:
+                #     # Find the blob closest to the center of the bounding box
+                #     ch, cw = depth_crop.shape[:2]
+                #     center = np.array([cw / 2, ch / 2])
+                #     
+                #     best_label = 1
+                #     min_dist = float('inf')
+                #     for i in range(1, num_labels):
+                #         # Filter out tiny specks (< 50 pixels)
+                #         if stats[i, cv2.CC_STAT_AREA] < 50:
+                #             continue
+                #         centroid = centroids[i]
+                #         dist = np.linalg.norm(centroid - center)
+                #         if dist < min_dist:
+                #             min_dist = dist
+                #             best_label = i
+                #             
+                #     object_mask = (labels == best_label)
+                #     
+                #     # 5. Dilate the object mask slightly to recover the edge pixels we removed
+                #     morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                #     object_mask_u8 = cv2.dilate(object_mask.astype(np.uint8), morph_kernel, iterations=1)
+                #     
+                #     # Intersect dilated mask with the original coarse mask
+                #     depth_mask = object_mask_u8.astype(bool) & coarse_mask
+                #
+                # color_crop[~depth_mask] = 0
+                # depth_crop[~depth_mask] = 0.0
+
+                
+                tx = transform.transform.translation.x
+                ty = transform.transform.translation.y
+                tz = transform.transform.translation.z
+                qx = transform.transform.rotation.x
+                qy = transform.transform.rotation.y
+                qz = transform.transform.rotation.z
+                qw = transform.transform.rotation.w
+                
+                # Manual quaternion to rotation matrix conversion to avoid tf_transformations dependency
+                xx, yy, zz = qx*qx, qy*qy, qz*qz
+                xy, xz, yz = qx*qy, qx*qz, qy*qz
+                xw, yw, zw = qx*qw, qy*qw, qz*qw
+                
+                r11 = 1.0 - 2.0 * (yy + zz)
+                r12 = 2.0 * (xy - zw)
+                r13 = 2.0 * (xz + yw)
+                
+                r21 = 2.0 * (xy + zw)
+                r22 = 1.0 - 2.0 * (xx + zz)
+                r23 = 2.0 * (yz - xw)
+                
+                r31 = 2.0 * (xz - yw)
+                r32 = 2.0 * (yz + xw)
+                r33 = 1.0 - 2.0 * (xx + yy)
+                
+                camera_to_world = np.array([
+                    [r11, r12, r13, tx],
+                    [r21, r22, r23, ty],
+                    [r31, r32, r33, tz],
+                    [0.0, 0.0, 0.0, 1.0]
+                ])
+                crop_offset = (left, top)
+                splat_point_cloud_samples = self._full_crop_splat_points(
+                    color,
+                    depth,
+                    (left, top, right, bottom),
+                    camera_to_world,
+                )
+                object_splat_seconds += time.perf_counter() - object_splat_started
+            else:
+                color_crop = None
+                depth_crop = None
+                camera_to_world = None
+                crop_offset = None
+                splat_point_cloud_samples = []
+
             localized.append(
                 LocalizedDetection(
                     class_name=detection.class_name,
@@ -719,10 +1349,18 @@ class SemanticPerceptionNode(Node):
                     base_pixel_stddev_px=base_pixel_stddev_px,
                     bbox_pixel_stddev_px=bbox_pixel_stddev_px,
                     combined_pixel_stddev_px=combined_pixel_stddev_px,
+                    splat_point_cloud=splat_point_cloud_samples,
                     point_cloud=point_cloud_samples,
+                    color_crop=color_crop,
+                    depth_crop=depth_crop,
+                    camera_to_world=camera_to_world,
+                    crop_offset=crop_offset,
                 )
             )
         timing["depth"] = time.perf_counter() - stage_started
+        timing["depth_sampling"] = depth_sampling_seconds
+        timing["tracking_cloud"] = tracking_cloud_seconds
+        timing["object_splat_cloud"] = object_splat_seconds
         stage_started = time.perf_counter()
         if bool(self.get_parameter("debug.publish_annotated").value):
             self._publish_annotated_detections(
@@ -743,6 +1381,22 @@ class SemanticPerceptionNode(Node):
                 registry_stamp_ns,
             )
         )
+        scene_started = time.perf_counter()
+        try:
+            scene_timings = self._persist_scene_frame(
+                color=color,
+                depth=depth,
+                detections=detector_output,
+                camera_to_world=packet_camera_to_world,
+                stamp_ns=stamp.nanoseconds,
+            )
+            timing.update(scene_timings)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.get_logger().warning(
+                f"Could not cache scene keyframe: {exc}",
+                throttle_duration_sec=2.0,
+            )
+        timing["scene_cache"] = time.perf_counter() - scene_started
         return localized, rejected_depth, tf_mode, Time.from_msg(transform.header.stamp), timing
 
     def _publish_association_diagnostics(
@@ -1169,8 +1823,12 @@ class SemanticPerceptionNode(Node):
                     )
                     return
                 self._registry.load(self._registry_path)
+                # Rewrite once after loading so old visualization point clouds
+                # are removed from semantic_objects.json as well.
+                self._registry_dirty = True
             elif self._legacy_path.is_file():
                 self._registry.load(self._legacy_path)
+                self._registry_dirty = True
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"Could not load semantic registry: {exc}") from exc
 

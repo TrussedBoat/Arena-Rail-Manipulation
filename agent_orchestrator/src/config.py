@@ -99,10 +99,19 @@ TARGETED_SCAN_PITCH             = -0.3
 TARGETED_CLOSE_STANDOFF         = 0.30
 TARGETED_CANCEL_TIMEOUT_SEC     = 3.0
 
+# --- Confirmed-object orbit scan ---
+OBJECT_SCAN_RADIUS_M            = 0.25
+OBJECT_SCAN_HEIGHT_OFFSET_M     = 0.30
+OBJECT_SCAN_LOWER_HEIGHT_OFFSET_M = 0.06
+OBJECT_SCAN_ARC_DEGREES         = 360.0
+OBJECT_SCAN_VIEWPOINTS          = 18
+OBJECT_SCAN_MAX_CENTER_SHIFT_M  = 0.15
+OBJECT_SCAN_MAX_MISSING_UPDATES = 2
+
 # --- RRT manipulation defaults (calibrate in this file or with YOLO_VLM_* env) ---
 MANIPULATION_HOVER_HEIGHT_M       = 0.20
-MANIPULATION_GRASP_Z_OFFSET_M     = 0.04
-MANIPULATION_MIN_PICK_DESCEND_Z_M = 0.12
+MANIPULATION_GRASP_Z_OFFSET_M     = 0.01
+MANIPULATION_MIN_PICK_DESCEND_Z_M = 0.06
 MANIPULATION_PLACE_DROP_OFFSET_M  = 0.08
 MANIPULATION_LATERAL_OFFSET_M     = -0.03
 MANIPULATION_Y_OFFSET_M           = 0.02
@@ -226,6 +235,13 @@ class SearchConfig:
     targeted_scan_pitch: float
     targeted_close_standoff: float
     targeted_cancel_timeout_sec: float
+    object_scan_radius_m: float
+    object_scan_height_offset_m: float
+    object_scan_lower_height_offset_m: float
+    object_scan_arc_degrees: float
+    object_scan_viewpoints: int
+    object_scan_max_center_shift_m: float
+    object_scan_max_missing_updates: int
 
 
 @dataclass(frozen=True)
@@ -519,6 +535,35 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             ),
             targeted_cancel_timeout_sec=_env_float(
                 source, "YOLO_VLM_TARGETED_CANCEL_TIMEOUT_SEC", TARGETED_CANCEL_TIMEOUT_SEC
+            ),
+            object_scan_radius_m=_env_float(
+                source, "YOLO_VLM_OBJECT_SCAN_RADIUS_M", OBJECT_SCAN_RADIUS_M
+            ),
+            object_scan_height_offset_m=_env_float(
+                source,
+                "YOLO_VLM_OBJECT_SCAN_HEIGHT_OFFSET_M",
+                OBJECT_SCAN_HEIGHT_OFFSET_M,
+            ),
+            object_scan_lower_height_offset_m=_env_float(
+                source,
+                "YOLO_VLM_OBJECT_SCAN_LOWER_HEIGHT_OFFSET_M",
+                OBJECT_SCAN_LOWER_HEIGHT_OFFSET_M,
+            ),
+            object_scan_arc_degrees=_env_float(
+                source, "YOLO_VLM_OBJECT_SCAN_ARC_DEGREES", OBJECT_SCAN_ARC_DEGREES
+            ),
+            object_scan_viewpoints=_env_int(
+                source, "YOLO_VLM_OBJECT_SCAN_VIEWPOINTS", OBJECT_SCAN_VIEWPOINTS
+            ),
+            object_scan_max_center_shift_m=_env_float(
+                source,
+                "YOLO_VLM_OBJECT_SCAN_MAX_CENTER_SHIFT_M",
+                OBJECT_SCAN_MAX_CENTER_SHIFT_M,
+            ),
+            object_scan_max_missing_updates=_env_int(
+                source,
+                "YOLO_VLM_OBJECT_SCAN_MAX_MISSING_UPDATES",
+                OBJECT_SCAN_MAX_MISSING_UPDATES,
             ),
         ),
         cartesian=CartesianConfig(
@@ -893,6 +938,10 @@ def validate_runtime_config(
         errors.append("targeted scan viewpoints must be at least 2")
     if config.search.mapping_scan_viewpoints < 2:
         errors.append("mapping scan viewpoints must be at least 2")
+    if config.search.object_scan_viewpoints < 2:
+        errors.append("object scan viewpoints must be at least 2")
+    if config.search.object_scan_max_missing_updates < 0:
+        errors.append("object scan maximum missing updates cannot be negative")
     for label, value in (
         ("targeted capture FPS", config.search.targeted_capture_fps),
         ("targeted desk width", config.search.targeted_desk_width),
@@ -902,9 +951,31 @@ def validate_runtime_config(
         ("targeted close stand-off", config.search.targeted_close_standoff),
         ("targeted cancel timeout", config.search.targeted_cancel_timeout_sec),
         ("targeted semantic action timeout", config.search.targeted_semantic_action_timeout_sec),
+        ("object scan radius", config.search.object_scan_radius_m),
+        ("object scan height offset", config.search.object_scan_height_offset_m),
+        ("object scan lower height offset", config.search.object_scan_lower_height_offset_m),
+        ("object scan maximum center shift", config.search.object_scan_max_center_shift_m),
     ):
         if not math.isfinite(value) or value <= 0:
             errors.append(f"{label} must be finite and positive, got {value}")
+    if (
+        math.isfinite(config.search.object_scan_lower_height_offset_m)
+        and math.isfinite(config.search.object_scan_height_offset_m)
+        and config.search.object_scan_lower_height_offset_m
+        >= config.search.object_scan_height_offset_m
+    ):
+        errors.append(
+            "object scan lower height offset must be below the upper height offset, got "
+            f"{config.search.object_scan_lower_height_offset_m} >= "
+            f"{config.search.object_scan_height_offset_m}"
+        )
+    if not math.isfinite(config.search.object_scan_arc_degrees) or not (
+        0.0 < config.search.object_scan_arc_degrees <= 360.0
+    ):
+        errors.append(
+            "object scan arc must be finite and in (0, 360] degrees, got "
+            f"{config.search.object_scan_arc_degrees}"
+        )
     if config.search.targeted_table_scan_y >= config.search.targeted_desk_width:
         errors.append(
             "targeted table scan Y must be inside the desk edge, got "

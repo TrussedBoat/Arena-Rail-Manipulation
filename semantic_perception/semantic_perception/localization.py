@@ -27,7 +27,14 @@ class LocalizedDetection:
     base_pixel_stddev_px: float = 0.0
     bbox_pixel_stddev_px: float = 0.0
     combined_pixel_stddev_px: float = 0.0
+    # Full-crop, valid-depth context cloud used only for 3DGS initialization.
+    # ``point_cloud`` remains the object-focused tracking cloud.
+    splat_point_cloud: list[dict[str, float | int]] | None = None
     point_cloud: list[dict[str, float | int]] | None = None
+    color_crop: np.ndarray | None = None
+    depth_crop: np.ndarray | None = None
+    camera_to_world: np.ndarray | None = None
+    crop_offset: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)

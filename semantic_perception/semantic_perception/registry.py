@@ -518,9 +518,29 @@ class ObjectRegistry:
         track.model_id = self.model_id
         self._update_appearance(track, detection)
         if detection.point_cloud:
-            track.point_cloud.extend(detection.point_cloud)
-            if len(track.point_cloud) > 150:
-                track.point_cloud = track.point_cloud[-150:]
+            voxel_size = 0.01  # 1 cm voxels
+            voxel_grid = {}
+            for pt in track.point_cloud:
+                voxel_key = (
+                    int(pt["x"] / voxel_size),
+                    int(pt["y"] / voxel_size),
+                    int(pt["z"] / voxel_size)
+                )
+                voxel_grid[voxel_key] = pt
+            
+            for pt in detection.point_cloud:
+                voxel_key = (
+                    int(pt["x"] / voxel_size),
+                    int(pt["y"] / voxel_size),
+                    int(pt["z"] / voxel_size)
+                )
+                if voxel_key not in voxel_grid:
+                    voxel_grid[voxel_key] = pt
+
+            new_cloud = list(voxel_grid.values())
+            if len(new_cloud) > 3000:
+                new_cloud = new_cloud[-3000:]
+            track.point_cloud = new_cloud
         self._add_class_observation(track, detection, now_sec)
         self._update_state(track, now_sec)
 
@@ -708,7 +728,9 @@ class ObjectRegistry:
                 if item.get("stale_since")
                 else None
             ),
-            point_cloud=item.get("point_cloud", []),
+            # Point clouds are visualization-only and intentionally no longer
+            # persisted in semantic_objects.json.
+            point_cloud=[],
         )
         self._prune_class_scores(track)
         self._tracks[track.object_id] = track
@@ -802,7 +824,6 @@ class ObjectRegistry:
             "observation_count": track.observation_count,
             "first_seen": _iso_time(track.first_seen_sec),
             "last_seen": _iso_time(track.last_seen_sec),
-            "point_cloud": track.point_cloud,
             **(
                 {"stale_since": _iso_time(track.stale_since_sec)}
                 if track.stale_since_sec is not None

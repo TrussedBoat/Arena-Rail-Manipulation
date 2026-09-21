@@ -34,7 +34,9 @@ from targeted_scan_geometry import (
     close_view_tilt_poses,
     generate_desk_arc,
     generate_desk_targets,
+    generate_object_arc_angles,
     look_at_eef_rotation,
+    object_arc_pose,
     rail_centre,
 )
 
@@ -55,6 +57,13 @@ DIRECT_ARM_POSTURE_HANDOFF_DELAY_SEC = 0.25
 MAX_MANIPULATION_RAIL_OFFSET_M = 0.25
 STARTUP_RAIL_POSITION_M = -1.1
 STARTUP_ARM_JOINTS = (0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854)
+# Fixed, high observation poses retained while the rail traverses between
+# mapping stations.  The right pose mirrors the supplied left pose across the
+# robot X-Z plane: Y and yaw change sign, while roll/pitch are unchanged.
+# Pitch is slightly more downward than the scan poses so rail travel also
+# contributes useful table/scene observations.
+MAPPING_LEFT_TRANSIT_POSE = ScanPose(0.00, 0.40, 0.40, 3.14, -1.46, 1.56)
+MAPPING_RIGHT_TRANSIT_POSE = ScanPose(0.00, -0.40, 0.40, 3.14, -1.46, -1.56)
 _yolo_detector = None
 
 
@@ -1350,8 +1359,30 @@ def _scan_mapping_desk_sides(
     return completed
 
 
+def _move_mapping_to_transit_view(
+    node: object, config: RuntimeConfig, pose: ScanPose, label: str
+) -> None:
+    """Move to one fixed safe observation pose before rail travel."""
+    print(
+        f"[MAPPING][{label.upper()}_TRANSIT] "
+        f"xyz=({pose.x:.2f}, {pose.y:.2f}, {pose.z:.2f}) "
+        f"rpy=({pose.roll:.2f}, {pose.pitch:.2f}, {pose.yaw:.2f})"
+    )
+    _execute_mapping_pose(node, pose, config)
+
+
+def _return_mapping_to_home(node: object, config: RuntimeConfig) -> None:
+    """Return rail home while retaining a left-side camera view."""
+    _move_mapping_to_transit_view(node, config, MAPPING_LEFT_TRANSIT_POSE, "left")
+    print("[MAPPING][HOME] Returning rail home while retaining left-side camera view.")
+    _command_rail_and_wait(
+        node, STARTUP_RAIL_POSITION_M, config, timeout_sec=HOME_MOTION_TIMEOUT_SEC
+    )
+    _command_default_standing_posture_and_wait(node, config)
+
+
 def general_mapping() -> dict[str, object]:
-    """Build a full semantic map from min, centre, and max rail stations."""
+    """Build a full semantic map from quarter, centre, and three-quarter rail stations."""
     completed_viewpoints = 0
     started = time.monotonic()
     node = None
@@ -1361,17 +1392,24 @@ def general_mapping() -> dict[str, object]:
         node = get_shared_node()
         if not _wait_for_search_telemetry(node):
             return _failure_result("", "Timed out waiting for rail and arm telemetry.", state="initialize")
+        rail_min = config.search.rail_min_position
+        rail_span = config.search.rail_max_position - rail_min
         stations = (
-            config.search.rail_min_position,
-            rail_centre(config.search.rail_min_position, config.search.rail_max_position),
-            config.search.rail_max_position,
+            rail_min + 0.25 * rail_span,
+            rail_min + 0.50 * rail_span,
+            rail_min + 0.75 * rail_span,
         )
         for index, station in enumerate(stations, 1):
             print(f"[MAPPING][STATION] {index}/3: moving rail to {station:.3f}m")
-            _command_default_standing_posture_and_wait(node, config)
+            if index > 1:
+                _move_mapping_to_transit_view(
+                    node, config, MAPPING_RIGHT_TRANSIT_POSE, "right"
+                )
             _command_rail_and_wait(node, station, config)
+            print("[MAPPING][POSTURE] Station reached; moving to initial pose before scan.")
+            _command_default_standing_posture_and_wait(node, config)
             completed_viewpoints += _scan_mapping_desk_sides(node, config, station)
-        _return_targeted_search_to_home(node, config)
+        _return_mapping_to_home(node, config)
         return {
             "status": "success",
             "success": True,
@@ -3110,6 +3148,255 @@ def move_rail_to_object(object_id: str) -> dict[str, object]:
             reason += f"; standing-posture recovery failed: {recovery_error}"
         return {"status": "failure", "success": False, "recoverable": True,
                 "reason": reason}
+
+
+def _object_scan_topic_position(item: object) -> np.ndarray | None:
+    """Return a usable global XYZ update from one semantic topic object."""
+    if item is None or str(getattr(item, "state", "")) not in {
+        "confirmed", "class_ambiguous"
+    }:
+        return None
+    position = getattr(item, "position", None)
+    if position is None:
+        return None
+    values = np.asarray(
+        [getattr(position, axis, float("nan")) for axis in ("x", "y", "z")],
+        dtype=float,
+    )
+    return values if np.all(np.isfinite(values)) else None
+
+
+def _object_global_to_base(global_position: np.ndarray, rail_position: float) -> np.ndarray:
+    """Convert semantic global XYZ to panda_link0 using the rail convention."""
+    return np.asarray(
+        [rail_position - global_position[0], -global_position[1], global_position[2]],
+        dtype=float,
+    )
+
+
+def scan_object(object_id: str) -> dict[str, object]:
+    """Orbit one confirmed object while semantic perception refines its track."""
+    requested_id = str(object_id or "").strip()
+    node = None
+    config = None
+    completed = 0
+    skipped_viewpoints: list[dict[str, object]] = []
+    try:
+        config = get_runtime_config()
+        item = _confirmed_semantic_object_by_id(config, requested_id)
+        if item is None:
+            return {
+                "status": "failure", "success": False, "recoverable": False,
+                "object_id": requested_id,
+                "reason": "Object scan requires a currently confirmed semantic object_id.",
+            }
+        node = get_shared_node()
+        if not _wait_for_search_telemetry(node):
+            raise RuntimeConfigurationError("Timed out waiting for rail and arm telemetry")
+        if not node.ensure_rrt_idle(config.search.targeted_cancel_timeout_sec):
+            raise RuntimeConfigurationError("Could not stop active RRT motion before object scan")
+
+        rail = float(node.current_rail_position)
+        position = item["position"]
+        initial_global = np.asarray(
+            [float(position[axis]) for axis in ("x", "y", "z")], dtype=float
+        )
+        if abs(rail - initial_global[0]) > MAX_MANIPULATION_RAIL_OFFSET_M:
+            return {
+                "status": "failure", "success": False, "recoverable": False,
+                "object_id": requested_id,
+                "reason": (
+                    "Robot is not rail-aligned with the object; call "
+                    "move_rail_to_object(object_id) before scan_object."
+                ),
+            }
+
+        # Sweep a full orbit in deterministic increasing-angle order. The
+        # default scan progresses from -180 to +180 degrees; unreachable
+        # poses are skipped independently by the execution loop below.
+        start_angle = math.radians(-180.0)
+        bearings = generate_object_arc_angles(
+            start_angle=start_angle,
+            arc_degrees=config.search.object_scan_arc_degrees,
+            viewpoints=config.search.object_scan_viewpoints,
+            direction=1,
+        )
+
+        latest_global = initial_global.copy()
+        maximum_drift = 0.0
+        missing_updates = 0
+        scan_passes = (
+            ("upper", config.search.object_scan_height_offset_m),
+            ("lower", config.search.object_scan_lower_height_offset_m),
+        )
+        total_viewpoints = len(bearings) * len(scan_passes)
+        print(
+            f"[OBJECT_SCAN] {requested_id}: {total_viewpoints} RRT viewpoints "
+            f"across {len(scan_passes)} height passes, "
+            f"arc={config.search.object_scan_arc_degrees:g}deg, "
+            f"radius={config.search.object_scan_radius_m:.2f}m, "
+            f"height_offsets=({scan_passes[0][1]:.2f}, {scan_passes[1][1]:.2f})m"
+        )
+        global_index = 0
+        for pass_index, (pass_name, height_offset) in enumerate(scan_passes, start=1):
+            print(
+                f"[OBJECT_SCAN][{pass_name.upper()}] pass "
+                f"{pass_index}/{len(scan_passes)} height_offset={height_offset:.2f}m"
+            )
+            for pass_viewpoint, bearing in enumerate(bearings, start=1):
+                global_index += 1
+                topic_position = _object_scan_topic_position(
+                    node.semantic_object(requested_id)
+                )
+                if topic_position is None:
+                    missing_updates += 1
+                    if missing_updates > config.search.object_scan_max_missing_updates:
+                        raise RuntimeConfigurationError(
+                            "Semantic object disappeared for too many consecutive viewpoints"
+                        )
+                else:
+                    missing_updates = 0
+                    step_shift = float(np.linalg.norm(topic_position - latest_global))
+                    if step_shift > config.search.object_scan_max_center_shift_m:
+                        raise RuntimeConfigurationError(
+                            "Semantic object center jumped "
+                            f"{step_shift:.3f}m, exceeding the safe recenter limit of "
+                            f"{config.search.object_scan_max_center_shift_m:.3f}m"
+                        )
+                    latest_global = topic_position
+                    maximum_drift = max(
+                        maximum_drift,
+                        float(np.linalg.norm(latest_global - initial_global)),
+                    )
+
+                target_base = _object_global_to_base(latest_global, rail)
+                raw_pose = object_arc_pose(
+                    target_position=tuple(float(value) for value in target_base),
+                    bearing=bearing,
+                    radius=config.search.object_scan_radius_m,
+                    height_offset=height_offset,
+                )
+                target = type(
+                    "ObjectScanTarget", (),
+                    {"x": target_base[0], "y": target_base[1], "z": target_base[2]},
+                )()
+                pose = _camera_look_at_scan_pose(node, raw_pose, target, config)
+                angle_degrees = math.degrees(bearing)
+                print(
+                    f"[OBJECT_SCAN][{pass_name.upper()}] viewpoint "
+                    f"{pass_viewpoint}/{len(bearings)} "
+                    f"angle={angle_degrees:.1f}deg"
+                )
+                try:
+                    pose_completed = node.send_eef_pose(
+                        pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw,
+                        timeout_sec=config.cartesian.command_timeout_sec,
+                        readiness_timeout_sec=config.cartesian.readiness_timeout_sec,
+                        tf_timeout_sec=config.cartesian.tf_timeout_sec,
+                        base_frame=config.cartesian.base_frame,
+                        eef_frame=config.cartesian.eef_frame,
+                    )
+                    if not pose_completed:
+                        raise RuntimeError("RRT pose did not complete")
+                except (RuntimeError, TimeoutError, ValueError) as exc:
+                    reason = str(exc)
+                    print(
+                        f"[OBJECT_SCAN][SKIP][{pass_name.upper()}] viewpoint "
+                        f"{pass_viewpoint} angle={angle_degrees:.1f}deg: {reason}"
+                    )
+                    skipped_viewpoints.append({
+                        "index": global_index,
+                        "pass": pass_name,
+                        "pass_viewpoint": pass_viewpoint,
+                        "height_offset_m": height_offset,
+                        "angle_degrees": angle_degrees,
+                        "reason": reason,
+                    })
+                    if not node.ensure_rrt_idle(
+                        config.search.targeted_cancel_timeout_sec
+                    ):
+                        raise RuntimeConfigurationError(
+                            "Could not cancel failed object-scan "
+                            f"{pass_name} viewpoint {pass_viewpoint}"
+                        ) from exc
+                    continue
+                completed += 1
+                if config.search.motion_settling_sec > 0.0:
+                    time.sleep(config.search.motion_settling_sec)
+
+        if completed == 0:
+            raise RuntimeConfigurationError(
+                "No object-scan viewpoint had a reachable, safe RRT solution"
+            )
+
+        final_item = node.semantic_object(requested_id)
+        final_topic_position = _object_scan_topic_position(final_item)
+        if final_topic_position is not None:
+            latest_global = final_topic_position
+            maximum_drift = max(
+                maximum_drift,
+                float(np.linalg.norm(latest_global - initial_global)),
+            )
+        final_state = str(getattr(final_item, "state", "confirmed"))
+        final_confidence = float(
+            getattr(final_item, "confidence", item.get("confidence", 0.0))
+        )
+        final_stddev = float(
+            getattr(
+                final_item,
+                "position_stddev_m",
+                item.get("position_stddev_m", 0.0),
+            )
+        )
+        return {
+            "status": "success", "success": True,
+            "object_id": requested_id,
+            "class_name": str(item.get("class_name", "")),
+            "viewpoints_completed": completed,
+            "viewpoints_planned": total_viewpoints,
+            "viewpoints_skipped": len(skipped_viewpoints),
+            "skipped_viewpoint_details": skipped_viewpoints,
+            "arc_degrees": float(config.search.object_scan_arc_degrees),
+            "horizontal_radius_m": float(config.search.object_scan_radius_m),
+            "height_offsets_m": [height for _, height in scan_passes],
+            "camera_distance_m": float(math.hypot(
+                config.search.object_scan_radius_m,
+                config.search.object_scan_height_offset_m,
+            )),
+            "maximum_center_drift_m": maximum_drift,
+            "final_state": final_state,
+            "final_confidence": final_confidence,
+            "final_position_stddev_m": final_stddev,
+            "initial_position": {
+                axis: float(initial_global[index])
+                for index, axis in enumerate(("x", "y", "z"))
+            },
+            "final_position": {
+                axis: float(latest_global[index])
+                for index, axis in enumerate(("x", "y", "z"))
+            },
+            "reason": "Object-centered semantic scan completed.",
+        }
+    except Exception as exc:
+        print(f"[OBJECT_SCAN][FAILURE] {exc}")
+        recovery_error = (
+            _recover_rrt_navigation(node, config, context="OBJECT_SCAN")
+            if node is not None and config is not None else None
+        )
+        reason = f"Object scan failed after safe recovery: {exc}"
+        if recovery_error:
+            reason += f"; standing-posture recovery failed: {recovery_error}"
+        return {
+            "status": "failure", "success": False, "recoverable": True,
+            "object_id": requested_id,
+            "viewpoints_completed": completed,
+            "viewpoints_planned": (
+                config.search.object_scan_viewpoints * 2 if config is not None else 0
+            ),
+            "viewpoints_skipped": len(skipped_viewpoints),
+            "skipped_viewpoint_details": skipped_viewpoints,
+            "reason": reason,
+        }
 
 
 def execute_pick_script(object_id: str) -> dict[str, object]:

@@ -28,6 +28,59 @@ class DeskTarget:
     z: float
 
 
+def generate_object_arc_angles(
+    *,
+    start_angle: float,
+    arc_degrees: float,
+    viewpoints: int,
+    direction: int,
+) -> list[float]:
+    """Generate a continuous object-orbit bearing sequence.
+
+    The first bearing is the robot's current EEF bearing about the object, so
+    starting the scan does not introduce an avoidable jump to the opposite
+    end of the orbit.  ``direction`` selects clockwise or counter-clockwise.
+    """
+    if not all(math.isfinite(value) for value in (start_angle, arc_degrees)):
+        raise ValueError("object arc angles must be finite")
+    if not 0.0 < arc_degrees <= 360.0:
+        raise ValueError("arc_degrees must be in (0, 360]")
+    if viewpoints < 2:
+        raise ValueError("viewpoints must be at least 2")
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or +1")
+    arc_radians = math.radians(arc_degrees)
+    return [
+        start_angle + direction * arc_radians * index / (viewpoints - 1)
+        for index in range(viewpoints)
+    ]
+
+
+def object_arc_pose(
+    *,
+    target_position: tuple[float, float, float],
+    bearing: float,
+    radius: float,
+    height_offset: float,
+) -> ScanPose:
+    """Return one horizontal orbit pose around a target in the base frame."""
+    if len(target_position) != 3 or not all(
+        math.isfinite(float(value)) for value in (*target_position, bearing, radius, height_offset)
+    ):
+        raise ValueError("object arc geometry must be finite")
+    if radius <= 0.0 or height_offset <= 0.0:
+        raise ValueError("object arc radius and height offset must be positive")
+    target_x, target_y, target_z = map(float, target_position)
+    return ScanPose(
+        x=target_x + radius * math.cos(bearing),
+        y=target_y + radius * math.sin(bearing),
+        z=target_z + height_offset,
+        roll=0.0,
+        pitch=0.0,
+        yaw=0.0,
+    )
+
+
 def rail_centre(rail_min: float, rail_max: float) -> float:
     if not all(math.isfinite(value) for value in (rail_min, rail_max)):
         raise ValueError("rail bounds must be finite")

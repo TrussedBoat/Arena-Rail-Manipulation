@@ -10,6 +10,7 @@ from tools import (
     execute_pick_script,
     execute_place_script,
     move_rail_to_object,
+    scan_object,
     general_mapping,
     targeted_search,
     start_joint_controller,
@@ -130,6 +131,29 @@ tool_definitions = [
                     "object_id": {
                         "type": "string",
                         "description": "Exact confirmed object_id, or home/start.",
+                    }
+                },
+                "required": ["object_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scan_object",
+            "description": (
+                "Perform a close object-centered semantic scan after "
+                "move_rail_to_object(object_id). The wrist camera follows a configurable "
+                "270-degree RRT arc at fixed standoff while semantic perception continues "
+                "processing RGB-D frames and refining the same stored object track."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "object_id": {
+                        "type": "string",
+                        "description": "Exact confirmed object_id that was passed to move_rail_to_object.",
                     }
                 },
                 "required": ["object_id"],
@@ -269,6 +293,7 @@ class AgentState(TypedDict, total=False):
     execution_ledger: list[str]
     semantic_query_cache: dict[str, str]
     last_visual_verification: dict
+    last_navigation_object_id: str
 BOWL_TARGETS = {"bowl", "purple bowl"}
 
 
@@ -284,6 +309,7 @@ tools_impl = {
     "move_rail_to_object": lambda args: move_rail_to_object(
         args.get("object_id")
     ),
+    "scan_object": lambda args: scan_object(args.get("object_id")),
     "move_rail_relative": lambda args: move_rail_relative(
         args.get("relative_distance_m")
     ),
@@ -325,6 +351,20 @@ def _validate_tool_for_stage(
     target = _normalized_argument(arguments, "target_object")
     if tool_name == "targeted_search" and not target:
         return "Search requires a non-empty canonical pickup target."
+
+    if tool_name == "scan_object":
+        object_id = str(arguments.get("object_id") or "").strip()
+        if not object_id:
+            return "scan_object requires a confirmed object_id."
+        if (
+            not tools_called
+            or tools_called[-1] != "move_rail_to_object"
+            or object_id != state.get("last_navigation_object_id", "")
+        ):
+            return (
+                "Call move_rail_to_object with this exact object_id immediately before "
+                "starting its object-centered scan."
+            )
 
     if tool_name in ("execute_pick_script", "execute_place_script"):
         if not tools_called or tools_called[-1] != "get_camera_frame":
@@ -403,6 +443,14 @@ def _compact_ledger_entry(tool_name: str, arguments: dict, result: object) -> st
         if isinstance(result, dict) and result.get("success") is not True:
             return f"Rail/look-at failed safely: {str(result.get('reason', 'unknown reason'))[:180]}"
         return f"Rail/look-at completed for {arguments.get('object_id', 'requested object')}."
+    if tool_name == "scan_object" and isinstance(result, dict):
+        return (
+            f"Object scan for {arguments.get('object_id', 'object')}: "
+            f"{result.get('viewpoints_completed', 0)}/"
+            f"{result.get('viewpoints_planned', '?')} viewpoints; "
+            f"final_position={result.get('final_position', 'unavailable')}; "
+            f"result={result.get('status', 'unknown')}."
+        )
     if tool_name == "get_camera_frame":
         if not isinstance(result, dict):
             return "Isolated visual verification did not return structured evidence."
@@ -615,9 +663,20 @@ def execute_tools(state: AgentState) -> dict:
     )[-8:]
     semantic_query_cache = dict(state.get("semantic_query_cache", {}))
     last_visual_verification = state.get("last_visual_verification", {})
+    last_navigation_object_id = state.get("last_navigation_object_id", "")
     if tool_name == "get_camera_frame":
         last_visual_verification = raw_result if isinstance(raw_result, dict) else {}
-    if tool_name in {"targeted_search", "general_mapping"}:
+    if tool_name == "move_rail_to_object":
+        if isinstance(raw_result, dict) and raw_result.get("success") is True:
+            last_navigation_object_id = str(arguments.get("object_id") or "").strip()
+        else:
+            last_navigation_object_id = ""
+    elif tool_name in {
+        "start_joint_controller", "targeted_search", "general_mapping",
+        "move_rail_relative", "turn_panda_arm", "home_panda_arm",
+    }:
+        last_navigation_object_id = ""
+    if tool_name in {"targeted_search", "general_mapping", "scan_object"}:
         # These motions can add, update, or expire map tracks.
         semantic_query_cache.clear()
     elif tool_name == "search_semantic_objects" and not raw_result.get("already_queried", False):
@@ -641,6 +700,7 @@ def execute_tools(state: AgentState) -> dict:
         "execution_ledger": execution_ledger,
         "semantic_query_cache": semantic_query_cache,
         "last_visual_verification": last_visual_verification,
+        "last_navigation_object_id": last_navigation_object_id,
     }
     if tool_name == "finish_task":
         summary = str(arguments["summary"])
