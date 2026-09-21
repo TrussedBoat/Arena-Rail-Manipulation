@@ -4,6 +4,8 @@
 [![Isaac Sim 5.0](https://img.shields.io/badge/Isaac%20Sim-5.0-orange)](https://developer.nvidia.com/isaac-sim)
 [![Python 3.10](https://img.shields.io/badge/Python-3.10-blue)](https://www.python.org/)
 
+> **About this repository.** This is a small part of the **Home Robotics** project, carried out in collaboration with **BEKO** at **METU ROMER**. This part was developed by the group **Becodeum**, made up of two summer interns, **Ali Görkem Küçük** and **Hakan Emre Kayacan**. See [Acknowledgements](#-acknowledgements).
+
 Arena RealSim is a home-robotics stack built on NVIDIA Isaac Sim. A Franka Panda arm rides on a linear rail between two rows of desks. You give it a task in plain language, such as *"pick up the apple and place it into the purple bowl"*, and the system:
 
 1. **perceives** the scene with a wrist RGB-D camera (YOLO + MobileCLIP), building a persistent 3-D **semantic map**
@@ -335,6 +337,18 @@ gaussian_splatting_ros/gaussian_splatting_ros/
 isaac_worlds/                  # USD scenes and assets
 semantic_objects.json          # persistent semantic map (schema v3)
 ```
+
+---
+
+## 🙏 Acknowledgements
+
+This work was done by **Becodeum**, a group of two summer interns, Ali Görkem Küçük and Hakan Emre Kayacan. It is a small part of the Home Robotics project, carried out in collaboration with BEKO at METU ROMER.
+
+We thank **METU ROMER** for the opportunity to work on this project.
+
+**Contact**
+- Ali Görkem Küçük: [aligorkemkucuk@gmail.com](mailto:aligorkemkucuk@gmail.com)
+- Hakan Emre Kayacan: [hakanemrekayacan@gmail.com](mailto:hakanemrekayacan@gmail.com)
 
 ---
 
