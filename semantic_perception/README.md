@@ -1,200 +1,125 @@
-# Semantic perception
+# 👁️ Semantic perception
 
-This ROS 2 package owns wrist RGB-D object detection, timestamped 3-D
-localization, covariance-aware tracking, and semantic-object persistence.
-Robot motion and search trajectories remain owned by the orchestrator.
+A ROS 2 package that turns the wrist RGB-D camera into a persistent map of objects: detection (YOLO), appearance embeddings (MobileCLIP), 3-D localization with uncertainty, tracking, and storage in `semantic_objects.json`. It also caches views for Gaussian Splatting. Robot motion stays with the [orchestrator](../agent_orchestrator/README.md).
 
-## Build
+For how it fits into the whole system, see the [root README](../README.md).
 
-Build the updated `interface` package first:
+## 🚀 Run
 
-```bash
-cd ../home_robotics/homerobotics_ws
-colcon build --packages-select interface
-source install/setup.bash
-```
-
-The Arena package can then run directly with the supplied script, or be built
-as a normal ROS package:
-
-```bash
-cd Arena-RealSim
-colcon build --base-paths semantic_perception --packages-select semantic_perception
-source install/setup.bash
-```
-
-Ultralytics is an inference-time dependency and must be installed in the Python
-environment used to start the node.
-
-## Run
+From the repository root, with the simulator running:
 
 ```bash
 ./run_semantic_perception.sh
 ```
 
-## Visual YOLO debugging
+| Flag | Effect |
+|---|---|
+| `--rviz` / `--rviz-confirmed-only` | Also starts the RViz marker bridge (confirmed-only hides candidates and stale objects) |
+| `--publish-debug` | Publishes the annotated YOLO image on `/semantic/debug/yolo` |
+| `--scene-export` | Saves scene keyframes for scene-level Gaussian Splatting |
+| `-p name:=value` | Passed to the node as a ROS parameter |
 
-Run this alongside the simulator to publish the raw detector output as an
-annotated image, independent of RGB-D localization and registry confirmation:
+Tuned command lines for the simulator and a real camera are in [`commands.txt`](../commands.txt).
+
+**Environment variables** read by the script:
+
+| Variable | Default |
+|---|---|
+| `ARENA_DETECTOR_MODEL` | `agent_orchestrator/models/yolo26x.pt` |
+| `ARENA_MOBILECLIP_CHECKPOINT` | `agent_orchestrator/models/mobileclip_s0.pt` |
+| `ARENA_OBJECT_REGISTRY` | `semantic_objects.json` |
+| `ARENA_USE_SIM_TIME` | `true` (use `false` with a real wall-clock camera) |
+| `ARENA_CONFIRMATION_HITS` | `8` |
+| `ARENA_PROCESSING_RATE_HZ` | `12.0` |
+| `ARENA_PUBLISH_ANNOTATED_DEBUG` | `false` |
+| `ARENA_OBJECT_POINT_VOXEL_SIZE_M` | `0.02` |
+| `ARENA_DYNAMIC_COORDINATES`, `ARENA_WRITE_LEGACY_COORDINATES` | legacy `semantic_distances_dynamic.json` export (off) |
+
+You can also build it as a normal ROS package and use the launch file (`model_path` is required):
 
 ```bash
-./run_yolo_debug.sh
+colcon build --base-paths semantic_perception --packages-select semantic_perception
+source install/setup.bash
+ros2 launch semantic_perception semantic_perception.launch.py model_path:=/path/to/yolo.pt
 ```
 
-It publishes `sensor_msgs/Image` on `/semantic/debug/yolo`. To display it in
-the included OpenCV viewer, use:
+## 🛠️ Setup
+
+- Build the `interface` package of the `home_robotics` workspace first (`colcon build --packages-select interface`). It provides `DetectedObject(Array)`, `FindObject`, `SearchSemanticObjects` and `AssociationDiagnosticArray`.
+- Install `ultralytics` in the Python environment that starts the node.
+- Install Apple's MobileCLIP and download the S0 checkpoint. The node never downloads weights and stops with a clear error if either is missing.
 
 ```bash
-python3 scripts/view_wrist_camera.py --topic /semantic/debug/yolo
+git clone https://github.com/apple/ml-mobileclip.git
+./agent_orchestrator/agent_env/bin/pip install -e ./ml-mobileclip
 ```
 
-The debug node defaults to `0.25` so marginal boxes remain visible. Semantic
-perception defaults to `0.50`; change either with `-p confidence_threshold:=…`.
+## 📡 ROS API
 
-Semantic perception rejects a detection when its bounding box covers more than
-55% of the image (`detector.max_bbox_area_fraction`). This suppresses common
-surface-sized false positives; increase the value for genuinely large nearby
-objects, or set it to `1.0` to disable the filter. Class evidence decays by
-`0.95` per observation, keeping roughly the last 20 observations influential.
+| Name | Type | Purpose |
+|---|---|---|
+| `/semantic/objects` | `DetectedObjectArray` (latched) | The full registry. Late subscribers get the last map immediately |
+| `/semantic/detections` | `DetectedObjectArray` | Objects localized from the current frame |
+| `/semantic/target_found` | `DetectedObject` | Published when a `find_object` goal succeeds |
+| `/semantic/find_object` | action `FindObject` | Succeeds on a **fresh** confirmed sighting of a class made after the goal started (class probability ≥ 0.70 and enough new hits) |
+| `/semantic/search_objects` | service `SearchSemanticObjects` | Ranks confirmed objects against a text query with MobileCLIP (top 5 above cosine similarity 0.25). This is map evidence, not visual proof |
+| `/semantic/association_diagnostics` | `AssociationDiagnosticArray` | Per-frame timing, depth statistics, covariance and match decision (`matched`, `new_track`, `depth_rejected`) |
+| `/semantic/debug/yolo` | `Image` | Annotated detections, with `--publish-debug` |
+| `/semantic/rviz/markers` | `MarkerArray` | From the RViz bridge. Fixed Frame: `global_origin` |
 
-To publish annotated frames from the semantic-perception node itself, start it
-with `--publish-debug`:
+Inputs: the wrist color and depth images (`topics.color`, `topics.aligned_depth`) and `/tf`.
 
-```bash
-./run_semantic_perception.sh --publish-debug
-```
+## 🔬 How it works
 
-This publishes `/semantic/debug/yolo` using the exact YOLO inference result
-that feeds localization. It is disabled by default. Do not run
-`run_yolo_debug.sh` at the same time, because both nodes would publish to that
-topic.
+1. **Sync.** RGB and depth are paired within 30 ms. A packet waits until TF can be interpolated at the image time. The latest TF is not used by default (`tf.fallback_to_latest: false`), because it would smear positions while the camera moves.
+2. **Detect and embed.** YOLO finds boxes. Boxes touching the image border or covering more than 55 % of the image are dropped. MobileCLIP-S0 embeds all crops of a frame in one batch.
+3. **Localize.** A robust depth sample from the inner part of the box is back-projected with the fixed calibration into `global_origin`, with a 3×3 covariance that grows beyond 1 m.
+4. **Match.** A detection joins a track only if it passes the 3-D Mahalanobis gate (99 %, `d² ≤ 11.345`) and the appearance gate (cosine distance ≤ 0.35). Matches are solved with the Hungarian algorithm.
+5. **Update.** Position: Kalman update. Class: a soft distribution over at most four labels plus `other`. A track is *confirmed* after enough hits in the confirmation window (class probability ≥ 0.70) and goes *stale* after 300 s unseen.
+6. **Save.** The registry is written to `semantic_objects.json` (schema v3) once per second. Older schemas and legacy coordinate files are migrated on load.
 
-## RViz detections
+## ⚙️ Configuration
 
-Start the marker bridge alongside semantic perception:
+Defaults are in `config/semantic_perception.yaml`, tuned for the simulator. Use `config/semantic_perception_real.yaml` (more conservative noise values) for a real camera:
 
-```bash
-./run_semantic_rviz_visualizer.sh
-```
+- set all six `camera.*` values (`fx`, `fy`, `cx`, `cy`, `image_width`, `image_height`) from your camera. The node has no `CameraInfo` input and rejects frames of a different size
+- set `camera.tf_frame_override` to your camera's TF frame, or leave it empty to use the image header frame. The simulator labels images `sim_camera`, but its TF calls the frame `wrist_camera`
+- run with `ARENA_USE_SIM_TIME=false` if the camera uses wall time
 
-Or start it together with semantic perception using the launcher option:
+Simulator calibration: 1280×720, fx 907.00, fy 905.69, cx 567.74, cy 488.32.
 
-```bash
-./run_semantic_perception.sh --rviz
-```
+Useful parameters:
 
-Use `--rviz-confirmed-only` instead to hide candidates, ambiguous tracks, and
-stale objects from RViz.
+| Parameter | Default | Meaning |
+|---|---|---|
+| `detector.confidence_threshold` | 0.50 | Minimum YOLO confidence |
+| `detector.max_bbox_area_fraction` | 0.55 | Drop boxes larger than this share of the image |
+| `filter.confirmation_hits` / `filter.confirmation_window_sec` | 3 / 3.0 | Hits needed to confirm a track (the run script sets 8 hits) |
+| `class.confirmation_probability` | 0.70 | Class probability needed to confirm |
+| `depth.maximum_m` | 5.0 | Ignore depth beyond this range |
+| `processing_rate_hz` | 12.0 | Detection rate |
+| `diagnostics.publish` | true | Publish `/semantic/association_diagnostics` |
+| `debug.timing` | false | Write per-stage timings (`debug.timing_log_path`) |
 
-In RViz, set **Fixed Frame** to `global_origin`, then add a **MarkerArray**
-display with topic `/semantic/rviz/markers`. Green spheres are persistent,
-confirmed objects from `/semantic/objects`; their text labels show class,
-confidence, and state. The bridge receives the registry's transient-local
-snapshot even when it starts after semantic perception. Markers persist in
-RViz until the registry changes.
+## 🌫️ Gaussian Splatting export
 
-`ARENA_DETECTOR_MODEL`, `ARENA_OBJECT_REGISTRY`,
-`ARENA_DYNAMIC_COORDINATES`, and `ARENA_WRITE_LEGACY_COORDINATES` override the
-script defaults. The script uses wall time by default. `run_sim.sh` creates an
-Isaac `/clock` publisher and configures ROS camera helpers to use simulation
-timestamps. After restarting the simulator, use `ARENA_USE_SIM_TIME=true` and
-`-p tf.fallback_to_latest:=false`. A built package may instead be started through
-`semantic_perception.launch.py`.
+The node writes training data to the RAM disk `/dev/shm/3dgs_cache/`:
+- **per object:** RGB and depth crops, camera pose, intrinsics and a sparse point cloud. A pose filter (`export.voxel_size_m`, `export.voxel_size_deg`) skips near-duplicate views
+- **scene** (with `--scene-export`): keyframes every 10 cm or 8° of camera motion, at most 600, with background points
 
-The default `semantic_perception.yaml` uncertainty values are tuned for the
-simulator. Pass `config_file:=.../semantic_perception_real.yaml` to select the
-more conservative real-camera covariance floors.
+The [`gaussian_splatting_ros`](../gaussian_splatting_ros) node trains from this cache.
 
-The node uses fixed, rectified wrist-camera calibration from the `camera.*`
-parameters; it does not require a `CameraInfo` topic. The simulator profile is
-calibrated for `1280 × 720`, `fx=907.00`, `fy=905.69`, `cx=567.74`, and
-`cy=488.32`. RGB and depth must be aligned and match that configured resolution.
-The node rejects mismatched frames instead of producing incorrect coordinates.
-
-For a real camera, set all six `camera.*` parameters from that camera's own
-calibration and native aligned RGB-D resolution before starting the node.
-The simulator image stream labels frames as `sim_camera`, but its TF tree calls
-the camera `wrist_camera`; `camera.tf_frame_override` bridges that difference.
-For real hardware set the override to its published TF camera frame, or empty
-to use the image header's `frame_id` directly.
-
-When image and TF timestamps come from different time domains, the simulator
-profile falls back to the latest available TF transform (`tf.fallback_to_latest`)
-after an exact lookup fails. Keep this enabled only while those clocks differ;
-timestamped TF is preferred when both streams share a clock.
-
-## ROS API
-
-- `/semantic/detections`: localized observations from the current RGB-D packet.
-- `/semantic/objects`: filtered registry with transient-local durability.
-- `/semantic/target_found`: confirmed detections for simple event consumers.
-- `/semantic/find_object`: targeted-search action. Success requires a fresh,
-  confirmed observation after the goal starts.
-
-Each object carries a normalized soft class distribution containing at most
-four explicit labels plus `other`. `class_name` is the highest-probability
-explicit label, or `unknown` when `other` is largest. Target search additionally
-requires the representative class probability to be at least `0.70`.
-
-Spatial association uses the full measurement and track covariance with the
-3-D 99% chi-square Mahalanobis gate (`d² <= 11.345`). Eligible matches are
-chosen globally with Hungarian assignment. By default, every valid YOLO crop in
-a frame is batched through the image encoder of pretrained MobileCLIP-S0, then
-L2-normalized. Incompatible appearance pairs are rejected above cosine distance
-`0.35`, and the remaining assignment cost combines normalized `d²` and cosine
-distance equally. The `/semantic/search_objects` service additionally reuses MobileCLIP-S0's text
-encoder to rank compatible confirmed tracks for a natural-language description.
-It returns at most five tracks above cosine similarity `0.25` by default; this
-is retrieval evidence, not visual confirmation for manipulation.
-
-Install Apple's official `mobileclip` package in the ROS Python environment
-(`git clone https://github.com/apple/ml-mobileclip.git && ./agent_orchestrator/agent_env/bin/pip install -e ./ml-mobileclip`)
-and download the MobileCLIP-S0 checkpoint before starting the node. Set
-`ARENA_MOBILECLIP_CHECKPOINT=/absolute/path/to/mobileclip_s0.pt`, or pass
-`-p appearance.mobileclip_checkpoint:=/absolute/path/to/mobileclip_s0.pt`.
-The node never downloads model weights at runtime and reports a clear startup
-error if the package or checkpoint is missing. Set `appearance.enabled:=false`
-to return to spatial-only matching; `mobilenet_v3_small` and
-`ultralytics_crop` remain available through `appearance.backend`.
-
-Distance weighting treats observations closer than 1 m as full quality. Beyond
-that distance, the world-frame covariance is inflated quadratically and class
-evidence is down-weighted inversely with distance, with a 0.25 minimum evidence
-weight. Configure `distance_weighting.reference_distance_m` and
-`distance_weighting.minimum_class_evidence_weight` for a different camera range.
-
-The node publishes `/semantic/association_diagnostics` for every processed
-frame. It records TF mode and timestamp offset, depth/MAD sampling statistics,
-box-derived pixel uncertainty, final covariance, and the selected association
-decision/cost. `uncertainty.bbox_diagonal_fraction` (default `0.10`) adds
-10% of the 2-D box diagonal in quadrature with base pixel uncertainty.
-Inspect it with:
+## 🐞 Debugging
 
 ```bash
+# Show the YOLO overlay (start with --publish-debug)
+python3 scripts/view_wrist_camera.py --topic /semantic/debug/yolo --scale 0.6
+
+# Raw YOLO output without depth or tracking (do not run together with --publish-debug)
+PYTHONPATH=semantic_perception python3 -m semantic_perception.yolo_debug --ros-args -p model_path:=/path/to/yolo.pt
+
+# Watch matching decisions
 ros2 topic echo /semantic/association_diagnostics
 ```
 
-`association_decision=matched` means an existing track was updated;
-`new_track` means no eligible existing track survived the spatial and appearance
-gates; `depth_rejected` includes the depth-sampling rejection reason.
-Disable this diagnostic stream with `-p diagnostics.publish:=false`.
-
-Detections that touch the configured camera-edge margin are rejected before
-localization and appearance embedding. The default margin is 3% of each image
-dimension (`detector.border_margin_fraction=0.03`). With `--publish-debug`, the
-safe image region is magenta and rejected clipped boxes are red.
-
-YOLO confidence is not treated as `P(other)`. For an accepted detection with
-confidence `c`, its conditional class distribution is `class = 0.60 + 0.40c`
-and `other = 1 - class`; its total evidence contribution is still scaled by
-`c` and distance. Adjust the `0.60` floor with
-`class.conditional_reliability_floor`.
-Matched positions and covariances are fused with a static Kalman update.
-
-`semantic_objects.json` schema version 3 stores the class distribution, 3×3
-world-frame covariance, and the compatible appearance embedding when available.
-Schema versions 1–2 and legacy coordinate files are migrated when loaded. The node
-can also export the existing class-keyed `semantic_distances_dynamic.json`
-format by setting `registry.write_legacy_coordinates:=true`. It defaults to
-false until the old orchestrator writer is removed, preventing two processes
-from racing to overwrite the same file during migration.
+`yolo_debug` defaults to a lower confidence of 0.25 so marginal boxes stay visible.

@@ -1,189 +1,113 @@
-# 🤖 YOLO + VLM Robotic Task Orchestrator
+# 🤖 Orchestrator: VLM agent + RRT planner
 
-A hybrid ROS 2 manipulation pipeline in which a compact local VLM plans high-level actions while deterministic YOLO and ROS code perform visual search, centering, and localization.
+The high-level brain of Arena RealSim. A local vision-language model (VLM) reads a plain-language task and calls a small set of robot tools. The tools search, navigate, pick and place using semantic perception, an RRT motion planner and the rail bridge.
+
+For the whole system (ROS message flow, motion layers, perception, splatting), see the [root README](../README.md).
 
 <div align="center">
   <img src="logo.png" width="500" alt="Agent Logo">
 </div>
 
-## 🧰 Tech Stack
+## 🧰 Tech stack
 
 [![ROS 2](https://img.shields.io/badge/ROS_2-Humble-22314E?style=for-the-badge&logo=ros)](https://docs.ros.org/en/humble/index.html)
 [![Python](https://img.shields.io/badge/Python-3.10-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![LangChain](https://img.shields.io/badge/LangChain-v0.3-1C3C3C?style=for-the-badge&logo=langchain&logoColor=white)](https://www.langchain.com/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-agent-1C3C3C?style=for-the-badge)](https://www.langchain.com/langgraph)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-Vision-black?style=for-the-badge)](https://github.com/ggerganov/llama.cpp)
 [![uv](https://img.shields.io/badge/uv-Fast_Python_Manager-purple?style=for-the-badge&logo=astral)](https://docs.astral.sh/uv/)
-[![Status](https://img.shields.io/badge/Status-Active-success?style=for-the-badge)](#)
 
-## 🚀 Features
+## 🚀 Run
 
-- **Compact local planner**: Runs `Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` with the matching Q8_0 multimodal projector through `llama-server`.
-- **Deterministic visual search**: Uses the configured local `yolo11s.pt` checkpoint; camera frames are processed locally and are not sent to the VLM during active search.
-- **RRT desk scanning**: Targeted search sweeps configurable inward arcs over both desk rows while YOLO runs at a deadline-checked frame rate. Full mapping visits the minimum, centre, and maximum rail stations and executes 11 semantic-mapping viewpoints per desk side.
-- **Close confirmation**: Holds RRT motion on a candidate, depth-localizes it, approaches its rail X, and persists only a strict closer-look detection.
-- **Dynamic coordinates**: Saves rail-zero global XYZ pickup coordinates to `semantic_distances_dynamic.json` without overwriting unrelated labels.
-- **Fail-closed orchestration**: A LangGraph stage gate permits only one expected high-level tool at a time and terminates immediately after search, pick, navigation, or place failure.
+From the repository root, with the simulator (`./run_sim.sh`) and perception (`./run_semantic_perception.sh`) already running:
 
-## Architecture
-
-### RRT end-effector commands
-
-The orchestrator exposes `move_eef_to_pose` with XYZ in metres and roll, pitch,
-and yaw in radians. It publishes `geometry_msgs/Pose` on `/rrt/pose_command`, expressed
-relative to `panda_link0`. The RRT planner converts the pose into a timed
-seven-joint trajectory, validates self-collision, joint limits, and Jacobian
-singularity margin, and publishes it on `/rrt/joint_trajectory`. The caller
-waits for the arm-only `/panda/trajectory_complete` pulse and receives failures immediately from
-`/rrt/status`.
-
-The planner rejects any target or interpolated path state whose EEF height in
-`panda_link0` would be below `0.08 m`. This calibrated EEF floor is the
-`eef_min_z_m` ROS parameter, set by `run_orchestrator.sh`; override it with
-`ARENA_RRT_EEF_MIN_Z_M` when recalibrating the gripper geometry.
-
-The planner warns below a singularity metric of `0.10` and stops below `0.045`.
-Override the stop limit with `ARENA_RRT_SINGULARITY_STOP` only when calibrating
-reachable manipulation poses.
-
-The low-level controller does not consume `/rrt/pose_command` directly. Runtime safety
-monitoring issues a zero-velocity joint hold if actual feedback enters an unsafe
-configuration. Direct joint commands can still take priority through the bridge;
-a later `/rrt/pose_command` re-arms planned trajectory forwarding.
-Targeted search may also publish `/rrt/cancel`; this creates an intentional
-current-joint hold and reports `cancelled` separately from runtime safety stops.
-
-The short vertical descend and retreat legs of pick/place use
-`/panda/cartesian_pose_command` directly in the Panda pose controller. This
-bypasses RRT only for those local manipulation legs; the controller's
-`/panda/trajectory_complete` pulse is their completion feedback.
-
-### ROS command topics
-
-| Topic | Producer → consumer | Purpose |
-|---|---|---|
-| `/direct_joint_command` | orchestrator → bridge | Direct rail/Panda joint targets. |
-| `/rrt/pose_command` | orchestrator → RRT planner | Cartesian EEF target. |
-| `/panda/cartesian_pose_command` | orchestrator → Panda controller/bridge | Direct local Cartesian descend or ascend, bypassing RRT. |
-| `/rrt/joint_trajectory` | RRT planner → Panda controller | Validated joint trajectory. |
-| `/cartesian/joint_command` | Panda controller → bridge | Streamed joint targets while executing a trajectory. |
-| `/rrt/hold_command` | RRT planner → bridge | Emergency or cancellation joint hold. |
-| `/gripper/command` | orchestrator → bridge/Panda controller | Gripper command. |
-| `/panda/controller_ready` | Panda controller → clients | Controller startup readiness. |
-| `/panda/trajectory_complete` | Panda controller → clients/RRT planner | Arm/cartesian trajectory completion notification. |
-| `/gripper/reached` | Panda controller → clients | Gripper command completion notification. |
-
-The old `/joint_position_cmd` controller input is removed. Do not publish the
-old `/joint_position_command`, `/joint_command`, `/pose_cmd`, or
-`/joint_trajectory_cmd` names after restarting the stack.
-
-`run_orchestrator.sh` starts the controller from the `home_robotics` workspace.
-Set `ARENA_HOME_ROBOTICS_SETUP` if its `install/setup.bash` is not at the default
-location. Cartesian timeouts and TF frame names can be overridden with the
-`YOLO_VLM_CARTESIAN_*` environment variables defined in `src/config.py`. RRT
-parameters such as planning time, edge resolution, and singularity thresholds
-are ROS parameters declared by `src/rrt_planner.py`.
-
-The VLM sees only six high-level tools:
-
-1. `start_joint_controller`
-2. `targeted_search`
-3. `execute_pick_script`
-4. `move_rail_to_object`
-5. `execute_place_script`
-6. `finish_task`
-
-Camera capture, raw joint inspection, wrist motion, rail stepping, YOLO inference, centering, and coordinate persistence remain internal Python operations.
-
-The enforced manipulation sequence is:
-
-```text
-initialize controller
-  -> search and localize pickup target with YOLO
-  -> execute existing pick script
-  -> move to the fixed purple bowl
-  -> execute existing place script
-  -> return to home
-  -> finish task
-```
-
-Every successful localization writes the object position in the rail-zero
-`global_origin` frame. `rail_j1 = 0` is the fixed global origin and the axes
-are rail-aligned (the robot base is rotated 180° about Z relative to them):
-
-```json
-{
-  "apple": {
-    "x": 1.234,
-    "y": -0.120,
-    "z": 0.045
-  }
-}
-```
-
-`run_sim.sh` starts the reusable `rail_global` reference-frame node alongside
-the simulator. It consumes `/sim/rail_franka1/joint_states` and publishes
-`global_origin -> panda_link0`. It fails rather than publishing if another TF
-parent for `panda_link0` is detected. Existing entries for other labels are
-preserved.
-
-## Runtime configuration
-
-Runtime settings are loaded and validated by `src/config.py` before ROS motion begins. Defaults target:
-
-- Qwen2.5-VL-7B Q4_K_M with Q8_0 mmproj
-- 4096-token context, one inference slot, 99 GPU layers, Flash Attention, and 128–256 completion tokens
-- `yolo11s.pt` with a strict final confidence requirement of `> 0.85`
-- targeted-search defaults of seven RRT views per desk side, 5 FPS, 0.30 candidate confidence, 1.0 m desk width, and 0.30 m close stand-off
-- rail limits, motion tolerances, camera geometry, and semantic-coordinate paths
-
-Paths can be overridden with the `YOLO_VLM_*` environment variables defined in `src/config.py`. Missing model files or scripts fail validation; the orchestrator never downloads them automatically.
-
-## 🛠️ Installation & Setup
-
-### 1. Install Prerequisites
-
-#### Install `uv`
 ```bash
+./run_orchestrator.sh              # add --show-think to print the VLM's reasoning
+```
+
+The script starts, in order:
+
+1. `scripts/rail_bridge.py`: the only node that commands Isaac Sim
+2. `rrt_planner.py`: restarted automatically if it exits
+3. the Panda controller from the `home_robotics` workspace (log: `agent_ros.log`)
+4. `src/main.py`: starts `llama-server` in a tmux session (`vlm_server`), then opens an interactive prompt
+
+Type a task at the prompt (an empty line runs the default *"pick up the apple and place it into the purple bowl"*). `quit` stops everything.
+
+## 🛠️ Setup
+
+You need Ubuntu 22.04 with ROS 2 Humble, `tmux`, a CUDA GPU, and a built `home_robotics` workspace (custom `interface` messages, the Panda controller and the Panda URDF/SRDF).
+
+```bash
+# from the repository root
 curl -LsSf https://astral.sh/uv/install.sh | sh
-# OR
-wget -qO- https://astral.sh/uv/install.sh | sh
+uv venv agent_orchestrator/agent_env --python 3.10
+source agent_orchestrator/agent_env/bin/activate
+uv pip install -r agent_orchestrator/requirements.txt
 ```
 
-### 2. Setup Python Environment (using `uv`)
+Other things you must provide (nothing is downloaded automatically):
+
+| What | Default location | Override |
+|---|---|---|
+| `llama-server` build | `<llama root>/build/bin/llama-server` | `YOLO_VLM_LLAMA_ROOT`, `YOLO_VLM_LLAMA_EXECUTABLE` |
+| VLM: Qwen3-VL-8B-Instruct Q4_K_M + F16 mmproj (GGUF) | `<llama root>/models/` | `YOLO_VLM_MODEL_PATH`, `YOLO_VLM_MMPROJ_PATH` |
+| YOLO weights | `agent_orchestrator/models/yolo26x.pt` | `YOLO_VLM_YOLO_CHECKPOINT` |
+| `home_robotics` workspace | `<controller root>` | `YOLO_VLM_CONTROLLER_WORKSPACE`, `ARENA_HOME_ROBOTICS_SETUP` |
+
+> ⚠️ The default `<llama root>` and `<controller root>` in `src/config.py` point to the development machine's home directory. On any other machine, set the overrides above.
+
+## ⚙️ Configuration
+
+All settings are loaded and checked in `src/config.py` before any robot motion. They come from `YOLO_VLM_*` environment variables (about 100, all listed in that file: rail limits, scan geometry, pick/place offsets, timeouts, camera intrinsics). If a check fails, the program stops with a clear error.
+
+Checked at startup:
+- required files exist: `llama-server`, GGUF, mmproj, YOLO checkpoint, `semantic_distances.json` (static coordinates), the ROS and controller setup scripts
+- the VLM fits its GPU budget, which is fixed to 4096-token context, 1 slot, 99 GPU layers, Flash Attention, 128–256 completion tokens, at most 8 GB VRAM
+- the YOLO checkpoint knows the required classes (`apple` by default)
+
+The old `rail_demo_pick.sh` / `rail_demo_place.sh` scripts are no longer used by the current tools. A missing script only prints a warning (`YOLO_VLM_ALLOW_MOCK_HARDWARE_SCRIPTS` defaults to on).
+
+## 🧠 How the agent works
+
+`agent.py` builds a **LangGraph** loop: `call_llm` → `execute_tools` → `call_llm` … until `finish_task`, a failure, or 20 steps. Every tool call must carry a `thought` field.
+
+| Area | Tools |
+|---|---|
+| Setup / end | `start_joint_controller`, `finish_task` |
+| Semantic map | `search_semantic_objects`, `targeted_search`, `general_mapping` |
+| Navigation | `move_rail_to_object`, `move_rail_relative`, `scan_object` |
+| Arm | `turn_panda_arm`, `home_panda_arm` |
+| Manipulation | `get_camera_frame`, `execute_pick_script`, `execute_place_script` |
+
+Rules enforced in code, not only in the prompt:
+- the first call must be `start_joint_controller`
+- `scan_object` is allowed only right after `move_rail_to_object` on the same object ID
+- pick and place are refused unless the previous call was `get_camera_frame` and its separate, context-free VLM check returned `target_confirmed` and `safe_for_action`
+- a failed pick or place has already tried a safe retreat, so the failure is recoverable and the VLM re-plans
+
+Objects are chosen by exact `object_id` from `semantic_objects.json`, the map written by semantic perception. Positions are in the rail-zero `global_origin` frame.
+
+## 📂 Files
+
+| File | Purpose |
+|---|---|
+| `src/main.py` | Entry point, system prompt, interactive loop, cleanup of tmux sessions |
+| `src/agent.py` | Tool schemas, stage gate, LangGraph graph |
+| `src/tools.py` | The tools: search, mapping, navigation, pick/place, VLM server and visual verification |
+| `src/ros_interface.py` | Shared ROS node: action/service clients, camera, TF, joint state |
+| `src/rrt_planner.py` | RRT planning with joint-limit, collision, height and singularity checks |
+| `src/rail_global.py` | Publishes `global_origin → panda_link0` |
+| `src/targeted_scan_geometry.py` | Scan-arc and look-at pose maths |
+| `src/config.py` | Environment-driven configuration and validation |
+| `src/ros_logger.py` | Sends ROS node logs to `agent_ros.log`; the terminal shows errors only |
+| `test/object_scan_geometry_test.py` | Unit tests for the scan geometry |
+
+## 🧪 Tests
+
 ```bash
-# Initialize uv project (if not already)
-uv init --python 3.10
-
-# Create and activate virtual environment
-uv venv agent_orchestrator
-source agent_orchestrator/bin/activate
-
-# Install dependencies
-uv pip install -r requirements.txt 
+PYTHONPATH=agent_orchestrator/src python3 -m unittest discover -s agent_orchestrator/test -p "*_test.py"
 ```
 
-## 🎮 Running the Orchestrator for Neo-Classic Pipeline
+## ⚠️ Known outdated
 
-To run the full system, open two separate terminals:
-
-### Terminal 1: Start the Arena Simulation
-```bash
-cd Workspace/Arena-RealSim
-./scripts/start_arena.sh rail
-```
-
-### Terminal 2: Run the Orchestrator Agent
-```bash
-cd Workspace/Arena-RealSim
-source agent_orchestrator/agent_orchestrator/bin/activate
-source /opt/ros/humble/setup.bash
-python3 agent_orchestrator/src/main.py
-```
-
-## 📂 Project Structure
-
-- **`src/config.py`**: Environment-based runtime configuration and fail-fast validation.
-- **`src/main.py`**: Main entry point and interactive CLI runtime loop.
-- **`src/agent.py`**: Minimal six-tool LangGraph planner and enforced pipeline stages.
-- **`src/tools.py`**: llama.cpp lifecycle, deterministic YOLO search, centering, persistence, navigation, and manipulation wrappers.
-- **`src/ros_interface.py`**: ROS 2 Node integration, subscription handlers, and hardware actuation interface.
+`src/reset_rail.sh` publishes to `/direct_joint_command` and `/gripper/command`. The bridge now rejects these topics, so the script no longer moves the robot.
