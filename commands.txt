@@ -103,5 +103,8 @@ python3 scripts/send_pose_cmd.py 0.00 0.30 0.7 3.14 -1.56 1.56
 # Trigger 3DGS training on a specific object ID
 ros2 service call /gaussian_splatting_node/optimize_object interface/srv/OptimizeObject "{object_id: 'object_023'}"
 
+# Trigger 3DGS training on the whole scene
+ros2 service call /gaussian_splatting_node/optimize_object interface/srv/OptimizeObject "{object_id: 'scene'}"
+
 # Trigger 3DGS training (Auto-detects the object with the most frames)
 ros2 service call /gaussian_splatting_node/optimize_object interface/srv/OptimizeObject "{}"
